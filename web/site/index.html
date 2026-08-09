@@ -1,0 +1,621 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cochleagram</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --chrome: #f2f2f5;
+    --label: #71717a;
+    --line: #d4d4d8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --chrome: #1c1c1f; --label: #a1a1aa; --line: #3f3f46; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--chrome);
+    display: flex; flex-direction: column;
+  }
+  .bar {
+    display: flex; align-items: center; gap: 0.9rem;
+    padding: 0.45rem 0.75rem; flex: 0 0 auto; flex-wrap: wrap;
+  }
+  .bar + .bar { border-top: 1px solid var(--line); }
+  #bars { border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+  .bar label { display: flex; align-items: center; gap: 0.35rem; }
+  button, select { font: inherit; }
+  button { padding: 0.3rem 0.8rem; border-radius: 6px; }
+  #status { margin-left: auto; color: var(--label);
+            font-variant-numeric: tabular-nums; }
+  #file { display: none; }
+  input[type=range] { width: 8rem; }
+  .rule { width: 1px; height: 18px; background: var(--line); }
+  /* The picture is a fixed 600 pixels tall, whatever the window does.
+     599 taps into 600 rows is one tap per pixel -- no vertical resampling,
+     which is the whole point: harmonics sit one or two taps apart and
+     interpolation destroys exactly that. A window too short to show it all
+     scrolls; it does not squeeze.
+     616 = the 600 of picture plus the 8 above and 8 below that the display
+     reserves for the top label's overhang and the bottom edge. */
+  #view { flex: 0 0 auto; width: 100%; height: 616px; display: block; }
+  #view.drop { outline: 3px solid #0a68d0; outline-offset: -3px; }
+</style>
+</head>
+<body>
+
+<div id="bars">
+  <div class="bar">
+    <button id="pause" title="Pause">❚❚</button>
+    <button id="open">Play file…</button>
+    <input type="file" id="file" accept="audio/*">
+    <div class="rule"></div>
+    <label>ERB
+      <select id="erb">
+        <option value="050">0.5</option><option value="060" selected>0.6</option>
+        <option value="070">0.7</option><option value="080">0.8</option>
+        <option value="090">0.9</option><option value="100">1.0</option>
+        <option value="110">1.1</option><option value="120">1.2</option>
+        <option value="130">1.3</option>
+      </select>
+    </label>
+    <span id="status">idle</span>
+  </div>
+  <div class="bar">
+    <label><input type="checkbox" id="invert"> Invert</label>
+    <label><input type="checkbox" id="auto"> Auto gain</label>
+    <label><input type="checkbox" id="deskew"> De-skew</label>
+    <div class="rule"></div>
+    <label>white <input type="range" id="white" min="-130" max="10" value="-100"></label>
+    <label>black <input type="range" id="black" min="-130" max="10" value="-40"></label>
+    <span id="range" style="color:var(--label);font-variant-numeric:tabular-nums"></span>
+    <div class="rule"></div>
+    <label>Speed
+      <select id="speed">
+        <option value="16">16 mS</option>
+        <option value="8">8 mS</option>
+        <option value="4" selected>4 mS</option>
+        <option value="2">2 mS</option>
+        <option value="1">1 mS</option>
+      </select>
+    </label>
+    <label>Close-up
+      <select id="closeup" title="Give the most recent moment its own, finer time scale on the right"></select>
+    </label>
+    <div class="rule"></div>
+    <button id="reset" title="Put every control back to its starting value">Defaults</button>
+  </div>
+</div>
+
+<canvas id="view"></canvas>
+
+<script type="module">
+import { Display } from './display.js';
+import { CLOSE_UP_SPANS, closeUpFit, closeUpAvailable } from './closeup.js';
+
+const $ = id => document.getElementById(id);
+const view = $('view');
+const display = new Display(view);
+const say = t => { $('status').textContent = t; };
+
+let ctx = null, capture = null, worker = null;
+let micStream = null, micSource = null, fileSource = null;
+let playingFile = false, paused = false, fileEnded = false;
+let colsSeen = 0, lastReport = performance.now();
+
+// ---- what is remembered between visits -----------------------------------
+//
+// localStorage, which is per-origin: settings from a local server and from
+// the published page are separate, which is right -- one is where you try
+// things and the other is where you use them.
+//
+// The source is deliberately not remembered. A file cannot be reopened
+// without the user choosing it again, and a page that claimed to resume a
+// recording it no longer has would be worse than one that plainly starts
+// listening.
+
+const KEY = 'cochleagram.settings';
+const defaults = {
+    columnMs: 4, erb: '060', deskew: false,
+    // Auto gain off and a window from -100 to -40 dB: what the picture looks
+    // like when somebody who knows what they are looking for sets it up. The
+    // wide-open range is the safe first impression on unknown hardware, and it
+    // is not the most informative one -- these are the settings the display is
+    // actually read at.
+    invert: false, autoGain: false, whiteDB: -100, blackDB: -40,
+    // How much of the recent past the close-up strip shows, in milliseconds;
+    // zero is off. The *span* is what is stored, not the width, because the
+    // width that gives it depends on Speed -- and what you want when you come
+    // back is the same amount of time, not the same number of pixels.
+    //
+    // Off by default. It is the least self-explanatory thing in the window,
+    // and a stranger meeting a display already divided into two regions
+    // scrolling at different rates would reasonably conclude it was broken.
+    closeUpSpanMs: 0, closeUpColumns: 400,
+};
+let S = { ...defaults };
+try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch {}
+
+function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch {}
+}
+
+/// Push the stored values at the controls and at the display. Runs before
+/// anything is wired up, so nothing here fires a change handler.
+function applySettings() {
+    $('speed').value = String(S.columnMs);
+    $('erb').value = S.erb;
+    $('deskew').checked = S.deskew;
+    $('invert').checked = S.invert;
+    $('auto').checked = S.autoGain;
+    $('white').value = String(S.whiteDB);
+    $('black').value = String(S.blackDB);
+    display.exposure.inverted = S.invert;
+    display.exposure.autoGain = S.autoGain;
+    display.exposure.whiteDB = S.whiteDB;
+    display.exposure.blackDB = S.blackDB;
+    $('range').textContent = `${S.whiteDB} … ${S.blackDB} dB`;
+    display.columnMs = S.columnMs;
+}
+applySettings();
+
+// ---- the close-up --------------------------------------------------------
+
+let closeUpK = 1;
+
+/// Push the close-up at both halves of the system, in the order that matters:
+/// the display has to know the new geometry before the engine starts producing
+/// columns at the new rate, or the first frame's worth arrives to be filed
+/// under the old one.
+function applyCloseUp() {
+    if (!closeUpAvailable(S.columnMs)) S.closeUpSpanMs = 0;
+    const on = S.closeUpSpanMs > 0 && !S.deskew;
+    const fit = on ? closeUpFit(S.closeUpSpanMs, S.columnMs,
+                                display.maxCloseUpColumns, S.closeUpColumns)
+                   : null;
+    if (on && !fit) S.closeUpSpanMs = 0;      // no legal width at this Speed
+    closeUpK = fit ? fit.k : 1;
+    if (fit) S.closeUpColumns = fit.columns;
+    display.setCloseUp(fit ? fit.columns : 0, closeUpK);
+    display.columnMs = S.columnMs;            // the *main* picture's rate
+    worker?.postMessage({ type: 'columnMs', value: S.columnMs / closeUpK });
+    showCloseUpMenu();
+    save();
+}
+
+/// Rebuild the span menu, greying out the spans that cannot be drawn.
+///
+/// Legality is expressed in the control rather than left to be discovered:
+/// a span with no divisor satisfying both the engine's floor and the strip's
+/// width limits simply cannot be shown, and an entry that did nothing when
+/// picked would be worse than one that is visibly unavailable.
+function showCloseUpMenu() {
+    const sel = $('closeup');
+    sel.innerHTML = '';
+    for (const span of CLOSE_UP_SPANS) {
+        const o = document.createElement('option');
+        o.value = String(span);
+        o.textContent = span === 0 ? 'off' : `${span} mS`;
+        o.disabled = span > 0 && (S.deskew || !closeUpFit(
+            span, S.columnMs, display.maxCloseUpColumns, S.closeUpColumns));
+        sel.appendChild(o);
+    }
+    sel.value = String(S.closeUpSpanMs);
+    // De-skew works by delaying the whole picture by the apex's group delay,
+    // so it has nothing recent to show. The two are mutually exclusive.
+    sel.disabled = S.deskew || !closeUpAvailable(S.columnMs);
+}
+
+$('closeup').onchange = e => {
+    S.closeUpSpanMs = +e.target.value;
+    applyCloseUp();
+};
+display.snapCloseUpWidth = asked => {
+    const f = closeUpFit(S.closeUpSpanMs, S.columnMs,
+                         display.maxCloseUpColumns, asked);
+    return f ? f.columns : 0;
+};
+display.onCloseUpWidthChanged = cols => {
+    S.closeUpColumns = cols;
+    applyCloseUp();
+};
+showCloseUpMenu();
+showTransport();
+
+// ---- the machinery -------------------------------------------------------
+
+function startWorker() {
+    worker = new Worker('./engine-worker.js', { type: 'module' });
+    worker.onmessage = ev => {
+        const m = ev.data;
+        if (m.type === 'ready') {
+            display.setGeometry(m.taps, m.frequencies);
+            applyCloseUp();              // the width limit needs the geometry
+        } else if (m.type === 'columns') {
+            // Dropped rather than queued while frozen. Live input carries on
+            // whether we are looking or not, and a queue would replay the
+            // waiting seconds at high speed the moment you resumed.
+            if (!paused) { display.append(m.levels, m.coherence, m.refs, m.columns); }
+            colsSeen += m.columns;
+        } else if (m.type === 'error') {
+            say('error: ' + m.message);
+        }
+    };
+}
+
+function openEngine() {
+    worker.postMessage({
+        type: 'open',
+        coeff: `cochlea_88200_erb${S.erb}.coch`,
+        rate: ctx.sampleRate,
+        columnMs: S.columnMs / closeUpK,
+        deskew: S.deskew ? 1 : 0,
+    });
+}
+
+async function ensureAudio() {
+    if (ctx) return;
+    ctx = new AudioContext();
+    await ctx.audioWorklet.addModule('./capture-worklet.js');
+    // Explicitly mono, so a stereo file is mixed down by the browser rather
+    // than having its right channel quietly dropped.
+    capture = new AudioWorkletNode(ctx, 'capture', {
+        numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+        channelCount: 1, channelCountMode: 'explicit',
+        channelInterpretation: 'speakers',
+    });
+    capture.port.onmessage = ev => {
+        worker.postMessage({ type: 'audio', samples: ev.data },
+                           [ev.data.buffer]);
+    };
+    // A worklet with nothing downstream may be pruned, so it feeds a silent
+    // sink. Not the speakers: this is a microphone display, and routing the
+    // microphone to the output is how you get feedback.
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    capture.connect(mute).connect(ctx.destination);
+
+    startWorker();
+    openEngine();
+    requestAnimationFrame(frame);
+}
+
+/// One button, and it shows what pressing it will do.
+///
+/// There is no separate way back to the microphone. Everything that button
+/// would have done -- start listening if the browser refused on load, return
+/// to live input after a file has run out -- is a case of "make the picture
+/// move again", which is what this one already means. The Mac app's space bar
+/// has always worked this way.
+function showTransport() {
+    const willStart = paused || fileEnded || !ctx || (!micSource && !fileSource);
+    $('pause').textContent = willStart ? '\u25B6' : '\u2759\u2759';
+    $('pause').title = fileEnded || (!micSource && !fileSource)
+        ? 'Listen to the microphone'
+        : (paused ? 'Resume' : 'Freeze the display');
+}
+
+/// A file that has run out has nothing to resume, so rather than have the
+/// button do nothing it takes you back to live input. The picture is left
+/// frozen at the end of the file on purpose -- that is when you want to
+/// measure what you have just seen.
+function togglePause() {
+    if (!ctx || fileEnded || (!micSource && !fileSource)) {
+        fileEnded = false;
+        startMic();
+        return;
+    }
+    setPaused(!paused);
+}
+
+function stopSources() {
+    if (fileSource) { try { fileSource.stop(); } catch {} fileSource.disconnect(); fileSource = null; }
+    if (micSource) { micSource.disconnect(); micSource = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    playingFile = false;
+}
+
+// ---- sources -------------------------------------------------------------
+
+async function startMic({ quiet = false } = {}) {
+    await ensureAudio();
+    // Before asking for the microphone, not after: stopSources() stops every
+    // track it can see, and called afterwards it would have switched off the
+    // stream that had just been granted.
+    stopSources();
+    try {
+        // All three off. They are meant to make speech intelligible over a
+        // call, and each is a filter, a gate or a compressor sitting between
+        // the microphone and a display whose whole purpose is to show what the
+        // signal actually is.
+        micStream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false,
+                     autoGainControl: false },
+        });
+    } catch (e) {
+        // On load this is not a failure worth shouting about: the visitor may
+        // simply not have been asked yet, or may have said no and be about to
+        // open a file instead.
+        if (!quiet) say('no microphone: ' + e.message);
+        showTransport();          // still offering to try again
+        return false;
+    }
+    micSource = ctx.createMediaStreamSource(micStream);
+    micSource.connect(capture);
+    fileEnded = false;
+    setPaused(false);
+    await resumeAudio();
+    return true;
+}
+
+
+/// Get the context running, and if the browser will not allow it yet, wait
+/// for the first gesture and try again.
+///
+/// Autoplay policy: an AudioContext starts suspended and `resume()` is only
+/// honoured once the page has been interacted with. Granting the microphone
+/// counts on some browsers and not on others, so this asks, checks, and if the
+/// answer is no, arms a one-shot listener rather than leaving a page that
+/// looks alive and is silent.
+async function resumeAudio() {
+    if (!ctx) return false;
+    try { await ctx.resume(); } catch {}
+    if (ctx.state === 'running') return true;
+    say('click anywhere to start');
+    const go = async () => {
+        document.removeEventListener('pointerdown', go);
+        document.removeEventListener('keydown', go);
+        await ctx.resume();
+        if (ctx.state === 'running') say(`live · ${Math.round(ctx.sampleRate)} Hz`);
+    };
+    document.addEventListener('pointerdown', go);
+    document.addEventListener('keydown', go);
+    return false;
+}
+
+$('open').onclick = () => $('file').click();
+$('file').onchange = e => { if (e.target.files[0]) playFile(e.target.files[0]); };
+
+async function playFile(file) {
+    await ensureAudio();
+    stopSources();
+    await resumeAudio();
+    let buf;
+    try {
+        buf = await ctx.decodeAudioData(await file.arrayBuffer());
+    } catch (e) {
+        say(`cannot decode ${file.name}`);
+        return;
+    }
+    fileSource = ctx.createBufferSource();
+    fileSource.buffer = buf;
+    fileSource.connect(capture);
+    fileSource.connect(ctx.destination);      // and you hear it
+    fileSource.onended = () => {
+        // Not a gap in time -- it is the boundary of the recording, and worth
+        // telling apart from whatever arrives next.
+        if (playingFile) {
+            display.mark('fileEnd');
+            playingFile = false;
+            fileEnded = true;
+            showTransport();
+        }
+    };
+    playingFile = true;
+    fileEnded = false;
+    setPaused(false);
+    fileSource.start();
+    say(`${file.name} · ${buf.duration.toFixed(1)} s`);
+}
+
+// Dropping a file on the picture is the obvious gesture and costs three lines.
+view.addEventListener('dragover', e => { e.preventDefault(); view.classList.add('drop'); });
+view.addEventListener('dragleave', () => view.classList.remove('drop'));
+view.addEventListener('drop', e => {
+    e.preventDefault(); view.classList.remove('drop');
+    if (e.dataTransfer.files[0]) playFile(e.dataTransfer.files[0]);
+});
+
+// ---- transport -----------------------------------------------------------
+
+function setPaused(on) {
+    paused = on;
+    // A measurement is anchored to a column of a frozen picture. Once the
+    // picture starts moving again the two lines are over whatever has scrolled
+    // into their place, which is not what was measured.
+    display.paused = on;
+    if (!on) display.clearMeasurement();
+    if (playingFile) {
+        // A file is genuinely paused: nothing is produced and nothing is lost,
+        // so there is no seam to mark and drawing one would be a lie in the
+        // other direction.
+        on ? ctx.suspend() : ctx.resume();
+    } else if (on) {
+        display.mark('seam');
+    }
+    showTransport();
+}
+$('pause').onclick = togglePause;
+window.addEventListener('keydown', e => {
+    // Escape dismisses a measurement, and only that: swallowing it when there
+    // is nothing to dismiss would stop it doing whatever else it does.
+    if (e.code === 'Escape' && display.hasMeasurement) {
+        display.clearMeasurement();
+        return;
+    }
+    if (e.code === 'Space') {
+        // Space is the transport, wherever the focus happens to be.
+        //
+        // Clicking a checkbox leaves it focused, and the browser's own meaning
+        // for space on a focused checkbox is "toggle me" -- so after touching
+        // any control, space stopped pausing and started flipping whatever was
+        // clicked last. preventDefault is what stops that: the toggle is a
+        // default action, and refusing it here happens before the control ever
+        // sees the key.
+        //
+        // The exception is somewhere you might be typing, where a space is a
+        // space. There is nowhere in this page today, but there will be.
+        const t = e.target;
+        if (t && (t.isContentEditable ||
+                  (t.tagName === 'INPUT' &&
+                   ['text', 'search', 'number', 'email', 'url'].includes(t.type)))) {
+            return;
+        }
+        e.preventDefault();
+        togglePause();
+    }
+});
+
+// Let go of a control once it has been clicked.
+//
+// Not only so space keeps working -- preventDefault already sees to that --
+// but because a control that stays visibly selected after you have finished
+// with it looks like it is still waiting for something.
+//
+// Only on a real click: `detail` is zero when a click was synthesised from the
+// keyboard, and someone navigating by Tab should keep the focus they are
+// using. Selects are let go on change instead, since blurring one mid-click
+// would shut the menu the click had just opened.
+for (const el of document.querySelectorAll('#bars button, #bars input')) {
+    el.addEventListener('click', e => { if (e.detail > 0) el.blur(); });
+}
+for (const el of document.querySelectorAll('#bars select')) {
+    el.addEventListener('change', () => el.blur());
+}
+
+// ---- controls ------------------------------------------------------------
+
+$('speed').onchange = e => {
+    S.columnMs = +e.target.value; save();
+    // Everything left of the mark was drawn at a different number of
+    // milliseconds per column, so widths either side are not comparable.
+    display.mark('scaleChange');
+    // The divisor is derived from the main column time, so changing Speed
+    // changes the engine's rate as well when the close-up is open.
+    applyCloseUp();
+};
+$('erb').onchange = e => {
+    S.erb = e.target.value; save();
+    // A different tuning is a different coefficient file, so the engine is
+    // reopened; the filters either side of the mark have different bandwidths.
+    display.mark('tuningChange');
+    if (worker) openEngine();
+};
+$('deskew').onchange = e => {
+    S.deskew = e.target.checked; save();
+    worker?.postMessage({ type: 'deskew', value: S.deskew ? 1 : 0 });
+    applyCloseUp();                     // the two cannot both be on
+};
+$('invert').onchange = e => {
+    S.invert = e.target.checked; save();
+    display.exposure.inverted = S.invert;
+    display.remapAll();
+};
+$('auto').onchange = e => {
+    S.autoGain = e.target.checked; save();
+    display.exposure.autoGain = S.autoGain;
+    display.remapAll();
+};
+
+function exposureChanged() {
+    // White is where the picture reaches white and black where it reaches
+    // black, so they cannot cross, and squeezed together they would make every
+    // level either one or the other.
+    let w = +$('white').value, b = +$('black').value;
+    if (b - w < 10) {
+        if (this === $('white')) b = Math.min(10, w + 10);
+        else w = Math.max(-130, b - 10);
+        $('white').value = w; $('black').value = b;
+    }
+    S.whiteDB = w; S.blackDB = b; save();
+    display.exposure.whiteDB = w;
+    display.exposure.blackDB = b;
+    $('range').textContent = `${w} … ${b} dB`;
+    display.remapAll();
+}
+$('white').oninput = exposureChanged;
+$('black').oninput = exposureChanged;
+
+// ---- the frame -----------------------------------------------------------
+
+/// Back to the starting values, and forget what was stored.
+///
+/// Settings that persist outlive every change to what the defaults are, so
+/// without this the only way to see a new one would be to know about
+/// localStorage.
+$('reset').onclick = () => {
+    S = { ...defaults };
+    try { localStorage.removeItem(KEY); } catch {}
+    applySettings();
+    applyCloseUp();
+    display.remapAll();
+    if (worker) {
+        display.mark('tuningChange');
+        openEngine();                    // tuning and column time in one go
+    }
+};
+
+function frame(t) {
+    display.render();
+    if (t - lastReport > 1000) {
+        const rate = colsSeen * 1000 / (t - lastReport);
+        if (!paused) {
+            say(`${display.taps} taps · ${Math.round(ctx.sampleRate)} Hz · `
+                + `${rate.toFixed(0)} col/s`);
+        }
+        colsSeen = 0;
+        lastReport = t;
+    }
+    requestAnimationFrame(frame);
+}
+
+/// Follow the element, not the window.
+///
+/// A `resize` event on `window` is about the window, and inside a frame the
+/// frame can be resized without the window ever changing -- which is exactly
+/// what happens when the page around it grows. Observing the canvas catches
+/// both, and is the only thing that works in both the standalone page and the
+/// framed one.
+const refit = () => {
+    display.resize();
+    // Half the picture is the close-up strip's ceiling, so a change of width
+    // can make the current strip illegal.
+    applyCloseUp();
+};
+try {
+    new ResizeObserver(refit).observe(view);
+} catch {
+    window.addEventListener('resize', refit);
+}
+
+// Start listening without being asked to.
+//
+// Nothing about the page is interesting until sound is going through it, and
+// a button that must be pressed before anything happens is a button between
+// the visitor and the only thing they came for.
+//
+// It cannot simply be done, though. `getUserMedia` needs permission, which on
+// a first visit means a prompt; and an AudioContext will not run until the
+// page has been interacted with. So: ask, and if either says no, fall back to
+// the button and to `resumeAudio`'s one-shot listener. A refusal here is a
+// quiet no-op, not an error -- the visitor may be about to open a file.
+(async () => {
+    // If the browser can tell us the answer without prompting, use it: an
+    // unheralded permission dialog on load is worse manners than a button.
+    // Safari has no 'microphone' descriptor and throws, in which case asking
+    // is the only way to find out.
+    let known = null;
+    try {
+        known = (await navigator.permissions.query({ name: 'microphone' })).state;
+    } catch {}
+    if (known === 'denied') return;
+    await startMic({ quiet: true });
+})();
+</script>
+
+</body>
+</html>

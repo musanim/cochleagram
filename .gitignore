@@ -20,6 +20,13 @@ __pycache__/
 # to questions it is not going to ask.
 .cache/
 
+web/bench/build/
+# Built by web/build.sh: the WASM module, its glue, and the coefficient files
+# copied from the app's Resources.
+web/site/cochlea.js
+web/site/cochlea.wasm
+web/site/*.coch
+
 # macOS
 .DS_Store
 

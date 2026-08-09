@@ -29,7 +29,24 @@
 
 namespace {
 
-constexpr int   kMaxDeskewColumns = 256;   /* covers 1 s at 4 ms columns */
+/* De-skew history depth, in columns.
+ *
+ * It has to cover the apex's group delay -- about 183 ms -- at the *shortest*
+ * column the host will ask for, and that is not 4 ms. Close-up runs the engine
+ * a divisor times faster, down to 0.05 ms a column, where 183 ms is 3660
+ * columns.
+ *
+ * It was 256, which covers a second at 4 ms and looked ample. What it actually
+ * did at short columns was clamp: every tap needing more than 255 columns got
+ * exactly 255, so instead of a hold-back that grows with frequency they all
+ * received the same one, and the skew de-skew exists to remove survived almost
+ * untouched. It failed silently and only at fine Speeds, which is why it
+ * looked like a drawing problem rather than an arithmetic one.
+ *
+ * 4096 columns is 205 ms at 0.05 ms and 16 s at 4 ms. The cost is
+ * 4096 x 599 x 4 bytes, twice -- about 20 MB -- which is the price of the
+ * feature working at every Speed rather than at some of them. */
+constexpr int   kMaxDeskewColumns = 4096;
 /*  Output queue.  At the close-up's finest column time the engine produces
  *  20,000 columns a second, so 4096 columns was 200 ms of slack -- a dozen
  *  frames, and one stall from overflowing.  8192 is 400 ms.
@@ -558,6 +575,81 @@ struct CochleaEngine {
         resetState();
     }
 
+    /// Measure what the de-skew shifts should be, rather than trusting the
+    /// number in the coefficient file.
+    ///
+    /// The file carries an analytic group delay -- what the poles say the
+    /// cascade should do. What the display draws is the sample-and-hold peak,
+    /// and the two are not the same thing: measured against an impulse they
+    /// disagree by up to 10 ms at the apex and by -5 ms around 78 Hz, which is
+    /// exactly the residual tilt left over after de-skewing by the analytic
+    /// value. There is no reason to infer a quantity we can simply observe --
+    /// the cascade is right here, with these coefficients, this rate, and the
+    /// middle ear in front of it.
+    ///
+    /// Half a second, because the apex's delay alone is about 180 ms and its
+    /// ringing outlasts that. Paid once, at startup, beside the coherence
+    /// calibration.
+    void calibrateDelays() {
+        const int n = n_taps;
+        if (n < 1) return;
+        const long total = static_cast<long>(fs * 0.5);
+
+        /* Two passes, because the threshold for the second is a property of
+         * the first. */
+        resetState();
+        std::vector<double> best(static_cast<size_t>(n), 0.0);
+        for (long i = 0; i < total; ++i) {
+            runCascade(i == 0 ? 1.0 : 0.0);
+            for (int t = 0; t < n; ++t) {
+                if (held[t] > best[static_cast<size_t>(t)]) {
+                    best[static_cast<size_t>(t)] = held[t];
+                }
+            }
+        }
+
+        /* The *first* peak, not the biggest one and not the first big one.
+         *
+         * A tap's impulse response builds over a cycle or two, so its largest
+         * peak comes after its first. Lining up the largest ones lines up the
+         * wrong feature: what the eye follows is the leading edge of the mark,
+         * and at 30 Hz the gap between the first peak and the biggest is a
+         * whole cycle -- 33 ms.
+         *
+         * The threshold below is only there to ignore numerical dirt. It was a
+         * tenth of the tap's maximum, which sounds modest and is not: the first
+         * peak is a smaller fraction of the maximum the higher the tap, so a
+         * tenth caught the second peak from 113 Hz up and the third from 334,
+         * skipping a whole cycle each time. A hundred-thousandth is 100 dB
+         * down, far below anything that is ever drawn, so the first crossing is
+         * the first peak and nothing else.
+         *
+         * `held` only ever moves at a genuine positive local maximum of the
+         * tap's output, so "the first time held moves" *is* "the first peak".
+         * The threshold is a guard, not a selector. */
+        constexpr double kLeadFraction = 1e-5;
+        resetState();
+        std::vector<long> at(static_cast<size_t>(n), 0);
+        std::vector<bool> found(static_cast<size_t>(n), false);
+        for (long i = 0; i < total; ++i) {
+            runCascade(i == 0 ? 1.0 : 0.0);
+            for (int t = 0; t < n; ++t) {
+                if (!found[static_cast<size_t>(t)] &&
+                    held[t] >= kLeadFraction * best[static_cast<size_t>(t)] &&
+                    best[static_cast<size_t>(t)] > 0.0) {
+                    found[static_cast<size_t>(t)] = true;
+                    at[static_cast<size_t>(t)] = i;
+                }
+            }
+        }
+        for (int t = 0; t < n; ++t) {
+            gdelay[static_cast<size_t>(t)] =
+                static_cast<double>(at[static_cast<size_t>(t)]) / fs;
+        }
+        resetState();
+        recomputeShifts();
+    }
+
     /*  Back to silence, with nothing left over from whatever was fed in. */
     void resetState() {
         std::fill(z1.begin(), z1.end(), 0.0);
@@ -709,6 +801,11 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
     /*  Last, because it runs audio through the finished engine and then puts
      *  it back the way it found it. */
     e->calibrateCoherence();
+    /*  After the coherence pass, and after the analytic dt_base above was
+     *  derived from the file's delays: this overwrites gdelay with measured
+     *  ones, and doing it earlier would change a fallback that has nothing to
+     *  do with de-skew. */
+    e->calibrateDelays();
     return e;
 }
 

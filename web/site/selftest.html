@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cochleagram engine self-test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+         max-width: 46em; margin: 3rem auto; padding: 0 1.25rem; }
+  pre { background: rgba(128,128,128,0.12); padding: 0.9rem 1rem;
+        border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  button { font: inherit; padding: 0.5rem 1.2rem; border-radius: 6px; }
+  label { margin-right: 1.2rem; }
+  input { font: inherit; width: 5em; }
+</style>
+</head>
+<body>
+
+<h1>Engine self-test</h1>
+
+<p>Runs the same benchmark as <code>web/bench</code>, on the same deterministic
+noise, through the WebAssembly build. The speed says whether a browser version
+is practical. The <b>digest</b> says whether it is the <i>same engine</i> — it
+should match the native run to about six decimal places, and if it does not,
+something about the port is wrong in a way no amount of looking at a picture
+would reveal.</p>
+
+<p>
+  <label>seconds <input id="secs" type="number" value="20" min="1"></label>
+  <label>input rate <input id="rate" type="number" value="48000"></label>
+  <label>ERB <input id="erb" type="text" value="100" size="3"></label>
+</p>
+
+<p><button id="go">Run</button></p>
+
+<pre id="out">Ready.</pre>
+
+<script type="module">
+import { Cochlea } from './engine.js';
+
+const out = document.getElementById('out');
+const say = t => { out.textContent += '\n' + t; };
+
+/// The same generator as bench.cpp, digit for digit.
+///
+/// A different noise would make the digests incomparable, which is the whole
+/// point of having one -- so this is xorshift64 with the same seed, in BigInt
+/// because JavaScript has no other 64-bit integer. It is slow and it is not on
+/// any hot path.
+function noise(n) {
+    const M64 = (1n << 64n) - 1n;
+    let s = 88172645463325252n;
+    const x = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        s = (s ^ (s << 13n)) & M64;
+        s = s ^ (s >> 7n);
+        s = (s ^ (s << 17n)) & M64;
+        x[i] = (Number(s >> 11n) / 2 ** 52) * 0.25;
+    }
+    return x;
+}
+
+document.getElementById('go').onclick = async () => {
+    const secs = +document.getElementById('secs').value;
+    const rate = +document.getElementById('rate').value;
+    const erb = document.getElementById('erb').value.padStart(3, '0');
+    out.textContent = 'Loading…';
+
+    let c;
+    try {
+        c = await Cochlea.create(`cochlea_88200_erb${erb}.coch`, rate);
+    } catch (e) {
+        say('FAILED: ' + e.message);
+        return;
+    }
+    say(`${c.tapCount} taps, internal ${Math.round(c.internalRate)} Hz, ` +
+        `input ${rate} Hz`);
+    say(`top tap ${c.frequencies[0].toFixed(1)} Hz, ` +
+        `bottom ${c.frequencies[c.tapCount - 1].toFixed(1)} Hz`);
+
+    const N = Math.floor(rate * secs);
+    say('generating noise…');
+    await new Promise(r => setTimeout(r, 0));
+    const x = noise(N);
+
+    // 128 samples is one Web Audio quantum, so this is the real block size.
+    const BLOCK = 128;
+    let pulled = 0, dl = 0, dc = 0;
+    const t0 = performance.now();
+    for (let i = 0; i + BLOCK <= N; i += BLOCK) {
+        c.process(x.subarray(i, i + BLOCK));
+        const got = c.pullColumns(64);
+        if (got) {
+            for (let k = 0; k < got.levels.length; k++) {
+                dl += got.levels[k];
+                dc += got.coherence[k];
+            }
+            pulled += got.columns;
+        }
+    }
+    const el = (performance.now() - t0) / 1000;
+
+    say(`${secs.toFixed(1)} s of audio in ${el.toFixed(3)} s  ->  ` +
+        `${(secs / el).toFixed(1)}x realtime, ` +
+        `${(100 * el / secs).toFixed(1)}% of one core`);
+    say(`columns pulled ${pulled}, dropped ${c.droppedColumns}`);
+    say(`digest  levels ${(dl / (pulled * c.tapCount)).toFixed(6)}  ` +
+        `coherence ${(dc / (pulled * c.tapCount)).toFixed(6)}`);
+    c.destroy();
+};
+</script>
+
+</body>
+</html>

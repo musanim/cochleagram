@@ -7,23 +7,38 @@ better or more faithful to the original.
 
 ## Display fidelity
 
-**De-skew reference.** Currently group delay from the analytic phase slope at
-each tap's best frequency. Smooth and monotone, which is what matters — but on a
-synthetic click it leaves 15 ms of spread across taps, where impulse-peak
-alignment gives 1 ms.
+**De-skew reference.** *Mostly settled, 2026aug09.* The engine no longer uses
+the analytic group delay from the coefficient file. At startup it feeds an
+impulse through the finished cascade -- same coefficients, same rate, middle ear
+included -- and records, per tap, the time of the **first** peak of the
+sample-and-hold level, not the largest. That is the feature the eye follows: a
+tap's response builds over a cycle or two, so aligning maxima aligns something a
+whole cycle late at the apex.
 
-The impulse-peak version is implemented (`which='delay'`) and *unusable as is*:
-it picks the largest positive sample of an oscillating response, so neighbouring
-taps land on different cycles of their own ringing. Across 599 taps it is
-non-monotone in ten places and fifty times rougher in second difference (1.36 ms
-rms against 0.027 ms, worst jump 20.8 ms). The jitter is bounded by each tap's
-half-period — 10 to 23 ms at the apex — which tears the low end of the picture
-apart.
+The earlier attempt failed because it picked the largest peak, and because the
+"ignore numerical dirt" threshold was set at a tenth of each tap's maximum --
+high enough to skip to the second peak above 113 Hz and the third above 334.
+It is now 1e-5, which selects nothing and only guards.
 
-*To try:* envelope-detect the impulse response (Hilbert, or a rectify-and-smooth
-at a fraction of the tap's bandwidth) instead of picking a raw sample, then
-smooth lightly across taps. That should land near impulse-peak accuracy with
-group-delay smoothness. Worth an hour.
+What remains:
+
+* **A one-pixel staircase along the leading edge.** Inherent, not a bug: the
+  de-skew history is a per-column ring, so shifts are a whole number of columns
+  and each tap's sub-column remainder survives. Bounded by one column at any
+  Speed. Removing it means interpolating between columns on the de-skew read,
+  which would blur the one thing this display refuses to blur.
+* **Sharp tunings are still not monotone.** The calibrated delay steps
+  *backwards* by 4.5 ms at 305 Hz at ERB 0.6 and 10.5 ms at 137 Hz at ERB 0.5 --
+  a few taps latching a different peak from their neighbours. ERB 1.0 and above
+  are clean. A median over five taps would fix it and cannot hurt the tunings
+  that are already smooth. Untried.
+* A related clamp bug is fixed: `kMaxDeskewColumns` was 256, which covers a
+  second at 4 ms columns and 12 ms at 0.05 ms ones. At fine Speeds every tap
+  above a crossover frequency got the *same* hold-back instead of one growing
+  with frequency, so the picture kept its skew and merely moved. Now 4096.
+
+`xcode/Cochleagram/tools/skew.cpp` and `tools/leadedge.cpp` measure all of this
+without a Mac.
 
 **Harmonic crispness.** Stephen's reference image separates resolved harmonics
 slightly more cleanly than the rebuild does. Candidates: tuning sharper than one

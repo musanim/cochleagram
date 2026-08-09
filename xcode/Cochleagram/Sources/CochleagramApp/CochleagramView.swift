@@ -116,6 +116,26 @@ final class CochleagramView: NSView {
     /// runs the engine five times faster and it stopped being invisible: the
     /// main thread managed one frame in the first second. Column-major makes
     /// appending a column one contiguous copy and scrolling one `memmove`.
+    // MARK: - automatic exposure
+    //
+    // The engine tracks a reference too, but it is a peak follower: it rises
+    // to the loudest tap at once and decays back. In a quiet room the loudest
+    // tap *is* the noise floor, so the reference sinks to meet it and the whole
+    // window ends up below the noise -- the picture goes solid black, having
+    // faithfully exposed for a signal that is not there.
+    //
+    // This aims at a property of the picture instead: keep the average pixel
+    // about 30% of the way to full ink. It cannot run away, because the thing
+    // it measures is the thing it controls, and it does not care whether the
+    // level it is looking at is signal or noise -- only whether there is a
+    // legible amount of ink on the paper.
+    private var autoRef: Float = 0
+    /// Mean ink to aim for. 0 is blank paper, 1 is solid.
+    private let autoTargetInk: Float = 0.30
+    /// How fast the reference chases it, in dB per second at full error. Slow
+    /// enough not to pump on speech, fast enough to follow a room.
+    private let autoRateDB: Float = 25
+
     private var levels = [Float]()
     /// The other half of the picture: coherence, in cycles, same shape as
     /// `levels`. Kept whichever mode is showing, for the same reason the
@@ -732,12 +752,54 @@ final class CochleagramView: NSView {
         }
     }
 
+    /// The reference each incoming column should be drawn against.
+    ///
+    /// Per column, and stored alongside the column, so that a column keeps the
+    /// exposure it was drawn with. Re-exposing the whole picture every time the
+    /// reference moved would make everything already on screen shimmer in step
+    /// with whatever had just happened, which is a display that cannot be read
+    /// while it is changing.
+    ///
+    /// Runs whether or not Auto gain is on, so that switching it on gives a
+    /// reference that has already found the room rather than one starting from
+    /// a standing start.
+    private func autoExpose(_ src: UnsafePointer<Float>, columns n: Int)
+    -> [Float] {
+        var out = [Float](repeating: 0, count: n)
+        guard height > 0 else { return out }
+        let white = Float(exposure.whiteDB), black = Float(exposure.blackDB)
+        let span = (black - white) == 0 ? 1 : (black - white)
+        // These are *engine* columns, which under Close-up arrive `aggregate`
+        // times faster than the main picture scrolls -- so the rate has to be
+        // in the engine's time, not the display's, or the loop would chase
+        // that much harder the moment the strip was opened.
+        let engineMS = mainColumnMS / Double(max(1, aggregate))
+        let step = autoRateDB * Float(engineMS / 1000.0)
+        for j in 0..<n {
+            let base = j * height
+            let lo = white + autoRef
+            var sum: Float = 0
+            for y in 0..<height {
+                let t = (src[base + y] - lo) / span
+                sum += t < 0 ? 0 : (t > 1 ? 1 : t)
+            }
+            out[j] = autoRef
+            // Too much ink means the window is too low, so lift it.
+            let err = sum / Float(height) - autoTargetInk
+            autoRef = min(60, max(-160, autoRef + step * err))
+        }
+        return out
+    }
+
     private func append(_ lv: UnsafeBufferPointer<Float>,
                         _ co: UnsafeBufferPointer<Float>,
                         _ rf: UnsafeBufferPointer<Float>, columns n: Int) {
+        // `rf` -- the engine's own peak-following reference -- is deliberately
+        // ignored. See `autoExpose`.
         guard let src = lv.baseAddress, let srcCoh = co.baseAddress,
-              let srcRef = rf.baseAddress, n > 0, width > 0, height > 0
+              n > 0, width > 0, height > 0
         else { return }
+        let srcRef = autoExpose(src, columns: n)
 
         // Never more than half the window: the strip is now wide enough that
         // on a small window it could otherwise leave the ordinary picture a

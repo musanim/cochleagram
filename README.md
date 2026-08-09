@@ -35,13 +35,19 @@ does not mean.
 |---|---|
 | `prototype/` | Python. Defines correctness — the filter design, the coefficient baking, and the reference implementations everything in the app is checked against. See `prototype/README.md`. |
 | `xcode/` | The real-time macOS app: a C++ engine behind a thin C interface, an AppKit front end, and baked coefficients for nine tuning sharpnesses. |
+| `web/` | The same engine compiled to WebAssembly, and a page that runs it. See `web/README.md`. |
 | `OPEN-QUESTIONS.md` | What is still not understood. |
 
 ## Getting it
 
-A signed, notarized build is at
-[musanim.com/Cochleagram](https://www.musanim.com/Cochleagram/) — no Xcode
-needed.
+It runs in a browser at
+[musanim.com/Cochleagram](https://www.musanim.com/Cochleagram/), which needs
+nothing installed. The same page has a signed, notarized Mac build.
+
+The browser version is not a reimplementation: it is `cochlea.cpp` compiled to
+WebAssembly through the same C interface the Mac app uses, and it produces
+numbers identical to the native build to six decimal places. Everything above
+except Coherence is in both.
 
 To build it yourself:
 
