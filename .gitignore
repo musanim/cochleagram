@@ -1,0 +1,44 @@
+# Build products. Regenerable, and 97 MB of the 147 this folder holds.
+.build/
+dist/
+*.app/
+DerivedData/
+xcuserdata/
+*.xcuserdatad/
+*.dSYM/
+*.o
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Not ours to publish. The CITRIS 2007 demo is 30 MB of somebody else's
+# footage, and shows work covered by patents still in effect.
+video/
+
+# Other people's machines, and correspondence -- ours and theirs.
+crashreports/
+outreach/
+Cochleagram_2026aug02.txt
+
+# How the idea is being pitched, which is not for the people being pitched to.
+PITCH.md
+
+# Working notes. They discuss named people who have not agreed to be
+# discussed, and read the correspondence in outreach/ out loud.
+handoffs/
+
+# Working material rather than the project: session transcripts, generated
+# plots, and several megabytes of test audio that the scripts in prototype/
+# will make again on demand.
+SessionLogs/
+figures/
+testsignals/
+
+# Commit messages written here for `git commit -F`, so they do not turn up
+# in the commit they describe.
+commit-message.txt

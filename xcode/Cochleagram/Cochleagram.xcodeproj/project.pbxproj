@@ -1,0 +1,388 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		CC0000000000000000000002 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000001 /* main.swift */; };
+		CC0000000000000000000004 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000003 /* AppDelegate.swift */; };
+		CC0000000000000000000006 /* AudioSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000005 /* AudioSource.swift */; };
+		CC0000000000000000000008 /* Cochlea.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000007 /* Cochlea.swift */; };
+		CC000000000000000000000A /* CochleagramView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000009 /* CochleagramView.swift */; };
+		CC000000000000000000000C /* Log.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC000000000000000000000B /* Log.swift */; };
+		CC000000000000000000000E /* cochlea.cpp in Sources */ = {isa = PBXBuildFile; fileRef = CC000000000000000000000D /* cochlea.cpp */; };
+		CC0000000000000000000026 /* AudioDevices.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000025 /* AudioDevices.swift */; };
+		CC0000000000000000000028 /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000027 /* Settings.swift */; };
+		CC000000000000000000002A /* InputUnit.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000029 /* InputUnit.swift */; };
+		CC0000000000000000000087 /* Cochleagram.icns in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000088 /* Cochleagram.icns */; };
+		CC000000000000000000002C /* cochlea_88200_erb050.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC000000000000000000002B /* cochlea_88200_erb050.coch */; };
+		CC0000000000000000000030 /* cochlea_88200_erb060.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC000000000000000000002F /* cochlea_88200_erb060.coch */; };
+		CC0000000000000000000036 /* cochlea_88200_erb070.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000035 /* cochlea_88200_erb070.coch */; };
+		CC000000000000000000003E /* cochlea_88200_erb080.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC000000000000000000003D /* cochlea_88200_erb080.coch */; };
+		CC0000000000000000000048 /* cochlea_88200_erb090.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000047 /* cochlea_88200_erb090.coch */; };
+		CC0000000000000000000054 /* cochlea_88200_erb100.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000053 /* cochlea_88200_erb100.coch */; };
+		CC0000000000000000000062 /* cochlea_88200_erb110.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000061 /* cochlea_88200_erb110.coch */; };
+		CC0000000000000000000072 /* cochlea_88200_erb120.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000071 /* cochlea_88200_erb120.coch */; };
+		CC0000000000000000000084 /* cochlea_88200_erb130.coch in Resources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000083 /* cochlea_88200_erb130.coch */; };
+		CC0000000000000000000086 /* RangeSlider.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC0000000000000000000085 /* RangeSlider.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		CC0000000000000000000001 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		CC0000000000000000000003 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		CC0000000000000000000005 /* AudioSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSource.swift; sourceTree = "<group>"; };
+		CC0000000000000000000007 /* Cochlea.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cochlea.swift; sourceTree = "<group>"; };
+		CC0000000000000000000009 /* CochleagramView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CochleagramView.swift; sourceTree = "<group>"; };
+		CC000000000000000000000B /* Log.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Log.swift; sourceTree = "<group>"; };
+		CC000000000000000000000D /* cochlea.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = cochlea.cpp; sourceTree = "<group>"; };
+		CC000000000000000000000F /* cochlea.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cochlea.h; sourceTree = "<group>"; };
+		CC0000000000000000000088 /* Cochleagram.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Cochleagram.icns; sourceTree = "<group>"; };
+		CC0000000000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		CC0000000000000000000013 /* Cochleagram.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Cochleagram.entitlements; sourceTree = "<group>"; };
+		CC0000000000000000000014 /* Cochleagram.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cochleagram.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		CC0000000000000000000025 /* AudioDevices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioDevices.swift; sourceTree = "<group>"; };
+		CC0000000000000000000027 /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
+		CC0000000000000000000029 /* InputUnit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputUnit.swift; sourceTree = "<group>"; };
+		CC000000000000000000002B /* cochlea_88200_erb050.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb050.coch; path = "Resources/cochlea_88200_erb050.coch"; sourceTree = "<group>"; };
+		CC000000000000000000002F /* cochlea_88200_erb060.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb060.coch; path = "Resources/cochlea_88200_erb060.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000035 /* cochlea_88200_erb070.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb070.coch; path = "Resources/cochlea_88200_erb070.coch"; sourceTree = "<group>"; };
+		CC000000000000000000003D /* cochlea_88200_erb080.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb080.coch; path = "Resources/cochlea_88200_erb080.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000047 /* cochlea_88200_erb090.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb090.coch; path = "Resources/cochlea_88200_erb090.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000053 /* cochlea_88200_erb100.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb100.coch; path = "Resources/cochlea_88200_erb100.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000061 /* cochlea_88200_erb110.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb110.coch; path = "Resources/cochlea_88200_erb110.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000071 /* cochlea_88200_erb120.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb120.coch; path = "Resources/cochlea_88200_erb120.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000083 /* cochlea_88200_erb130.coch */ = {isa = PBXFileReference; lastKnownFileType = file; name = cochlea_88200_erb130.coch; path = "Resources/cochlea_88200_erb130.coch"; sourceTree = "<group>"; };
+		CC0000000000000000000085 /* RangeSlider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RangeSlider.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		CC000000000000000000001C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		CC0000000000000000000015 = {
+			isa = PBXGroup;
+			children = (
+				CC0000000000000000000016 /* Sources */,
+				CC0000000000000000000012 /* Info.plist */,
+				CC0000000000000000000088 /* Cochleagram.icns */,
+				CC0000000000000000000013 /* Cochleagram.entitlements */,
+				CC0000000000000000000019 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CC0000000000000000000016 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000000000000000000017 /* CochleagramApp */,
+				CC0000000000000000000018 /* CochleaDSP */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		CC0000000000000000000017 /* CochleagramApp */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000000000000000000001 /* main.swift */,
+				CC0000000000000000000003 /* AppDelegate.swift */,
+				CC0000000000000000000005 /* AudioSource.swift */,
+				CC0000000000000000000007 /* Cochlea.swift */,
+				CC0000000000000000000009 /* CochleagramView.swift */,
+				CC000000000000000000000B /* Log.swift */,
+				CC0000000000000000000085 /* RangeSlider.swift */,
+				CC0000000000000000000029 /* InputUnit.swift */,
+				CC0000000000000000000027 /* Settings.swift */,
+				CC0000000000000000000025 /* AudioDevices.swift */,
+				CC0000000000000000000083 /* cochlea_88200_erb130.coch */,
+				CC0000000000000000000071 /* cochlea_88200_erb120.coch */,
+				CC0000000000000000000061 /* cochlea_88200_erb110.coch */,
+				CC0000000000000000000053 /* cochlea_88200_erb100.coch */,
+				CC0000000000000000000047 /* cochlea_88200_erb090.coch */,
+				CC000000000000000000003D /* cochlea_88200_erb080.coch */,
+				CC0000000000000000000035 /* cochlea_88200_erb070.coch */,
+				CC000000000000000000002F /* cochlea_88200_erb060.coch */,
+				CC000000000000000000002B /* cochlea_88200_erb050.coch */,
+			);
+			path = CochleagramApp;
+			sourceTree = "<group>";
+		};
+		CC0000000000000000000018 /* CochleaDSP */ = {
+			isa = PBXGroup;
+			children = (
+				CC000000000000000000000D /* cochlea.cpp */,
+				CC000000000000000000000F /* cochlea.h */,
+			);
+			path = CochleaDSP;
+			sourceTree = "<group>";
+		};
+		CC0000000000000000000019 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				CC0000000000000000000014 /* Cochleagram.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		CC000000000000000000001D /* Cochleagram */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CC0000000000000000000020 /* Build configuration list for PBXNativeTarget "Cochleagram" */;
+			buildPhases = (
+				CC000000000000000000001A /* Sources */,
+				CC000000000000000000001C /* Frameworks */,
+				CC000000000000000000001B /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Cochleagram;
+			productName = Cochleagram;
+			productReference = CC0000000000000000000014 /* Cochleagram.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		CC000000000000000000001E /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 2660;
+			};
+			buildConfigurationList = CC000000000000000000001F /* Build configuration list for PBXProject "Cochleagram" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = CC0000000000000000000015;
+			productRefGroup = CC0000000000000000000019 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				CC000000000000000000001D /* Cochleagram */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		CC000000000000000000001B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CC0000000000000000000084 /* cochlea_88200_erb130.coch in Resources */,
+				CC0000000000000000000072 /* cochlea_88200_erb120.coch in Resources */,
+				CC0000000000000000000062 /* cochlea_88200_erb110.coch in Resources */,
+				CC0000000000000000000054 /* cochlea_88200_erb100.coch in Resources */,
+				CC0000000000000000000048 /* cochlea_88200_erb090.coch in Resources */,
+				CC000000000000000000003E /* cochlea_88200_erb080.coch in Resources */,
+				CC0000000000000000000036 /* cochlea_88200_erb070.coch in Resources */,
+				CC0000000000000000000030 /* cochlea_88200_erb060.coch in Resources */,
+				CC000000000000000000002C /* cochlea_88200_erb050.coch in Resources */,
+				CC0000000000000000000087 /* Cochleagram.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		CC000000000000000000001A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CC0000000000000000000002 /* main.swift in Sources */,
+				CC0000000000000000000086 /* RangeSlider.swift in Sources */,
+				CC000000000000000000002A /* InputUnit.swift in Sources */,
+				CC0000000000000000000028 /* Settings.swift in Sources */,
+				CC0000000000000000000026 /* AudioDevices.swift in Sources */,
+				CC0000000000000000000004 /* AppDelegate.swift in Sources */,
+				CC0000000000000000000006 /* AudioSource.swift in Sources */,
+				CC0000000000000000000008 /* Cochlea.swift in Sources */,
+				CC000000000000000000000A /* CochleagramView.swift in Sources */,
+				CC000000000000000000000C /* Log.swift in Sources */,
+				CC000000000000000000000E /* cochlea.cpp in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		CC0000000000000000000021 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = S59385AX28;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 2;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		CC0000000000000000000022 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++17";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = S59385AX28;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				GCC_OPTIMIZATION_LEVEL = 3;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+			};
+			name = Release;
+		};
+		CC0000000000000000000023 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Cochleagram.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Sources/CochleaDSP/include";
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = org.malinowski.cochleagram;
+				PRODUCT_NAME = Cochleagram;
+				SWIFT_OBJC_BRIDGING_HEADER = Sources/CochleaDSP/include/cochlea.h;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		CC0000000000000000000024 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Cochleagram.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				DEAD_CODE_STRIPPING = YES;
+				ENABLE_HARDENED_RUNTIME = YES;
+				HEADER_SEARCH_PATHS = "$(SRCROOT)/Sources/CochleaDSP/include";
+				INFOPLIST_FILE = Info.plist;
+				PRODUCT_BUNDLE_IDENTIFIER = org.malinowski.cochleagram;
+				PRODUCT_NAME = Cochleagram;
+				SWIFT_OBJC_BRIDGING_HEADER = Sources/CochleaDSP/include/cochlea.h;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		CC000000000000000000001F /* Build configuration list for PBXProject "Cochleagram" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC0000000000000000000021 /* Debug */,
+				CC0000000000000000000022 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CC0000000000000000000020 /* Build configuration list for PBXNativeTarget "Cochleagram" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CC0000000000000000000023 /* Debug */,
+				CC0000000000000000000024 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = CC000000000000000000001E /* Project object */;
+}
