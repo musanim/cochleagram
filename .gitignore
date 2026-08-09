@@ -13,6 +13,13 @@ __pycache__/
 *.pyc
 .venv/
 
+# The prototype's filterbank calibration. Derived -- regenerated on first run,
+# about forty seconds -- and the file names are content hashes, so every change
+# of parameters adds files and nothing ever removes them. Committed, the repo
+# would only ever grow, and a clone would arrive with a cache full of answers
+# to questions it is not going to ask.
+.cache/
+
 # macOS
 .DS_Store
 

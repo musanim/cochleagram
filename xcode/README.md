@@ -325,7 +325,7 @@ The engine is portable C++, so it can be checked without a Mac:
 cd Cochleagram
 c++ -std=c++17 -O2 -I Sources/CochleaDSP/include \
     tools/selftest.cpp Sources/CochleaDSP/cochlea.cpp -o selftest
-./selftest Sources/CochleagramApp/Resources/cochlea_88200.coch \
+./selftest Sources/CochleagramApp/Resources/cochlea_88200_erb100.coch \
     input.f32 44100 out.pgm 4.0 -35 1
 ```
 
