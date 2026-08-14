@@ -456,6 +456,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ---- upper row -------------------------------------------------
 
+        // Pause, first, in its own compartment. Space has always done this;
+        // the button exists because space does not reach a Mac being used over
+        // screen sharing with the keyboard somewhere else, and because nothing
+        // in the window said the key existed.
+        //
+        // At the head of the row rather than between the display controls and
+        // the file controls, which is where it used to sit on the reasoning
+        // that it belonged to neither. It belongs to neither, but the browser
+        // puts it first, and a transport control that changes position between
+        // two versions of the same instrument is worse than one filed under
+        // the wrong heading.
+        pauseButton = button("", #selector(pauseButtonPressed(_:)))
+        pauseButton.imagePosition = .imageOnly
+        topRow.addArrangedSubview(pauseButton)
+
+        topRow.addArrangedSubview(divider())
+
         // Tuning sharpness. Each entry is a separately baked coefficient
         // file, so this is a chooser, not a computation.
         //
@@ -490,17 +507,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         topRow.addArrangedSubview(divider())
 
-        // Pause, in its own compartment between the display controls and the
-        // file controls -- it belongs to neither. Space has always done this;
-        // the button exists because space does not reach a Mac being used
-        // over screen sharing with the keyboard somewhere else, and because
-        // nothing in the window said the key existed.
-        pauseButton = button("", #selector(pauseButtonPressed(_:)))
-        pauseButton.imagePosition = .imageOnly
-        topRow.addArrangedSubview(pauseButton)
-
-        topRow.addArrangedSubview(divider())
-
         // No "Live Input" button. The device menu in Settings starts live
         // input on whatever you choose, and two controls doing the same job
         // is how they came to disagree: the button ignored the menu and
@@ -529,9 +535,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fileNameLabel.isHidden = true
 
 
-        // Replay, at the right-hand end of the row -- which the spacer above
-        // and the equal-width constraint below put directly over the last
-        // Speed detent.
+        // Replay. Beside Play File, not at the end of the row -- see the note
+        // below on the order; this comment described where it used to be.
         replayButton = button("", #selector(replayFile(_:)))
         if let symbol = NSImage(systemSymbolName: "arrow.clockwise",
                                 accessibilityDescription: "Replay") {
