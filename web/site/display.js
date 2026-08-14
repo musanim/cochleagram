@@ -12,7 +12,7 @@
 
 /// What an untouched column reads: far below any usable floor, so a buffer
 /// that has been allocated but not filled renders as silence.
-const SILENT_DB = -240;
+const SILENT_DB = -600;   // matches kTinyLevel in cochlea.cpp
 const NO_COHERENCE = -1000;
 
 export class Display {
@@ -35,9 +35,13 @@ export class Display {
         this.bctx = this.bitmap.getContext('2d', { alpha: false });
         this.image = null;
 
+        // Overwritten by the page's applySettings() before the first frame.
+        // Kept in step with `defaults` there all the same: if a fault stops
+        // that call, what shows through should be the same picture and not an
+        // older one.
         this.exposure = {
-            whiteDB: -130, blackDB: 10,
-            autoGain: true, inverted: false,
+            whiteDB: -180, blackDB: -10,   // sensitivity 95, range 170
+            autoGain: false, inverted: false,
         };
 
         /// Places where the picture stops meaning what it meant, in columns.
@@ -116,6 +120,8 @@ export class Display {
         /// a control that lied.
         this.snapCloseUpWidth = null;
 
+        this.resizing = false;
+        this.imageDirty = false;
         this.hover = null;
         this.measurement = null;
         this.measuring = false;
@@ -327,12 +333,33 @@ export class Display {
     /// plot's width. Keeps the most recent part of the picture, right-aligned,
     /// exactly as the Mac app does -- what falls off is the oldest.
     resize() {
+        // Re-entrant guard. This is driven by a ResizeObserver on the canvas,
+        // and everything below can change the canvas -- so without this, one
+        // observation can cause the next, and the loop reallocates three typed
+        // arrays and an ImageData every time round. On a desktop that merely
+        // wastes work; on an iPad it exhausted the tab and took Safari with it.
+        if (this.resizing) return;
+        this.resizing = true;
+        try {
+            this.resizeInner();
+        } finally {
+            this.resizing = false;
+        }
+    }
+
+    resizeInner() {
         const dpr = window.devicePixelRatio || 1;
         const cw = Math.max(320, Math.round(this.canvas.clientWidth));
         const chh = Math.max(200, Math.round(this.canvas.clientHeight));
-        this.canvas.width = Math.round(cw * dpr);
-        this.canvas.height = Math.round(chh * dpr);
-        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        const bw = Math.round(cw * dpr), bh = Math.round(chh * dpr);
+        // Only when it has actually changed. Assigning `canvas.width` resets
+        // the canvas even when the value is identical -- it clears the pixels
+        // and the transform -- so doing it on every observation both threw the
+        // picture away and re-triggered the observer.
+        if (this.canvas.width !== bw || this.canvas.height !== bh) {
+            this.canvas.width = bw;
+            this.canvas.height = bh;
+        }
         if (!this.taps) return;
 
         const w = Math.max(64, Math.round(this.plot.w));
@@ -414,7 +441,11 @@ export class Display {
             refs[j] = this.autoRef;
             // Too much ink means the window is too low, so lift it.
             const err = sum / taps - this.autoTargetInk;
-            this.autoRef = Math.min(60, Math.max(-160,
+            // Wide, because the reference has to be able to carry the
+            // window from wherever the visitor left Sensitivity to wherever
+            // the signal actually is, and those can be 150 dB apart -- a
+            // MacBook and an iPad in the same room differ by about fifty.
+            this.autoRef = Math.min(250, Math.max(-250,
                                     this.autoRef + step * err));
         }
     }
@@ -585,7 +616,7 @@ export class Display {
             const x = x0 + i;
             const ref = autoGain ? this.refs[x] : 0;
             const lo = whiteDB + ref, hi = blackDB + ref;
-            const span = (hi - lo) || 1;
+            const span = Math.max(hi - lo, 1e-6);   // matches the Swift
             const base = x * taps;
             for (let y = 0; y < taps; y++) {
                 let t = (this.levels[base + y] - lo) / span;
@@ -598,7 +629,20 @@ export class Display {
                 d[p] = d[p + 1] = d[p + 2] = v;
             }
         }
-        this.bctx.putImageData(this.image, 0, 0);
+        // Marked, not uploaded.
+        //
+        // This used to call putImageData here -- the whole image, every time a
+        // batch of columns arrived, which is 250 times a second for one new
+        // column each. At 1330 x 599 that is 3.2 MB an upload and 800 MB/s of
+        // pixel traffic on the thread that also has to draw, relay audio and
+        // answer the user. macOS absorbs it. iOS does not: putImageData there
+        // can force the whole backing store to be read back and re-uploaded,
+        // and the main thread simply stops -- which looks less like a slow app
+        // than like an absent one.
+        //
+        // The picture is only ever *seen* once a frame, so it only needs
+        // uploading once a frame.
+        this.imageDirty = true;
     }
 
     /// Re-expose everything already on screen. What the sliders call.
@@ -610,6 +654,14 @@ export class Display {
     render() {
         const ctx = this.ctx;
         const dpr = window.devicePixelRatio || 1;
+        // Every frame, not only when the size changed.
+        //
+        // iOS discards a canvas's backing store under memory pressure and
+        // hands it back cleared, with the transform reset to identity -- so
+        // drawing in CSS pixels on a 2x display fills exactly the top-left
+        // quadrant and stays that way. Setting it here costs nothing and makes
+        // that impossible; setting it only on resize made it permanent.
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         const W = this.canvas.width / dpr, H = this.canvas.height / dpr;
         const plot = this.plot;
 
@@ -620,6 +672,10 @@ export class Display {
         ctx.fillRect(plot.x, plot.y, plot.w, plot.h);
 
         if (this.width && this.taps) {
+            if (this.imageDirty) {
+                this.bctx.putImageData(this.image, 0, 0);
+                this.imageDirty = false;
+            }
             // One tap, one row, no resampling: the whole point is harmonics
             // sitting one or two taps apart, and interpolation destroys
             // exactly that.
@@ -798,7 +854,17 @@ export class Display {
         // hairline at an unsnapped position straddles two pixels, each gets
         // half coverage, and antialiasing turns it pale enough to miss.
         const lw = Math.max(sx, 1 / (window.devicePixelRatio || 1));
-        for (const m of this.marks) {
+        // Drawn in order of precedence, not in the order they were recorded.
+        //
+        // At a replay boundary two marks land on the same column -- the old
+        // recording ended and a new one began, both true -- and whichever is
+        // painted second is the one you see. That was insertion order, which
+        // differed between this and the Mac app for no reason anybody chose,
+        // so the same moment came out green in one and red in the other.
+        // MARK_RANK is the same table in both.
+        const ordered = [...this.marks].sort(
+            (a, b) => (MARK_RANK[a.kind] ?? 0) - (MARK_RANK[b.kind] ?? 0));
+        for (const m of ordered) {
             ctx.fillStyle = MARK_COLOURS[m.kind] || '#f00';
             let x = plot.x + m.column * sx;
             x = Math.min(Math.max(x, plot.x), plot.x + plot.w - lw);
@@ -863,6 +929,13 @@ export class Display {
         }
     }
 }
+
+/// Which mark wins when two land on the same column. Higher is drawn later,
+/// so it is the one seen. The order is by how much the mark says: `seam` only
+/// claims that time jumps, which is implied by all the others.
+const MARK_RANK = {
+    seam: 0, scaleChange: 1, tuningChange: 2, fileEnd: 3,
+};
 
 const MARK_COLOURS = {
     seam: '#e5484d',           // time jumps here

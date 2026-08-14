@@ -20,6 +20,52 @@
 
 export const CLOSE_UP_SPANS = [0, 5, 10, 20, 40, 80, 160, 320];
 
+// ---- the Speed detents ----------------------------------------------------
+//
+// Also from Settings.swift, and here for the same reason: the two apps have to
+// offer the same settings or a picture cannot be compared with a picture.
+//
+// Ten equal *ratios* across the range, not ten equal numbers of milliseconds.
+// A time scale is a ratio quantity -- the step from 1 ms to 2 ms is the same
+// change as the step from 32 to 64 -- so equal spacing on screen has to mean
+// equal spacing in the log.
+//
+// 0.5 to 64 ms is 128x, seven octaves. Divided fourteen ways each step is
+// exactly half an octave, a ratio of root two, which puts 0.5, 1, 2, 4, 8, 16,
+// 32 and 64 all on the grid with one detent between each pair.
+export const COLUMN_RANGE = [0.5, 64];
+export const COLUMN_DIVISIONS = 14;
+export const COLUMN_STEPS = Array.from(
+    { length: COLUMN_DIVISIONS + 1 },
+    (_, i) => COLUMN_RANGE[0]
+              * Math.pow(COLUMN_RANGE[1] / COLUMN_RANGE[0], i / COLUMN_DIVISIONS));
+
+/// How a column time is written. Enough digits to tell two detents apart and
+/// no more: the half-octave steps are 1.41 and 2.83, not 1 and 3.
+export function columnLabel(ms) {
+    if (ms < 1) return `${ms.toFixed(2)} mS`;
+    if (ms < 10) return `${ms.toFixed(1)} mS`;
+    return `${ms.toFixed(0)} mS`;
+}
+
+/// Nearest detent, measured in the log -- 3 ms is nearer to 3.48 than to 2.14
+/// by ratio even though it is equidistant by subtraction. Used on the way in,
+/// so a stored setting from a build with different detents still lands on one.
+export function nearestColumnStep(ms) {
+    // Not `indexOf(4)`: 128^(6/14) is 7.999999999999999, so the detent that
+    // ought to be 4 is 3.9999999999999996 and `indexOf` returns -1 --
+    // `COLUMN_STEPS[-1]` is undefined, and the whole close-up chain would then
+    // be computing with it. The index is written down instead.
+    const kDefault = 6;                       // 0.5 x 2^3 = 4 ms
+    if (!(ms > 0)) return kDefault;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < COLUMN_STEPS.length; ++i) {
+        const d = Math.abs(Math.log(ms / COLUMN_STEPS[i]));
+        if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+}
+
 /// The engine's column time cannot go below this. It is columnMs / k for whole
 /// k, so it is a ceiling on k -- and it is a real one: on the Mac, at 0.25 ms
 /// the display managed one frame in a second.

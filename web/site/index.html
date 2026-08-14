@@ -33,6 +33,14 @@
   #status { margin-left: auto; color: var(--label);
             font-variant-numeric: tabular-nums; }
   #file { display: none; }
+  /* The file's name reads as a caption, not a control. Plain end-truncation
+     with the whole of it in the tooltip: `direction: rtl` would keep the more
+     distinguishing tail of the name, as the Mac app's middle-truncation does,
+     but it reorders punctuation in a Latin filename and the failure looks
+     like corruption rather than like eliding. */
+  #fname { color: var(--label); max-width: 16rem; overflow: hidden;
+           text-overflow: ellipsis; white-space: nowrap; }
+  #replay { font-size: 1.05em; line-height: 1; }
   input[type=range] { width: 8rem; }
   .rule { width: 1px; height: 18px; background: var(--line); }
   /* The picture is a fixed 600 pixels tall, whatever the window does.
@@ -51,9 +59,13 @@
 <div id="bars">
   <div class="bar">
     <button id="pause" title="Pause">❚❚</button>
-    <button id="open">Play file…</button>
-    <input type="file" id="file" accept="audio/*">
     <div class="rule"></div>
+    <!-- ERB ahead of the file group, so that the two things that appear when
+         a file is played -- its name and the Replay button -- grow into the
+         empty space at the end of the row instead of shoving everything to
+         their right along. A control that moves when you did not touch it
+         reads as a different control. The Mac app has had this order all
+         along; this row had it backwards. -->
     <label>ERB
       <select id="erb">
         <option value="050">0.5</option><option value="060" selected>0.6</option>
@@ -63,47 +75,151 @@
         <option value="130">1.3</option>
       </select>
     </label>
+    <div class="rule"></div>
+    <button id="open">Play file…</button>
+    <button id="replay" title="Play the same file again" hidden>&#8635;</button>
+    <span id="fname" hidden></span>
+    <input type="file" id="file" accept="audio/*">
     <span id="status">idle</span>
   </div>
+  <!-- Grouped by what a control is about, separators between the groups:
+       how the picture is drawn, then what part of the sound it shows, then
+       the exposure pair (Auto gain drives Sensitivity, so they belong
+       together), then the width of the grey scale, then Defaults. -->
   <div class="bar">
     <label><input type="checkbox" id="invert"> Invert</label>
-    <label><input type="checkbox" id="auto"> Auto gain</label>
     <label><input type="checkbox" id="deskew"> De-skew</label>
     <div class="rule"></div>
-    <label>white <input type="range" id="white" min="-130" max="10" value="-100"></label>
-    <label>black <input type="range" id="black" min="-130" max="10" value="-40"></label>
-    <span id="range" style="color:var(--label);font-variant-numeric:tabular-nums"></span>
-    <div class="rule"></div>
     <label>Speed
-      <select id="speed">
-        <option value="16">16 mS</option>
-        <option value="8">8 mS</option>
-        <option value="4" selected>4 mS</option>
-        <option value="2">2 mS</option>
-        <option value="1">1 mS</option>
-      </select>
+      <!-- Filled from COLUMN_STEPS at startup, so the detents cannot drift
+           away from the Mac app's. -->
+      <select id="speed"></select>
     </label>
     <label>Close-up
       <select id="closeup" title="Give the most recent moment its own, finer time scale on the right"></select>
     </label>
     <div class="rule"></div>
-    <button id="reset" title="Put every control back to its starting value">Defaults</button>
+    <!-- The values here are overwritten by applySettings() before anything is
+         wired up; they match `defaults` so that the controls do not flicker
+         through a different position on the way. -->
+    <label>sensitivity <input type="range" id="sens" min="0" max="200" value="95"></label>
+    <label><input type="checkbox" id="auto"> Auto gain</label>
+    <div class="rule"></div>
+    <label>range <input type="range" id="rng" min="5" max="200" value="170"></label>
+    <div class="rule"></div>
+    <button id="reset" title="Put the display controls back to their starting values. Speed and ERB are left as they are.">Defaults</button>
   </div>
 </div>
 
 <canvas id="view"></canvas>
 
 <script type="module">
-import { Display } from './display.js';
-import { CLOSE_UP_SPANS, closeUpFit, closeUpAvailable } from './closeup.js';
+import { Display } from './display.js?v=DEV';
+import { CLOSE_UP_SPANS, closeUpFit, closeUpAvailable,
+         COLUMN_STEPS, columnLabel, nearestColumnStep } from './closeup.js?v=DEV';
 
 const $ = id => document.getElementById(id);
 const view = $('view');
 const display = new Display(view);
-const say = t => { $('status').textContent = t; };
+/// Once something has gone wrong, it stays on screen.
+///
+/// The periodic readout used to overwrite every message within the second,
+/// including the ones that said why nothing was working. A failure you have to
+/// catch in the act is a failure nobody reports properly.
+let stuck = null;
+const say = t => { if (!stuck) $('status').textContent = t; };
+const fail = t => { stuck = t; $('status').textContent = '⚠ ' + t; };
+
+// Counters, so it is possible to say *where* the chain stops rather than only
+// that it stopped: blocks leaving the audio thread, and columns coming back
+// from the engine. Blocks but no columns means the engine; neither means the
+// microphone.
+let blocksIn = 0;
+/// Bumped by everything that starts a source. Starting is not atomic -- there
+/// is a permission prompt, a decode, an audio clock to wake -- and the old
+/// code stopped the previous source *before* those waits and published the new
+/// one after, so anything starting in between was invisible to it. A click on
+/// Replay during the microphone permission prompt left both connected to the
+/// analyser at once. A start whose number is no longer current gives up.
+let startGen = 0;
+/// Identifies the most recent end-of-file, so a stale flush reply -- from a
+/// file that was interrupted by another -- cannot freeze the new one.
+///
+/// Moved in two places, and it needs both: when a flush is asked for, and in
+/// `stopSources`, when whatever might have asked for one is taken away. For a
+/// while it moved only on the first, which meant a flush already in flight
+/// stayed current across an interruption and froze the file that followed.
+let endToken = 0;
+/// Samples handed to the worker since the page loaded, and the count at which
+/// the file running now stops being the file.
+///
+/// The end of a recording is a fact about the *audio*, not about when a
+/// callback fires. `onended` arrives on the main thread after the worklet has
+/// already captured and posted the silence that follows the file, so a flush
+/// sent from there drains that silence into the picture first -- some 35 ms of
+/// it, which pushed the whole response further from the right edge than the
+/// Mac app put it. Counting samples puts the boundary where the audio does.
+let samplesSent = 0;
+let fileEndsAt = 0;
+
+/// Mark the end of the recording and stop, once the engine has caught up.
+///
+/// The picture is left frozen on purpose: the end of a file is when you want
+/// to measure what you have just seen. Anything arriving from here is the
+/// player rendering silence, and it is dropped rather than queued -- the
+/// columns handler already discards while paused.
+function finishFile() {
+    display.mark('fileEnd');
+    fileEnded = true;
+    // Both of these used to be left to `src.onended`, and that is a race this
+    // loses about as often as it wins. The flush is asked for the instant the
+    // sample count reaches the end of the file, while `ended` lags the audio
+    // by tens of milliseconds -- so when the worker replies quickly, this runs
+    // first. It then froze the picture with `playedThrough` still false, which
+    // hides Replay, and nothing afterwards recomputed the button: every other
+    // `showTransport` belongs to something *starting*. A paused picture with
+    // no Replay and no way on but the microphone.
+    //
+    // A flush reply whose token is still current means the file did reach its
+    // end, so this is the authority on that, not `ended`.
+    playedThrough = true;
+    // And `playingFile` has to go before `setPaused`, or the suspend below
+    // takes the "a file is genuinely paused" branch and suspends the context
+    // while the source is still rendering. `ended` is then deferred until
+    // something resumes -- and everything that resumes clears `fileSource`
+    // first, so the handler returns early and the flag is never set at all.
+    playingFile = false;
+    setPaused(true, false);        // no seam: the green line already says it
+}
+/// Loudest input sample since the status line was last written, so the figure
+/// shown is a peak over the last second rather than an average over all time.
+let inPeak = 0;
+
+window.addEventListener('error', e => fail(`${e.message} (${e.filename}:${e.lineno})`));
+window.addEventListener('unhandledrejection',
+    e => fail('unhandled: ' + (e.reason && e.reason.message || e.reason)));
+
+/// Diagnostic mode, reached by adding ?test to the URL. No button and no
+/// mention on the page: it is not a feature, it is a way to tell an input
+/// fault from a display fault on a device that will not give you either a
+/// console or a file.
+const TEST_MODE = new URLSearchParams(location.search).has('test');
 
 let ctx = null, capture = null, worker = null;
 let micStream = null, micSource = null, fileSource = null;
+/// The last file played, kept so it can be played again without a second trip
+/// through the picker -- the Mac app's Replay button, which the browser was
+/// missing along with the name of the file it is showing you.
+///
+/// The decoded buffer rather than the `File`: a `File` is a handle to
+/// something on disk that may since have moved, and decoding it again is work
+/// already done.
+let lastBuffer = null, lastName = '';
+/// Whether the last file ran to its end, which is what Replay's visibility is
+/// derived from. A file that was interrupted has somewhere to resume from; one
+/// that finished has only somewhere to start again.
+let playedThrough = false;
+
 let playingFile = false, paused = false, fileEnded = false;
 let colsSeen = 0, lastReport = performance.now();
 
@@ -119,14 +235,36 @@ let colsSeen = 0, lastReport = performance.now();
 // listening.
 
 const KEY = 'cochleagram.settings';
+/// The tunings there are coefficient files for, read off the menu rather than
+/// written out again -- the menu is already the list, and a second copy could
+/// name a file that does not exist.
+const ERB_VALUES = [...$('erb').options].map(o => o.value);
 const defaults = {
     columnMs: 4, erb: '060', deskew: false,
-    // Auto gain off and a window from -100 to -40 dB: what the picture looks
-    // like when somebody who knows what they are looking for sets it up. The
-    // wide-open range is the safe first impression on unknown hardware, and it
-    // is not the most informative one -- these are the settings the display is
-    // actually read at.
-    invert: false, autoGain: false, whiteDB: -100, blackDB: -40,
+    // Auto gain off, and a window from -180 to -10 dB to make up for it.
+    //
+    // Auto gain would guarantee a picture on any hardware, but it owns
+    // sensitivity while it is on, and switching it off hands back wherever the
+    // controller had drifted to -- which depends on everything the page has
+    // heard since it loaded. This app and the Mac app would then disagree
+    // about sensitivity after the same button press unless they had also had
+    // the same history, and being able to set the two side by side and get the
+    // same picture is worth more than the convenience.
+    //
+    // So the safe first impression has to come from a fixed window wide enough
+    // to survive not knowing the input level. Mean ink over pink and white
+    // noise, from the offline engine at ERB 0.6 -- the controller aims for
+    // 0.30 when it is choosing for itself:
+    //
+    //     input   -20   -40   -60   -80  -100  -120 dBFS
+    //      pink  0.74  0.62  0.51  0.39  0.28  0.16
+    //     white  0.71  0.60  0.48  0.37  0.25  0.14
+    //
+    // Never a black slab, never blank. The cost is contrast: 170 dB from white
+    // to black is a soft picture, and 70/60 -- the window that used to be
+    // written -100 to -40 -- is still the one the display is really read at,
+    // once you can see where the signal is. That is what the sliders are for.
+    invert: false, autoGain: false, sensDB: 95, rangeDB: 170,
     // How much of the recent past the close-up strip shows, in milliseconds;
     // zero is off. The *span* is what is stored, not the width, because the
     // width that gives it depends on Speed -- and what you want when you come
@@ -137,8 +275,93 @@ const defaults = {
     // scrolling at different rates would reasonably conclude it was broken.
     closeUpSpanMs: 0, closeUpColumns: 400,
 };
+/// Which of the defaults the Defaults button restores: all of them except
+/// `columnMs` and `erb`.
+///
+/// Speed and ERB are left wherever they were, because those two say what the
+/// picture *is* rather than how it is exposed, and somebody who has chosen a
+/// tuning and a time scale and then wants a legible grey scale is not asking
+/// to be moved off them. Leaving them also means the engine does not have to
+/// be reopened, so the button can be pressed without destroying what is on
+/// screen.
+///
+/// Derived from `defaults` rather than written out again: the button restores
+/// a shorter *list* of settings, not a different set of values, and a second
+/// copy of the values would only be a way for the two to drift apart. The Mac
+/// app's Defaults button omits the same two, for the same reason.
+const DISPLAY_KEYS = ['deskew', 'invert', 'autoGain', 'sensDB', 'rangeDB',
+                      'closeUpSpanMs', 'closeUpColumns'];
+const displayDefaults =
+    Object.fromEntries(DISPLAY_KEYS.map(k => [k, defaults[k]]));
+// The window is set by where its middle is and how wide it is, not by its two
+// ends. The ends share a scale and so collide: they cannot cross, they need a
+// minimum separation, and the guard enforcing it can fail silently at the
+// limits -- which it did, giving a one-decibel window and a picture with no
+// grey in it. A midpoint and a width cannot interact at all.
+//
+// Sensitivity is the *negated* midpoint, so that dragging right means more
+// sensitive, more ink, a darker picture. Its limits come from a measurement:
+// the response is linear, so input level maps one-for-one onto a shift of the
+// window -- median tap level runs -53.3 / -103.3 / -153.3 dB for inputs of
+// -20 / -70 / -120 dBFS. Covering full scale down to a very quiet phone
+// microphone is therefore a midpoint from -10 to -190, rounded out to 200.
+//
+// Not "the ends should be all white and all black": that guarantee needs the
+// window pushed past the tails of the distribution, and the tails are 80 dB
+// beyond the first percentile. The last third of the travel would do nothing
+// but chase a signal that is not there.
+const SENS_LO = 0, SENS_HI = 200;
+/// Below about five decibels the picture is a threshold rather than a grey
+/// scale. Above two hundred nothing is outside the window to begin with.
+const RANGE_LO = 5, RANGE_HI = 200;
+
+// `Number.isFinite` first, because Math.min, Math.max and Math.round all
+// propagate NaN rather than rejecting it -- a NaN out of storage would give a
+// NaN window, an all-black picture, and no way back except clearing
+// localStorage. The old code rejected NaN only by accident, as a side effect
+// of a comparison that happened to be false.
+const clampTo = (lo, hi, fallback) => v =>
+    Number.isFinite(+v) ? Math.min(hi, Math.max(lo, Math.round(+v))) : fallback;
+const clampSens  = clampTo(SENS_LO,  SENS_HI,  defaults.sensDB);
+const clampRange = clampTo(RANGE_LO, RANGE_HI, defaults.rangeDB);
+
+/// The pair the display actually wants. Kept in one place so the sign of the
+/// negation is written down once.
+const windowFor = (sens, range) => ({
+    whiteDB: -sens - range / 2,
+    blackDB: -sens + range / 2,
+});
+
 let S = { ...defaults };
-try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || '{}')); } catch {}
+let stored = {};
+try { stored = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch {}
+
+// Settings stored by an older build name the two ends. Convert rather than
+// discard: the window someone left set is the one they want back.
+//
+// The test is against what came out of storage, not against `S`. Testing `S`
+// looks equivalent and is not: `S` starts as a copy of `defaults`, which has
+// a sensDB already, so the condition could never be true and every old
+// setting was quietly thrown away instead of converted.
+if (stored.sensDB === undefined &&
+    typeof stored.whiteDB === 'number' && typeof stored.blackDB === 'number') {
+    stored.rangeDB = stored.blackDB - stored.whiteDB;
+    stored.sensDB  = -(stored.whiteDB + stored.blackDB) / 2;
+}
+delete stored.whiteDB; delete stored.blackDB;
+Object.assign(S, stored);
+// Stored settings outlive the code that wrote them, so what comes back in has
+// to be made safe rather than trusted -- a browser that once reached a
+// one-decibel window would otherwise keep it forever, through every reload.
+S.sensDB  = clampSens(S.sensDB);
+S.rangeDB = clampRange(S.rangeDB);
+// The tuning has to survive the same treatment, and it is the one that cannot
+// be recovered from without knowing about localStorage. A value naming no
+// coefficient file leaves the ERB menu blank, asks the worker for a file that
+// 404s, and `fail()` is sticky -- so the page shows a warning and never draws
+// again, and saves the bad value back on the way. The Mac has
+// `nearestErbScale` for exactly this; this is its counterpart.
+if (!ERB_VALUES.includes(S.erb)) S.erb = defaults.erb;
 
 function save() {
     try { localStorage.setItem(KEY, JSON.stringify(S)); } catch {}
@@ -146,19 +369,38 @@ function save() {
 
 /// Push the stored values at the controls and at the display. Runs before
 /// anything is wired up, so nothing here fires a change handler.
+// Widest column first, so the scroll gets faster to the right and the label
+// "Speed" agrees with the direction -- the same order as the Mac's dials.
+for (const ms of [...COLUMN_STEPS].reverse()) {
+    const o = document.createElement('option');
+    o.value = String(ms);
+    o.textContent = columnLabel(ms);
+    $('speed').appendChild(o);
+}
+
 function applySettings() {
+    // Snapped here rather than once on load, so that Defaults goes through it
+    // too. The detents are computed as 0.5 x 128^(i/14), and 128^(6/14) is
+    // 7.999999999999999 rather than 8 -- so the literal 4 in `defaults` is not
+    // the same Double as the 4 in the menu, `select.value` would match no
+    // option, and the control would come up blank. It is the same arithmetic
+    // the Mac does, and the two agree to within 4e-16 ms, which is what
+    // matters more than either being round.
+    S.columnMs = COLUMN_STEPS[nearestColumnStep(S.columnMs)];
     $('speed').value = String(S.columnMs);
     $('erb').value = S.erb;
     $('deskew').checked = S.deskew;
     $('invert').checked = S.invert;
     $('auto').checked = S.autoGain;
-    $('white').value = String(S.whiteDB);
-    $('black').value = String(S.blackDB);
+    $('sens').value = String(S.sensDB);
+    $('rng').value  = String(S.rangeDB);
+    // Auto gain owns sensitivity while it is on: the control reports what the
+    // controller is doing rather than accepting instructions. Wanting it
+    // somewhere else is what turning Auto gain off is for.
+    $('sens').disabled = S.autoGain;
     display.exposure.inverted = S.invert;
     display.exposure.autoGain = S.autoGain;
-    display.exposure.whiteDB = S.whiteDB;
-    display.exposure.blackDB = S.blackDB;
-    $('range').textContent = `${S.whiteDB} … ${S.blackDB} dB`;
+    Object.assign(display.exposure, windowFor(S.sensDB, S.rangeDB));
     display.columnMs = S.columnMs;
 }
 applySettings();
@@ -229,7 +471,15 @@ showTransport();
 // ---- the machinery -------------------------------------------------------
 
 function startWorker() {
-    worker = new Worker('./engine-worker.js', { type: 'module' });
+    worker = new Worker('./engine-worker.js?v=DEV', { type: 'module' });
+    // A worker that fails to load -- a module that will not import, a WASM
+    // module that will not instantiate -- reports here and nowhere else. This
+    // was missing, which is why a dead engine looked exactly like a silent
+    // room: zero columns, white picture, no explanation.
+    worker.onerror = e =>
+        fail(`worker: ${e.message || 'failed to load'} `
+             + `(${e.filename || 'engine-worker.js'}:${e.lineno || '?'})`);
+    worker.onmessageerror = () => fail('worker: message could not be delivered');
     worker.onmessage = ev => {
         const m = ev.data;
         if (m.type === 'ready') {
@@ -241,8 +491,11 @@ function startWorker() {
             // waiting seconds at high speed the moment you resumed.
             if (!paused) { display.append(m.levels, m.coherence, m.refs, m.columns); }
             colsSeen += m.columns;
+            } else if (m.type === 'flushed') {
+            // Every column the file produced has now been appended.
+            if (m.token === endToken) finishFile();
         } else if (m.type === 'error') {
-            say('error: ' + m.message);
+            fail('engine: ' + m.message);
         }
     };
 }
@@ -260,7 +513,7 @@ function openEngine() {
 async function ensureAudio() {
     if (ctx) return;
     ctx = new AudioContext();
-    await ctx.audioWorklet.addModule('./capture-worklet.js');
+    await ctx.audioWorklet.addModule('./capture-worklet.js?v=DEV');
     // Explicitly mono, so a stereo file is mixed down by the browser rather
     // than having its right channel quietly dropped.
     capture = new AudioWorkletNode(ctx, 'capture', {
@@ -269,8 +522,27 @@ async function ensureAudio() {
         channelInterpretation: 'speakers',
     });
     capture.port.onmessage = ev => {
+        blocksIn++;
+        // The raw input peak, taken here because the buffer is transferred on
+        // the next line and is gone afterwards. This is the one number that
+        // separates "the display is wrong" from "the signal is quiet", and
+        // not having it has cost several rounds of reading pictures.
+        const s = ev.data;
+        for (let i = 0; i < s.length; ++i) {
+            const a = s[i] < 0 ? -s[i] : s[i];
+            if (a > inPeak) inPeak = a;
+        }
+        samplesSent += s.length;
         worker.postMessage({ type: 'audio', samples: ev.data },
                            [ev.data.buffer]);
+        // Ask the engine to report as soon as it has consumed the last of the
+        // file -- posted here, so it sits in the queue directly behind that
+        // audio and ahead of whatever silence follows.
+        if (fileEndsAt && samplesSent >= fileEndsAt) {
+            fileEndsAt = 0;
+            endToken++;
+            worker.postMessage({ type: 'flush', token: endToken });
+        }
     };
     // A worklet with nothing downstream may be pruned, so it feeds a silent
     // sink. Not the speakers: this is a microphone display, and routing the
@@ -278,6 +550,20 @@ async function ensureAudio() {
     const mute = ctx.createGain();
     mute.gain.value = 0;
     capture.connect(mute).connect(ctx.destination);
+
+    // iOS suspends an AudioContext for reasons of its own -- another app taking
+    // the audio session, a call, the page being backgrounded -- and it does not
+    // resume by itself. Without this the display simply stops and stays
+    // stopped, which is exactly what it did on an iPad.
+    //
+    // Except a suspension we asked for. Pausing a *file* is done by suspending
+    // the context, which fires this -- so pause froze the picture, this handler
+    // read it as an interruption and resumed, and the file played on inaudibly
+    // past the point you were looking at. Resuming then landed somewhere later
+    // with no seam to say so.
+    ctx.onstatechange = () => {
+        if (ctx.state !== 'running' && !paused) resumeAudio();
+    };
 
     startWorker();
     openEngine();
@@ -295,8 +581,14 @@ function showTransport() {
     const willStart = paused || fileEnded || !ctx || (!micSource && !fileSource);
     $('pause').textContent = willStart ? '\u25B6' : '\u2759\u2759';
     $('pause').title = fileEnded || (!micSource && !fileSource)
-        ? 'Listen to the microphone'
+        ? (TEST_MODE ? 'Start the test signal' : 'Listen to the microphone')
         : (paused ? 'Resume' : 'Freeze the display');
+    // Derived here rather than set at the moment a file starts, which is what
+    // the Mac app does and for the same reason: set once, Replay stayed on
+    // screen through the whole of the replay it was offering, and then stayed
+    // there after the microphone had taken over.
+    $('fname').hidden  = !lastBuffer;
+    $('replay').hidden = !lastBuffer || !playedThrough;
 }
 
 /// A file that has run out has nothing to resume, so rather than have the
@@ -306,13 +598,31 @@ function showTransport() {
 function togglePause() {
     if (!ctx || fileEnded || (!micSource && !fileSource)) {
         fileEnded = false;
-        startMic();
+        // A press of a real button is the most reliable user gesture there is,
+        // so in test mode this is the way in most likely to work when starting
+        // on load did not.
+        if (TEST_MODE) startTestSignal(); else startMic();
         return;
     }
     setPaused(!paused);
 }
 
 function stopSources() {
+    // Whatever was playing is not going to reach its end now, so the count
+    // that was waiting for it must not fire against the next thing.
+    fileEndsAt = 0;
+    // Nor must a flush that has *already* been asked for. Clearing the count
+    // stops a new one being sent; it does nothing about one in flight, and the
+    // reply to that one used to arrive after the next file had started and
+    // freeze it -- a picture stopped with `playedThrough` still false, which
+    // also hides Replay, so the only way on was back to the microphone.
+    // Reachable by pressing Replay in the moment between a file ending and the
+    // engine reporting that it has caught up, which is a real interval and not
+    // a short one at 0.5 ms per column.
+    //
+    // Moving the token here is what the comment on its declaration always
+    // claimed: a file that has been interrupted can no longer end.
+    endToken++;
     if (fileSource) { try { fileSource.stop(); } catch {} fileSource.disconnect(); fileSource = null; }
     if (micSource) { micSource.disconnect(); micSource = null; }
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
@@ -327,6 +637,7 @@ async function startMic({ quiet = false } = {}) {
     // track it can see, and called afterwards it would have switched off the
     // stream that had just been granted.
     stopSources();
+    const gen = ++startGen;
     try {
         // All three off. They are meant to make speech intelligible over a
         // call, and each is a filter, a gate or a compressor sitting between
@@ -342,6 +653,11 @@ async function startMic({ quiet = false } = {}) {
         // open a file instead.
         if (!quiet) say('no microphone: ' + e.message);
         showTransport();          // still offering to try again
+        return false;
+    }
+    if (gen !== startGen) {       // something else started while we asked
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
         return false;
     }
     micSource = ctx.createMediaStreamSource(micStream);
@@ -361,19 +677,44 @@ async function startMic({ quiet = false } = {}) {
 /// counts on some browsers and not on others, so this asks, checks, and if the
 /// answer is no, arms a one-shot listener rather than leaving a page that
 /// looks alive and is silent.
+/// Which events count as "the visitor did something". `touchend` is in the
+/// list because some iOS versions unlock audio on that and not on the
+/// `pointerdown` that precedes it.
+const kGestures = ['pointerdown', 'touchend', 'click', 'keydown'];
+
 async function resumeAudio() {
     if (!ctx) return false;
     try { await ctx.resume(); } catch {}
     if (ctx.state === 'running') return true;
     say('click anywhere to start');
-    const go = async () => {
-        document.removeEventListener('pointerdown', go);
-        document.removeEventListener('keydown', go);
-        await ctx.resume();
-        if (ctx.state === 'running') say(`live · ${Math.round(ctx.sampleRate)} Hz`);
+    // Not `async`: everything up to the first `await` runs inside the gesture,
+    // and on iOS that is the whole of the permission to start audio. An
+    // `await` before touching the context spends it.
+    const go = () => {
+        for (const ev of kGestures) document.removeEventListener(ev, go);
+        // iOS wants to see the context *used* during the gesture, not merely
+        // resumed after one. A one-sample silent buffer, started here and
+        // synchronously, is what actually unlocks it -- and until now the app
+        // never needed it, because `getUserMedia` unlocks audio as a side
+        // effect and every path that reached here had already called it. The
+        // test signal is the first path that does not.
+        try {
+            const b = ctx.createBuffer(1, 1, 22050);
+            const q = ctx.createBufferSource();
+            q.buffer = b; q.connect(ctx.destination); q.start(0);
+        } catch {}
+        ctx.resume().then(() => {
+            if (ctx.state === 'running') {
+                say(`live · ${Math.round(ctx.sampleRate)} Hz`);
+            } else {
+                // Refused again. Arm for the next gesture rather than giving
+                // up: on iOS the first tap after an interruption is often
+                // ignored.
+                resumeAudio();
+            }
+        }).catch(() => resumeAudio());
     };
-    document.addEventListener('pointerdown', go);
-    document.addEventListener('keydown', go);
+    for (const ev of kGestures) document.addEventListener(ev, go);
     return false;
 }
 
@@ -383,33 +724,119 @@ $('file').onchange = e => { if (e.target.files[0]) playFile(e.target.files[0]); 
 async function playFile(file) {
     await ensureAudio();
     stopSources();
+    // Before the decode, not after. The permission to start audio comes from
+    // the gesture that opened the picker, and a large file can take longer to
+    // decode than that permission lasts.
     await resumeAudio();
     let buf;
     try {
         buf = await ctx.decodeAudioData(await file.arrayBuffer());
     } catch (e) {
         say(`cannot decode ${file.name}`);
+        showTransport();          // nothing is running; say so on the button
         return;
     }
-    fileSource = ctx.createBufferSource();
-    fileSource.buffer = buf;
-    fileSource.connect(capture);
-    fileSource.connect(ctx.destination);      // and you hear it
-    fileSource.onended = () => {
-        // Not a gap in time -- it is the boundary of the recording, and worth
-        // telling apart from whatever arrives next.
-        if (playingFile) {
-            display.mark('fileEnd');
-            playingFile = false;
-            fileEnded = true;
-            showTransport();
+    lastBuffer = buf;
+    lastName = file.name;
+    $('fname').textContent = file.name;
+    $('fname').title = `${file.name} · ${buf.duration.toFixed(1)} s`;
+    // Passed, not read back out of `lastBuffer`: two decodes in flight would
+    // otherwise have the first to finish play the second one's audio.
+    await playBuffer(buf, file.name);
+}
+
+/// Play the file again. Replay does exactly this and nothing else.
+const playLastFile = () => playBuffer(lastBuffer, lastName);
+
+async function playBuffer(buf, name) {
+    if (!buf) return;
+    await ensureAudio();
+    stopSources();
+    const gen = ++startGen;
+    await resumeAudio();
+    if (gen !== startGen) return;             // overtaken while the clock woke
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(capture);
+    src.connect(ctx.destination);             // and you hear it
+    src.onended = () => {
+        // `src === fileSource`, not merely `playingFile`. Stopping a source
+        // fires this too, and it arrives a task later -- by which time a
+        // replay has already started the next one, which would then be marked
+        // as having ended the moment it began.
+        if (fileSource !== src || !playingFile) return;
+        playingFile = false;
+        playedThrough = true;
+        // Neither the mark nor the freeze happens here. This fires when the
+        // last sample has been *played*, and the columns for it are still
+        // travelling from the worklet through the worker -- so marking now
+        // lands the line short of the true end, and freezing now leaves those
+        // columns undrawn. Ask the engine to tell us when it has caught up.
+        // Normally the sample count has already asked for the flush, and this
+        // is only the backstop -- for a source stopped before its end, where
+        // no such count was ever reached.
+        if (fileEndsAt || !worker) {
+            fileEndsAt = 0;
+            endToken++;
+            if (worker) worker.postMessage({ type: 'flush', token: endToken });
+            else finishFile();
         }
     };
+    fileSource = src;
+    // Where this file stops, in samples through the analyser. The buffer is
+    // already at the context's rate, so its length is the count.
+    fileEndsAt = samplesSent + buf.length;
+    playingFile = true;
+    fileEnded = false;
+    playedThrough = false;
+    // The start of a file is a jump in time just as much as its end: whatever
+    // was on the picture a moment ago -- the room, or the same file's last
+    // second -- was never adjacent to this. Replay makes that easy to reach.
+    display.mark('seam');
+    setPaused(false);
+    src.start();
+    say(`${name} · ${buf.duration.toFixed(1)} s`);
+}
+
+$('replay').onclick = () => playLastFile();
+
+/// A signal the app makes for itself, so the microphone can be taken out of
+/// the question without a file having to be got onto the device.
+///
+/// Broadband noise whose level sweeps the full width of the display window --
+/// -20 dBFS down to -110 and back over eight seconds -- with a click on each
+/// second. Drawn correctly that is a smooth grey wash, dark at the top of the
+/// sweep and pale at the bottom, crossed by vertical lines. Anything that
+/// gates, thresholds or quantises the signal on its way in cannot produce a
+/// wash: it produces bands with nothing between them, and the difference is
+/// not a judgement call.
+function testSignalBuffer() {
+    const secs = 8, sr = ctx.sampleRate;
+    const buf = ctx.createBuffer(1, Math.round(secs * sr), sr);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; ++i) {
+        const db = -65 + 45 * Math.cos(2 * Math.PI * (i / sr) / secs);
+        d[i] = (Math.random() * 2 - 1) * Math.pow(10, db / 20);
+    }
+    for (let k = 0; k < secs; ++k) d[Math.round(k * sr)] += 0.5;
+    return buf;
+}
+
+async function startTestSignal() {
+    await ensureAudio();
+    stopSources();
+    await resumeAudio();
+    fileSource = ctx.createBufferSource();
+    fileSource.buffer = testSignalBuffer();
+    fileSource.loop = true;
+    // To the analyser only. It is a test, not a sound, and at the top of the
+    // sweep it is loud.
+    fileSource.connect(capture);
     playingFile = true;
     fileEnded = false;
     setPaused(false);
     fileSource.start();
-    say(`${file.name} · ${buf.duration.toFixed(1)} s`);
+    say('test signal, no microphone \u00b7 noise sweeping \u221220 to \u2212110 dBFS');
 }
 
 // Dropping a file on the picture is the obvious gesture and costs three lines.
@@ -422,7 +849,7 @@ view.addEventListener('drop', e => {
 
 // ---- transport -----------------------------------------------------------
 
-function setPaused(on) {
+function setPaused(on, mark = true) {
     paused = on;
     // A measurement is anchored to a column of a frozen picture. Once the
     // picture starts moving again the two lines are over whatever has scrolled
@@ -434,7 +861,7 @@ function setPaused(on) {
         // so there is no seam to mark and drawing one would be a lie in the
         // other direction.
         on ? ctx.suspend() : ctx.resume();
-    } else if (on) {
+    } else if (on && mark) {
         display.mark('seam');
     }
     showTransport();
@@ -507,6 +934,13 @@ $('erb').onchange = e => {
 };
 $('deskew').onchange = e => {
     S.deskew = e.target.checked; save();
+    // A seam, in the same red as every other break in time -- because that is
+    // what this is. De-skew holds each tap back by its own travelling-wave
+    // delay, up to about 170 ms at the apex, so switching it slides the low
+    // rows against the high ones and the columns either side of the change
+    // were never adjacent. Without the line the picture would claim a
+    // continuity across the join that it does not have.
+    display.mark('seam');
     worker?.postMessage({ type: 'deskew', value: S.deskew ? 1 : 0 });
     applyCloseUp();                     // the two cannot both be on
 };
@@ -516,56 +950,111 @@ $('invert').onchange = e => {
     display.remapAll();
 };
 $('auto').onchange = e => {
+    if (!e.target.checked) {
+        // Hand back the control where the controller left it, not where the
+        // visitor last put it: switching to manual is what you do when Auto
+        // gain is close but not right, and it would be no use at all if the
+        // picture jumped at the moment you took over.
+        //
+        // Folding the reference into sensitivity makes the correct reference
+        // zero, which is why it is cleared rather than kept.
+        //
+        // The picture does jump if the sum lands outside the control's own
+        // limits, which needs a source quiet or loud enough to have driven the
+        // reference more than 200 dB from where sensitivity was left.
+        S.sensDB = clampSens(S.sensDB - display.autoRef);
+        display.autoRef = 0;
+        $('sens').value = String(S.sensDB);
+        Object.assign(display.exposure, windowFor(S.sensDB, S.rangeDB));
+    }
     S.autoGain = e.target.checked; save();
+    $('sens').disabled = S.autoGain;
     display.exposure.autoGain = S.autoGain;
     display.remapAll();
 };
 
+/// No guard, no minimum separation, no interaction between the two: a
+/// midpoint and a width are independent, and the window is free to hang off
+/// either end of the scale because levels outside it simply clamp.
 function exposureChanged() {
-    // White is where the picture reaches white and black where it reaches
-    // black, so they cannot cross, and squeezed together they would make every
-    // level either one or the other.
-    let w = +$('white').value, b = +$('black').value;
-    if (b - w < 10) {
-        if (this === $('white')) b = Math.min(10, w + 10);
-        else w = Math.max(-130, b - 10);
-        $('white').value = w; $('black').value = b;
-    }
-    S.whiteDB = w; S.blackDB = b; save();
-    display.exposure.whiteDB = w;
-    display.exposure.blackDB = b;
-    $('range').textContent = `${w} … ${b} dB`;
+    // Only when Auto gain is off. While it is on, the frame loop has been
+    // writing the *readout* -- sensitivity less the reference -- into this
+    // control, so reading it back would subtract the reference a second time
+    // and then not zero it. One nudge of `range` moved the picture by that
+    // many decibels and left a wrong value saved; during a drag it walked,
+    // every frame writing a new readout and every input event reading it in.
+    if (!S.autoGain) S.sensDB = clampSens(+$('sens').value);
+    S.rangeDB = clampRange(+$('rng').value);
+    save();
+    Object.assign(display.exposure, windowFor(S.sensDB, S.rangeDB));
     display.remapAll();
 }
-$('white').oninput = exposureChanged;
-$('black').oninput = exposureChanged;
+$('sens').oninput = exposureChanged;
+$('rng').oninput  = exposureChanged;
 
 // ---- the frame -----------------------------------------------------------
 
-/// Back to the starting values, and forget what was stored.
-///
-/// Settings that persist outlive every change to what the defaults are, so
-/// without this the only way to see a new one would be to know about
-/// localStorage.
+/// The display controls back to their starting values -- not Speed, not ERB,
+/// and not what is on screen. See `displayDefaults`.
 $('reset').onclick = () => {
-    S = { ...defaults };
-    try { localStorage.removeItem(KEY); } catch {}
+    const hadDeskew = S.deskew;
+    S = { ...S, ...displayDefaults };
+    // The reference goes too, and this is the point of the whole button.
+    // Sensitivity is only reproducible if it means the same thing in both
+    // apps, and while Auto gain is on it means "95 plus wherever the
+    // controller has drifted" -- a number that depends on everything heard
+    // since the page loaded. Restoring 95 and leaving the drift in place would
+    // put the two apps back where they were: agreeing on the control and
+    // disagreeing about the picture.
+    display.autoRef = 0;
+    save();
+    // The sensitivity control is written only when the number it shows would
+    // change, so the remembered value has to be forgotten or the slider can be
+    // left reading one thing with another in force: while Auto gain is on the
+    // control reports sensitivity plus the reference, and that sum can be
+    // unchanged across a press that moved both.
+    shownSens = null;
     applySettings();
     applyCloseUp();
     display.remapAll();
-    if (worker) {
-        display.mark('tuningChange');
-        openEngine();                    // tuning and column time in one go
+    // De-skew is the engine's business, and it is the only thing here that
+    // is. The tuning and the column rate are no longer touched, so the engine
+    // does not have to be reopened and whatever is on screen survives the
+    // press -- which is the point of leaving them alone.
+    if (worker && S.deskew !== hadDeskew) {
+        // The same seam the checkbox draws, for the same reason: the columns
+        // either side of the change were never adjacent.
+        display.mark('seam');
+        worker.postMessage({ type: 'deskew', value: S.deskew ? 1 : 0 });
     }
 };
 
+/// Last value written to the sensitivity control, so the DOM is touched only
+/// when the number it shows would change rather than sixty times a second.
+let shownSens = null;
+
 function frame(t) {
     display.render();
+    if (S.autoGain) {
+        const shown = clampSens(S.sensDB - display.autoRef);
+        if (shown !== shownSens) $('sens').value = String(shownSens = shown);
+    } else {
+        shownSens = null;
+    }
     if (t - lastReport > 1000) {
         const rate = colsSeen * 1000 / (t - lastReport);
-        if (!paused) {
+        if (ctx.state !== 'running') {
+            // Nothing will arrive until the browser lets the audio clock run,
+            // and this line is the only place that can say so -- it used to
+            // overwrite the "tap to start" message within the second, which
+            // left a white picture, a zero, and no explanation.
+            say(`tap the picture to start — audio is ${ctx.state}`);
+        } else if (!paused) {
+            const dbfs = inPeak > 0
+                ? `${(20 * Math.log10(inPeak)).toFixed(0)} dBFS` : 'silent';
+            inPeak = 0;
             say(`${display.taps} taps · ${Math.round(ctx.sampleRate)} Hz · `
-                + `${rate.toFixed(0)} col/s`);
+                + `${rate.toFixed(0)} col/s · in ${dbfs} · ${blocksIn} blocks`);
         }
         colsSeen = 0;
         lastReport = t;
@@ -580,11 +1069,18 @@ function frame(t) {
 /// what happens when the page around it grows. Observing the canvas catches
 /// both, and is the only thing that works in both the standalone page and the
 /// framed one.
+let lastWidth = 0;
 const refit = () => {
     display.resize();
-    // Half the picture is the close-up strip's ceiling, so a change of width
-    // can make the current strip illegal.
-    applyCloseUp();
+    // Only when the column count really moved. applyCloseUp writes to
+    // localStorage, and calling it on every observation is both wasteful and a
+    // way to keep the observer busy.
+    if (display.width !== lastWidth) {
+        lastWidth = display.width;
+        // Half the picture is the close-up strip's ceiling, so a change of
+        // width can make the current strip illegal.
+        applyCloseUp();
+    }
 };
 try {
     new ResizeObserver(refit).observe(view);
@@ -608,6 +1104,7 @@ try {
     // unheralded permission dialog on load is worse manners than a button.
     // Safari has no 'microphone' descriptor and throws, in which case asking
     // is the only way to find out.
+    if (TEST_MODE) { await startTestSignal(); return; }
     let known = null;
     try {
         known = (await navigator.permissions.query({ name: 'microphone' })).state;

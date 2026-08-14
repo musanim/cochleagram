@@ -29,6 +29,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set when a file has played to its end. There is nothing left to resume,
     /// so space means "back to the microphone" rather than "play".
     private var fileFinished = false
+    /// Whether this file's green line has been drawn. Two things now want to
+    /// draw it -- the sample boundary, which is where it belongs, and the
+    /// output's completion, which is the only one a file stopped early will
+    /// ever reach -- and exactly one of them should win.
+    private var fileEndMarked = false
+    /// Whether the finished file's graph has been taken down. Teardown removes
+    /// the tap, so it cannot happen until the tap has delivered the tail.
+    private var fileTornDown = false
+    /// When to stop waiting for that tail. A file that was stopped rather than
+    /// finished never reaches its own last sample, so the wait needs an end.
+    private var fileEndDeadline: CFTimeInterval?
     private var keyMonitor: Any?
 
     /// The last file played, and the button that replays it. Session-scoped:
@@ -45,7 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var closeUpPopup: NSPopUpButton!
     private var invertBox: NSButton!
     private var autoBox: NSButton!
-    private var exposureSlider: RangeSlider!
+    private var defaultsButton: NSButton!
+    private var sensSlider: NSSlider!
+    private var rangeSlider: NSSlider!
     private var timeButtons: [NSButton] = []
     private var erbPopup: NSPopUpButton!
     private var modePopup: NSPopUpButton!
@@ -135,7 +148,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func frameTick() {
         view.tick()
+        // The end of the file, as the audio defines it: the frame after the
+        // last one was fed to the cascade. Noticed here rather than signalled
+        // from the audio thread, which is not a place to be scheduling work.
+        if audio.fileSamplesEnded { markFileEndOnce() }
+        // And the teardown, which waits for that as well as for the output.
+        endFileIfReady()
+        showAutoSensitivity()
         reportAudioMeters()
+    }
+
+    /// `Settings.clamp` is private to `Settings`, and this is the one place
+    /// outside it that needs the same limits applied.
+    private static func clampSens(_ v: Double) -> Double {
+        min(Settings.sensitivityRange.upperBound,
+            max(Settings.sensitivityRange.lowerBound, v))
+    }
+
+    /// Last value written to the Sensitivity control, so it is touched only
+    /// when what it shows would change rather than sixty times a second.
+    private var shownSens: Double?
+
+    /// While Auto gain is on, Sensitivity reports what the controller has
+    /// arrived at: the setting in force is then visible, not merely in effect.
+    ///
+    /// The knob can pin at either end while the reference goes further, in
+    /// which case it stops reporting -- but reaching that needs a source more
+    /// than two hundred decibels from where Sensitivity was left.
+    private func showAutoSensitivity() {
+        guard settings.autoGain else { shownSens = nil; return }
+        let v = Self.clampSens((settings.sensDB - view.autoReferenceDB).rounded())
+        guard v != shownSens else { return }
+        shownSens = v
+        sensSlider.doubleValue = v
     }
 
     // MARK: - metering
@@ -462,7 +507,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // reopened the *system default*, leaving the menu showing a device
         // that was not the one being captured.
         let playButton = button("Play File", #selector(openFile(_:)))
-        topRow.addArrangedSubview(playButton)
 
         // The file's name, beside the button that opened it. Truncated in the
         // middle rather than at the tail: the extension and the end of the
@@ -478,14 +522,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                               for: .horizontal)
         fileNameLabel.setContentHuggingPriority(.init(1), for: .horizontal)
         // A ceiling as well as a floor. Without it a long name would take
-        // whatever the spacer would otherwise have given up, which is the
-        // one thing keeping Replay at the right-hand end of the row.
+        // whatever the spacer would otherwise have given up, and push the
+        // rest of the row about as it changed.
         fileNameLabel.widthAnchor.constraint(
             lessThanOrEqualToConstant: 220).isActive = true
         fileNameLabel.isHidden = true
-        topRow.addArrangedSubview(fileNameLabel)
 
-        topRow.addArrangedSubview(spacer())
 
         // Replay, at the right-hand end of the row -- which the spacer above
         // and the equal-width constraint below put directly over the last
@@ -498,35 +540,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             replayButton.title = "↻"        // if the symbol is ever missing
         }
-        replayButton.toolTip = "Replay the last file"
+        replayButton.toolTip = "Play the same file again"
         replayButton.isHidden = true
-        topRow.addArrangedSubview(replayButton)
+
+        // Play file, then Replay, then the name -- the same order as the
+        // browser version, and the order the three things happen in. Replay
+        // used to sit at the far right with the spacer between, which put the
+        // button furthest from the button it repeats.
+        //
+        // The spacer goes last, so the group stays left and the slack is at
+        // the end of the row rather than inside it.
+        for v in [playButton, replayButton, fileNameLabel, spacer()] as [NSView] {
+            topRow.addArrangedSubview(v)
+        }
 
         // ---- lower row -------------------------------------------------
 
         invertBox = NSButton(checkboxWithTitle: "Invert",
                              target: self, action: #selector(toggleInvert(_:)))
-        bottomRow.addArrangedSubview(invertBox)
-
-        autoBox = NSButton(checkboxWithTitle: "AGC",
+        autoBox = NSButton(checkboxWithTitle: "Auto gain",
                            target: self, action: #selector(toggleAuto(_:)))
-        autoBox.toolTip = "Automatic gain control: measure the Range against "
-                        + "a reference that follows the loudest tap, rather "
-                        + "than against full scale."
-        bottomRow.addArrangedSubview(autoBox)
+        autoBox.toolTip = "Move Sensitivity automatically, aiming to keep the "
+                        + "average pixel about 30% of the way to full ink. "
+                        + "Sensitivity then reports what it is doing rather "
+                        + "than accepting instructions; switch this off to "
+                        + "take over from wherever it had got to."
 
-        // De-skew sits next to Close-up rather than up in the top row,
-        // because it is the control that greys Close-up out. A switch that
-        // disables another one has to be within sight of it, or the other one
-        // simply appears to have stopped working.
+        // De-skew sits next to Invert: both are about how the picture is
+        // drawn rather than what it is drawn from. It is also the control
+        // that greys Close-up out, which is a reason to keep them in one row
+        // -- a switch that disables another has to be within sight of it, or
+        // the other simply appears to have stopped working.
         deskewBox = NSButton(checkboxWithTitle: "De-skew",
                              target: self, action: #selector(toggleDeskew(_:)))
         deskewBox.toolTip = "Compensate the travelling-wave delay so a click "
                           + "stands vertical. Costs about 186 ms of display "
                           + "latency, and more at sharper tunings. Close-up is "
                           + "unavailable while this is on."
-        bottomRow.addArrangedSubview(deskewBox)
-
         // The menu sets how much time; the line sets how much room it gets.
         // Magnification is the quotient, and the constraints on it live in
         // `Settings.closeUpFit` -- the view asks, it does not decide.
@@ -563,35 +613,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              + "De-skew off: de-skew delays the whole display "
                              + "by the apex's travel time, so there is nothing "
                              + "recent left to show."
-        bottomRow.addArrangedSubview(closeUpPopup)
-
-        // Invert, AGC, De-skew and Close-up are switches; the range is a
-        // measurement. Without a line the slider reads as a fifth thing in the
-        // same group, and the eye goes looking for the checkbox that belongs
-        // to it.
-        bottomRow.addArrangedSubview(divider())
-
-        // One slider, two knobs: the ends of the level-to-grey mapping. The
-        // left knob is where the picture reaches white, the right where it
-        // reaches black. Sliding both together is a gain change; sliding them
-        // apart is a contrast change.
+        // Two plain sliders, where there used to be one with two knobs.
         //
-        // No label and no numeric readout: the knobs are the reading, and the
-        // tooltip carries the units for anyone who wants them.
-        exposureSlider = RangeSlider()
-        exposureSlider.range = Settings.exposureRange
-        exposureSlider.minimumSeparation = Settings.minimumExposureSpan
-        exposureSlider.target = self
-        exposureSlider.action = #selector(exposureChanged(_:))
-        exposureSlider.toolTip = "Left knob: the level that renders white. "
-                               + "Right knob: the level that renders black. "
-                               + "dB, relative to the AGC reference when AGC "
-                               + "is on and to full scale when it is off."
-        exposureSlider.widthAnchor.constraint(equalToConstant: 150).isActive = true
-        exposureSlider.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        bottomRow.addArrangedSubview(exposureSlider)
+        // The knobs were the two ends of the mapping, which reads directly --
+        // but two ends of one scale collide, and the code keeping them apart
+        // failed silently at the limits. These do not interact: one says where
+        // the middle of the window is, the other how wide it is. See the note
+        // on `Settings.sensDB`.
+        //
+        // No numeric readout, on either. They are set to taste, by looking at
+        // the picture; a number would only be something else to read.
+        sensSlider = NSSlider(value: Settings().sensDB,
+                              minValue: Settings.sensitivityRange.lowerBound,
+                              maxValue: Settings.sensitivityRange.upperBound,
+                              target: self, action: #selector(sensChanged(_:)))
+        sensSlider.toolTip = "How faint a sound the display can show. Further "
+                           + "right is more sensitive, so more ink and a "
+                           + "darker picture. Driven by Auto gain while that "
+                           + "is on."
+        sensSlider.widthAnchor.constraint(equalToConstant: 110).isActive = true
 
-        bottomRow.addArrangedSubview(divider())
+        rangeSlider = NSSlider(value: Settings().rangeDB,
+                               minValue: Settings.rangeRange.lowerBound,
+                               maxValue: Settings.rangeRange.upperBound,
+                               target: self, action: #selector(rangeChanged(_:)))
+        rangeSlider.toolTip = "How many decibels lie between white and black. "
+                            + "Narrow is high contrast; wide shows more of the "
+                            + "signal at once. Always yours to set, whether or "
+                            + "not Auto gain is on."
+        rangeSlider.widthAnchor.constraint(equalToConstant: 110).isActive = true
+
+        // The browser version has had this since stored settings started
+        // outliving changes to what the defaults are, which is the whole
+        // reason it exists: without it the only way to see a new default is to
+        // know where the settings are kept and delete them.
+        //
+        // Not "Reset Settings..." in the Settings panel. That one is a bigger
+        // thing -- it forgets the window, the output device and the
+        // diagnostics too, and asks first. This restores only what is drawn on
+        // the screen, so it is safe to press while comparing two machines,
+        // which is what it is for.
+        defaultsButton = button("Defaults", #selector(restoreDisplayDefaults(_:)))
+        defaultsButton.toolTip = "Put the display controls back to their "
+                               + "starting values. Leaves the window, the "
+                               + "output device and the diagnostics alone."
 
         // Horizontal scale. Detents rather than a slider: the useful settings
         // are a handful of ratios apart, and a slider makes you hunt for them
@@ -602,7 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // scroll gets faster to the right, which the label has to agree with.
         // Unlike ERB this one keeps its label -- the dials carry no text at
         // all, so without it the row would end in fifteen anonymous circles.
-        bottomRow.addArrangedSubview(NSTextField(labelWithString: "Speed"))
+        let speedLabel = NSTextField(labelWithString: "Speed")
         let times = NSStackView()
         times.orientation = .horizontal
         times.spacing = 0                   // as tight as AppKit will draw them
@@ -630,7 +695,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // detent, so only the order they are hung in changes -- and `[` and
         // `]` then move the selection the way the brackets point.
         for b in timeButtons.reversed() { times.addArrangedSubview(b) }
-        bottomRow.addArrangedSubview(times)
+
+        // ---- and now the order ------------------------------------------
+        //
+        // In one place, because that is the only way it can be read. Grouped
+        // by what a control is *about*, with a line between the groups:
+        //
+        //   how the picture is drawn | what part of the sound it shows |
+        //   the exposure pair | the width of the grey scale
+        //
+        // Auto gain sits with Sensitivity because it is Sensitivity, moved by
+        // something other than your hand. Range stands alone: it is the one
+        // exposure control Auto gain does not touch.
+        // Annotated rather than cast: the stored controls are implicitly
+        // unwrapped optionals, and an array literal mixing those with fresh
+        // `divider()` values gives the compiler no single element type to
+        // settle on unless it is told one.
+        let ordered: [NSView] = [invertBox, deskewBox, divider(),
+                                 speedLabel, times, closeUpPopup, divider(),
+                                 sensSlider, autoBox, divider(),
+                                 rangeSlider, divider(), defaultsButton]
+        for v in ordered { bottomRow.addArrangedSubview(v) }
 
         // Built here rather than in the row above, because Settings owns it
         // now and the panel is created lazily.
@@ -663,15 +748,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showSettingsInControls()
         showTransport()
 
-        // Replay's right edge sits exactly over the rightmost Speed detent.
+        // The two rows end at the same place.
         //
-        // Said as a constraint against `times` rather than by making the two
-        // rows equal width. Equal widths would land in the same place today
-        // only because Speed happens to be last in the lower row, and would
-        // quietly stop meaning this the moment anything was added after it.
-        // Nothing here is tied to the window's edge: the row is as wide as it
-        // needs to be to reach that point, and the spacer takes up the slack.
-        topRow.trailingAnchor.constraint(equalTo: times.trailingAnchor).isActive = true
+        // This has now been wrong twice by naming a particular control instead
+        // of the thing meant. It named `times` when Speed happened to be last
+        // in the lower row, and stopped meaning anything when four controls
+        // were added after it; then it named Replay, which has since moved to
+        // sit beside Play file. The rows themselves are what has to line up,
+        // and neither of them is going anywhere.
+        //
+        // Nothing here is tied to the window's edge: each row is as wide as it
+        // needs to be, and the top row's trailing spacer takes up the slack.
+        topRow.trailingAnchor.constraint(
+            equalTo: bottomRow.trailingAnchor).isActive = true
 
         // And nothing in the toolbar may widen the window.
         for row in [topRow, bottomRow, bar] {
@@ -958,9 +1047,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                    isProblem: true)
             return nil
         }
-        guard let c = Cochlea(coefficientURL: url, inputRate: inputRate) else {
-            report("Could not load \(url.lastPathComponent).", isProblem: true)
-            return nil
+        // The one we are holding, if it is already the one being asked for.
+        //
+        // Building costs about half a second on the main thread -- two
+        // calibration sweeps over all 599 taps -- and Replay paid it every
+        // time, which is most of the gap between the Mac taking most of a
+        // second to start a file and the browser taking a fifth of one. The
+        // browser never rebuilds for a replay; it keeps the engine it opened
+        // and simply plays the buffer again.
+        //
+        // The engine keeps its filter state across the reuse, exactly as the
+        // browser's does. That is not a compromise for speed: a file's first
+        // moments are genuinely preceded by whatever came before, and the seam
+        // `adopt` marks below is what says so.
+        let c: Cochlea
+        if let existing = cochlea, existing.coefficientURL == url,
+           existing.inputRate == inputRate {
+            c = existing
+            Log.say("COCHLEA reused (\(name), input \(Int(inputRate)) Hz)")
+        } else {
+            guard let built = Cochlea(coefficientURL: url, inputRate: inputRate)
+            else {
+                report("Could not load \(url.lastPathComponent).",
+                       isProblem: true)
+                return nil
+            }
+            c = built
         }
         cochlea = c
         view.adopt(c, join: join)
@@ -969,7 +1081,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 + "\(String(format: "%.1f", c.frequencies.last ?? 0))-"
                 + "\(String(format: "%.0f", c.frequencies.first ?? 0)) Hz, "
                 + "input \(Int(inputRate)) Hz, internal \(Int(c.internalRate)) Hz, "
-                + "\(columnMS) ms/column, \(settings.erbScale) x ERB")
+                + "\(columnMS) ms/column, \(settings.erbScale) x ERB, "
+                + "dmax \(String(format: "%.2f", c.maxDelayMS)) ms")
         return c
     }
 
@@ -1000,6 +1113,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // ran out -- there is no finished file any more, so space goes
                 // back to meaning pause.
                 self.fileFinished = false
+                // With it, everything that was waiting on the finished file.
+                // `startInput` has already stopped that graph, so there is
+                // nothing left to mark or to tear down, and a deadline left
+                // armed across the change would be waiting on a tap that no
+                // longer exists.
+                self.fileEndMarked = false
+                self.fileTornDown = false
+                self.fileEndDeadline = nil
                 self.view.isPaused = false
                 self.showCurrentDevice()
                 // The file is gone, but it is still what Replay would play,
@@ -1064,6 +1185,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hasPlayedThrough = false
             paused = false
             fileFinished = false
+            fileEndMarked = false
+            fileTornDown = false
+            fileEndDeadline = nil
             view.isPaused = false
             // After the three flags above, not before: the transport controls
             // are drawn from them, and this used to run first -- harmless
@@ -1083,29 +1207,132 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The file has played its last sample.
+    /// The file's last *sample* has reached the cascade, which is when the
+    /// picture of it is complete. Earlier than `fileDidFinish`, which waits
+    /// for the output to have played that sample -- and the gap between the
+    /// two is the 35 ms the green line used to be short by.
+    ///
+    /// Called from the frame tick rather than from the audio thread, and made
+    /// idempotent, because `fileDidFinish` calls it too: a file that is
+    /// stopped rather than finished never reaches its own last sample, and the
+    /// completion is then the only thing that will say so.
+    private func markFileEndOnce() {
+        guard !fileEndMarked else { return }
+        fileEndMarked = true
+
+        // Draw what the engine has already produced *before* freezing, or the
+        // final columns would sit undrawn in the ring and put the green line
+        // short of the end.
+        view.tick()
+
+        // TEMPORARY DIAGNOSTIC. `fed` is how much of the file has reached the
+        // cascade, `drew` is how much picture exists since the join, and the
+        // frame is where the file's first non-silent sample landed in what was
+        // fed. For `reference/pureimpulse.wav` that frame should now read
+        // 4410; it read 5946 while the pre-roll was being drawn.
+        let fedMS = audio.sampleRate > 0
+            ? Double(audio.meters.samples - audio.samplesAtFileStart)
+              / audio.sampleRate * 1000.0
+            : 0
+        let drewMS = Double(view.columnsSinceJoin) * engineColumnMS
+        let firstNZ = audio.firstNonZeroFrame
+        let nzFrame = firstNZ >= 0 ? firstNZ - audio.samplesAtFileStart : -1
+        let nzMS = nzFrame >= 0 && audio.sampleRate > 0
+            ? Double(nzFrame) / audio.sampleRate * 1000.0 : -1
+        Log.say(String(format:
+            "ENDMARK fed %.1f ms, drew %.1f ms, difference %.1f ms "
+            + "(%d columns at %.3f ms); first non-zero sample at frame %d "
+            + "= %.1f ms of stream", fedMS, drewMS, fedMS - drewMS,
+            view.columnsSinceJoin, engineColumnMS, nzFrame, nzMS))
+
+        view.markFileEnd()
+
+        // Frozen here, with the sound still playing out: every sample of the
+        // file has reached the cascade, and the remaining few milliseconds are
+        // the output emptying its buffers.
+        //
+        // "Every sample has reached the cascade" is not quite "the picture is
+        // complete", and the difference is De-skew. It holds each tap back by
+        // its own travelling-wave delay, up to about 186 ms at the apex, so
+        // the newest column's low frequencies are still that far behind the
+        // newest sample. The tail of a de-skewed picture is therefore short at
+        // the bottom however this is timed -- inherent to de-skew, not to the
+        // boundary, but the boundary is 35 ms earlier than the completion it
+        // replaced, so it is marginally more so.
+        paused = true
+        view.discardWhilePaused = true
+        view.isPaused = true
+    }
+
+    /// The file has been *heard* to its end: the output reports it has played
+    /// the last sample.
+    ///
+    /// Which is not the end of the picture, and is the earlier of the two.
+    /// Rendering leads playback by the output's own latency, but the tap hands
+    /// over a batch only once it is full -- 4410 frames here, 100 ms -- so the
+    /// batch holding the file's tail arrives about 65 ms *after* this fires.
+    /// Marking and tearing down here threw that batch away with the tap still
+    /// holding it, which is why the picture stopped 35 ms short of the sound.
     private func fileDidFinish() {
         fileFinished = true
         hasPlayedThrough = true
         showTransport()
+        report("Finished — space returns to live input.")
+        // Comfortably more than the one tap batch being waited for, and short
+        // enough that a boundary which never comes costs a fifth of a second
+        // of the player's silence rather than half of one.
+        fileEndDeadline = CACurrentMediaTime() + 0.2
+        // The frame tick checks the deadline, and the frame tick is a display
+        // link -- which AppKit stops when the window is minimised or fully
+        // occluded. A file finishing behind a minimised window would then hold
+        // the engine, the player and the output device until it was restored.
+        // A timer that does not depend on anything being drawn.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.endFileIfReady()
+        }
+        endFileIfReady()
+    }
 
-        // Draw what the engine has already produced *before* freezing. The
-        // completion fires once the last sample has been played, so the final
-        // columns are sitting in the ring; pausing first would leave them
-        // undrawn and put the green line short of the actual end.
-        view.tick()
-        view.markFileEnd()
-
+    /// Wind the file up, once both timelines agree it is over: the output has
+    /// played the last sample, and the tap has delivered it.
+    ///
+    /// Called every frame, because the second of those arrives on its own
+    /// schedule and nothing announces it.
+    private func endFileIfReady() {
+        guard fileFinished, !fileTornDown else { return }
+        if !fileEndMarked {
+            // `nil` means "not armed yet", so it must not read as "long since
+            // expired". Unreachable today -- the deadline is set two lines
+            // before the only call that can get here -- but one reordering
+            // away from marking the moment a file ends.
+            let timedOut = fileEndDeadline.map { CACurrentMediaTime() > $0 }
+                ?? false
+            // No boundary is coming for a file whose length was never known,
+            // so there is nothing to wait for and the completion is the best
+            // authority there is.
+            let noBoundaryComing = !audio.knowsFileLength
+            guard audio.fileSamplesEnded || timedOut || noBoundaryComing
+            else { return }
+            if timedOut || noBoundaryComing {
+                // A file that was stopped rather than finished never reaches
+                // its own last sample. Mark where the audio actually got to
+                // and say so, rather than waiting for something that is not
+                // coming.
+                Log.say("FILE end: no sample boundary "
+                        + (noBoundaryComing ? "(length unknown)" : "(timed out)")
+                        + "; marking where the audio reached")
+            }
+            markFileEndOnce()
+        }
+        fileTornDown = true
+        fileEndDeadline = nil
+        // `markFileEndOnce` has already frozen the display. Asserted again
+        // because the state is cheap and the cost of getting it wrong is a
+        // wall of blank columns scrolling the end of the file away.
         paused = true
-        // Anything arriving from here on is the player rendering silence into
-        // the tap. Discard it rather than queue it, or it would scroll the end
-        // of the file away behind a wall of blank columns the moment the
-        // display resumed.
         view.discardWhilePaused = true
         view.isPaused = true
         audio.finishedPlayingFile()
-
-        report("Finished — space returns to live input.")
         Log.say("FILE finished; green line at the end, engine winding down")
     }
 
@@ -1348,6 +1575,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // right-hand strip claiming to show the last sixth of a second while
         // the engine holds every column back by the apex's travel time.
         if settings.deskew { settings.closeUpSpanMS = 0 }
+        // A seam, before the engine is told: the columns either side of this
+        // were never adjacent. De-skew holds each tap back by its own
+        // travelling-wave delay -- up to about 170 ms at the apex, nothing at
+        // the base -- so switching it slides the bottom of the picture against
+        // the top. Marking it costs one line and stops the picture claiming a
+        // continuity across the join that it does not have.
+        view.markSeam()
         cochlea?.deskew = settings.deskew
         applyCloseUp()
         showSettingsInControls()
@@ -1439,14 +1673,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleAuto(_ sender: NSButton) {
-        settings.autoGain = sender.state == .on
+        let on = sender.state == .on
+        if !on && settings.autoGain {
+            // Hand the control back where the controller left it, not where
+            // it was last put by hand. Switching to manual is what you do when
+            // Auto gain is close but not right, and it would be no use at all
+            // if the picture jumped at the moment you took over.
+            //
+            // Folding the reference into Sensitivity makes the correct
+            // reference zero, which is why the view is then told to forget it
+            // rather than keep it for next time.
+            //
+            // The picture does jump if the sum lands outside the control's own
+            // limits -- which means the controller had gone somewhere manual
+            // control cannot express, so there is nowhere honest to put the
+            // knob. It needs a source more than two hundred decibels from
+            // where Sensitivity was left.
+            settings.sensDB = Self.clampSens(settings.sensDB
+                                             - view.autoReferenceDB)
+            view.resetAutoReference()
+        }
+        settings.autoGain = on
+        showSettingsInControls()
         applyLevels()
         save()
     }
 
-    @objc private func exposureChanged(_ sender: RangeSlider) {
-        settings.whiteDB = sender.lowValue
-        settings.blackDB = sender.highValue
+    @objc private func sensChanged(_ sender: NSSlider) {
+        // Auto gain owns this control while it is on, and the frame tick has
+        // been writing the reference-corrected *readout* into it. Reading that
+        // back would subtract the reference a second time.
+        guard !settings.autoGain else { return }
+        // Rounded, because the browser's slider has an integer step and these
+        // two numbers are meant to be transferable between the apps: "95 and
+        // 170" has to name the same window in both, and an NSSlider left at
+        // 94.7 would quietly make that false.
+        settings.sensDB = sender.doubleValue.rounded()
+        applyLevels()
+        save()
+    }
+
+    @objc private func rangeChanged(_ sender: NSSlider) {
+        settings.rangeDB = sender.doubleValue.rounded()
         applyLevels()
         save()
     }
@@ -1456,6 +1724,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// while we do it. Rather than hand a new `Cochlea` across that boundary,
     /// restart the source: both paths already build the engine before any
     /// audio flows, which is the one moment the handoff is free.
+    ///
+    /// Unless nothing is running, in which case the rebuild is not needed yet
+    /// and restarting would cost the picture. See below.
     @objc private func erbScaleChanged(_ sender: NSPopUpButton) {
         let i = sender.indexOfSelectedItem
         guard i >= 0, i < Settings.erbScales.count else { return }
@@ -1464,7 +1735,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.erbScale = scale
         Log.say("ERB scale -> \(scale)")
 
-        if audio.isFilePlayback || fileFinished, let url = lastFileURL {
+        if fileFinished {
+            // The file has played and the picture is frozen on its end, which
+            // is when somebody is most likely to be reading it. Nothing is
+            // arriving to be drawn with the new tuning, so there is nothing to
+            // rebuild yet: Replay and the microphone each build an engine from
+            // `settings` at the moment they start, and will pick this up then.
+            // Restarting here would replay the file unasked and throw away the
+            // picture the tuning was being chosen against.
+            Log.say("ERB deferred: file has finished, nothing to rebuild until "
+                    + "the next Replay or return to live input")
+        } else if audio.isFilePlayback, let url = lastFileURL {
             play(url, join: .tuningChange)   // from the top, new tuning
         } else {
             startLiveInput(deviceID: selectedDeviceID, join: .tuningChange)
@@ -1517,8 +1798,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showCloseUpSpan()
         invertBox.state = settings.invert ? .on : .off
         autoBox.state = settings.autoGain ? .on : .off
-        exposureSlider.lowValue = settings.whiteDB
-        exposureSlider.highValue = settings.blackDB
+        sensSlider.doubleValue = settings.sensDB
+        rangeSlider.doubleValue = settings.rangeDB
+        // Forget what the knob was last shown, having just overwritten it with
+        // the raw setting. Without this, `showAutoSensitivity` recomputes the
+        // same reference-corrected value it wrote before, finds it unchanged,
+        // and leaves the uncorrected number on screen -- until the reference
+        // happens to move, which on a paused or finished display is never.
+        shownSens = nil
+        // Auto gain owns Sensitivity while it is on: the control reports what
+        // the controller is doing rather than accepting instructions. Wanting
+        // it somewhere else is exactly what switching Auto gain off is for.
+        sensSlider.isEnabled = !settings.autoGain
         showTimeStep()
         applyDiagnostics()
         if let i = Settings.erbScales.firstIndex(of: settings.erbScale) {
@@ -1533,8 +1824,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// dB and knows nothing about Gain or Level, which is what lets a change
     /// re-expose the whole picture rather than only the columns still to come.
     private func applyLevels() {
-        view.exposure = CochleagramView.Exposure(whiteDB: settings.whiteDB,
-                                                 blackDB: settings.blackDB,
+        let w = settings.exposureWindow
+        view.exposure = CochleagramView.Exposure(whiteDB: w.white,
+                                                 blackDB: w.black,
                                                  autoGain: autoGain,
                                                  inverted: settings.invert,
                                                  mode: settings.displayMode)
@@ -1552,6 +1844,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Back to factory. Confirmed first: it throws away the window position
     /// as well, which is not obvious from the menu title.
+    /// The display controls, and only those, back to their starting values.
+    ///
+    /// Deliberately narrower than `resetSettings`: the output device, the
+    /// diagnostics, the window and its position are all left alone, because
+    /// this is a button on the toolbar rather than a considered act in a
+    /// settings panel, and pressing it should never cost you anything you
+    /// would have to go and set up again.
+    @objc private func restoreDisplayDefaults(_ sender: Any?) {
+        // The stored defaults, minus ERB and Speed -- and so minus the reload
+        // that restoring those used to need. What the button restores is not a
+        // separate set of values, only a shorter list of settings; keeping a
+        // second copy of the values would be a way for the two to drift.
+        let d = Settings()
+        let hadDeskew = settings.deskew
+        settings.deskew         = d.deskew
+        settings.invert         = d.invert
+        settings.autoGain       = d.autoGain
+        settings.sensDB         = d.sensDB
+        settings.rangeDB        = d.rangeDB
+        settings.displayMode    = d.displayMode
+        settings.closeUpSpanMS  = d.closeUpSpanMS
+        settings.closeUpColumns = d.closeUpColumns
+
+        showSettingsInControls()
+        applyToEngine()
+        // The picture survives, where this used to wipe it. Nothing here
+        // changes what a column *means* -- the tuning and the time scale are
+        // exactly where they were, and everything that did move is a mapping
+        // from level to grey, which `exposure`'s setter re-applies to what is
+        // already drawn. Wiping was right when the button also restored ERB
+        // and Speed; now it would throw away the thing somebody pressed the
+        // button in order to see.
+        //
+        // With one exception that is not this method's to fix: closing an open
+        // close-up retimes the bitmap, and `setCloseUp` wipes when it retimes.
+        // Pressing Defaults with the strip open therefore still costs the
+        // picture, exactly as switching the strip off by hand does.
+        //
+        // De-skew does change what a column means, so it gets the same seam
+        // the checkbox draws -- after `applyToEngine`, not before, so that it
+        // is not one of the things a retime would take with it. The browser
+        // marks it at the same point.
+        if settings.deskew != hadDeskew { view.markSeam() }
+        // The reference goes too, and this is the point of the whole button.
+        // Sensitivity is only reproducible if it means the same thing in both
+        // apps, and while Auto gain is on it means "95 plus wherever the
+        // controller has drifted" -- a number that depends on everything heard
+        // since launch. Restoring 95 and leaving the drift in place would put
+        // the two apps back where they were: agreeing on the control and
+        // disagreeing about the picture.
+        view.resetAutoReference()
+        save()
+        Log.say("SETTINGS display controls restored to defaults")
+    }
+
     @objc func resetSettings(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "Reset settings to their defaults?"
@@ -1582,6 +1929,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // adjustment you are watching the effect of, and several settings
         // moved at once.
         view.clear()
+        // Including what Auto gain had drifted to. Restoring the default
+        // Sensitivity while the reference still holds the last room's
+        // correction is not back to factory, it is back to factory plus a
+        // hidden offset.
+        view.resetAutoReference()
 
         // The frame is still named, so this position is what gets saved from
         // here on; clearing the key alone would leave the current frame in

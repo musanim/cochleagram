@@ -56,8 +56,25 @@ constexpr int   kMaxDeskewColumns = 4096;
  *  A display that has fallen four hundred milliseconds behind has a worse
  *  problem than a short queue, and the columns it loses are counted and
  *  marked. */
-constexpr int   kRingColumns      = 8192;
-constexpr float kTinyLevel        = 1e-12f;
+/* Columns the engine may hold before the display collects them.
+ *
+ * 1024 is four seconds at 4 ms a column, and the consumer pulls every audio
+ * block -- every three milliseconds or so -- meaning the ring never holds more
+ * than a handful. It was 8192, which is thirty-three seconds of queue nothing
+ * asks for, and 37 MB of it: at 599 taps and two quantities a column costs
+ * 4.7 kB, so the ring alone was the largest allocation in the program. On a
+ * desktop that is invisible. In an iOS tab, where the whole page is competing
+ * for a budget measured in hundreds of megabytes, it is most of the reason
+ * Safari was reloading the page and handing back cleared canvases. */
+constexpr int   kRingColumns      = 1024;
+/*  What a tap with no energy in it reports, standing in for minus infinity.
+ *  1e-30, not the 1e-12 this used to be: 1e-12 is -240 dB, and once the
+ *  display's window could be positioned freely it became reachable -- a
+ *  window of -300 to -100 drew genuine silence as a mid grey, because -240
+ *  is inside it. A stand-in for minus infinity has to stay outside every
+ *  window the instrument can be set to, and -600 dB does. Well above the
+ *  smallest normal float, 1.18e-38, so nothing here goes subnormal. */
+constexpr float kTinyLevel        = 1e-30f;
 
 
 /* ---------------------------------------------------------------------------
@@ -409,6 +426,44 @@ struct CochleaEngine {
         }
     }
 
+    /*  One sample at the *input* rate through the same front end the audio
+     *  takes: the resampler, and then the middle ear inside `runCascade`.
+     *  `step` is called after each internal sample, so a caller can watch the
+     *  taps at the engine's own resolution.
+     *
+     *  This exists so that calibration can measure the cascade through the
+     *  chain the picture is actually drawn from. Feeding `runCascade` a unit
+     *  sample directly -- which is what calibration used to do -- presents it
+     *  with an impulse carrying energy to half the *internal* rate, an octave
+     *  above anything real audio can contain. That extra octave leaks down the
+     *  cascade almost instantaneously and shows up as a tiny early "response"
+     *  ahead of the real one: 100 dB below it at 56 Hz and 177 dB below at
+     *  30 Hz at ERB 0.5, which is enough to be found by any threshold low
+     *  enough to catch a sharp tuning's genuine first peak. It never appears
+     *  in the picture, because real audio arrives band-limited through the
+     *  half-band upsampler. Calibrating through the same front end removes it
+     *  at the source rather than trying to recognise and reject it.
+     *
+     *  Deliberately not `cochlea_process` itself: that also fills the column
+     *  ring, and calibration has no picture to draw. */
+    template <typename F>
+    inline void feedInput(double x, F &&step) {
+        if (need_upsample) {
+            double two[2];
+            up.step(x, two);
+            for (int j = 0; j < 2; ++j) { runCascade(two[j]); step(); }
+        } else {
+            while (resample_phase < 1.0) {
+                const double s = last_in + (x - last_in) * resample_phase;
+                runCascade(s);
+                step();
+                resample_phase += resample_step;
+            }
+            resample_phase -= 1.0;
+            last_in = x;
+        }
+    }
+
     inline void runCascade(double x) {
         /* The middle ear runs here rather than on the host samples so that it
          * sees the internal rate, which is what its coefficients were designed
@@ -593,19 +648,23 @@ struct CochleaEngine {
     void calibrateDelays() {
         const int n = n_taps;
         if (n < 1) return;
-        const long total = static_cast<long>(fs * 0.5);
+        /* At the *input* rate, and through `feedInput`, so that the impulse
+         * reaching the cascade is the one real audio would deliver. See the
+         * note on `feedInput`. */
+        const long total = static_cast<long>(input_rate * 0.5);
 
         /* Two passes, because the threshold for the second is a property of
          * the first. */
         resetState();
         std::vector<double> best(static_cast<size_t>(n), 0.0);
         for (long i = 0; i < total; ++i) {
-            runCascade(i == 0 ? 1.0 : 0.0);
-            for (int t = 0; t < n; ++t) {
-                if (held[t] > best[static_cast<size_t>(t)]) {
-                    best[static_cast<size_t>(t)] = held[t];
+            feedInput(i == 0 ? 1.0 : 0.0, [&] {
+                for (int t = 0; t < n; ++t) {
+                    if (held[t] > best[static_cast<size_t>(t)]) {
+                        best[static_cast<size_t>(t)] = held[t];
+                    }
                 }
-            }
+            });
         }
 
         /* The *first* peak, not the biggest one and not the first big one.
@@ -616,35 +675,130 @@ struct CochleaEngine {
          * and at 30 Hz the gap between the first peak and the biggest is a
          * whole cycle -- 33 ms.
          *
-         * The threshold below is only there to ignore numerical dirt. It was a
-         * tenth of the tap's maximum, which sounds modest and is not: the first
-         * peak is a smaller fraction of the maximum the higher the tap, so a
-         * tenth caught the second peak from 113 Hz up and the third from 334,
-         * skipping a whole cycle each time. A hundred-thousandth is 100 dB
-         * down, far below anything that is ever drawn, so the first crossing is
-         * the first peak and nothing else.
-         *
          * `held` only ever moves at a genuine positive local maximum of the
          * tap's output, so "the first time held moves" *is* "the first peak".
-         * The threshold is a guard, not a selector. */
-        constexpr double kLeadFraction = 1e-5;
+         *
+         * The threshold is **absolute** -- one level for every tap -- and that
+         * is the whole of it. It was a fraction of each tap's own maximum,
+         * which is a different level for every tap, and where that level
+         * happened to fall between a tap's first and second peak the search
+         * took the second: a whole cycle late, for a whole band of taps at
+         * once. At ERB 0.6 that put everything above 305 Hz one cycle out,
+         * above 648 Hz two, above 1898 Hz three -- visible as rectangular
+         * steps in the leading edge of a click, 4.5 ms at the worst of them.
+         * ERB 1.0 escaped only by luck: at one ERB the first peak stands far
+         * enough above a hundredth of a millionth of the maximum everywhere.
+         *
+         * Chasing the fraction downwards does not fix it and cannot: the level
+         * it has to clear varies by tens of decibels across frequency and
+         * tuning, so no single fraction is below every first peak. An absolute
+         * level can be, and is also what the eye is using -- turn Sensitivity
+         * and Range to maximum, and the first non-white point in each row *is*
+         * this crossing. The rule and the picture are then the same statement.
+         *
+         * -300 dB, and the value barely matters now. Spread of the visible
+         * leading edge at 0.5 ms per column, de-skew on, measured through the
+         * front end above:
+         *
+         *            -140   -180   -220   -260   -300   -340   -380 dB
+         *   ERB 0.5  16.0   12.0    8.5    8.5    8.5    8.5    8.5 ms
+         *   ERB 0.6   5.0    4.0    1.5    1.5    1.5    1.5    1.5
+         *   ERB 0.7   3.5    1.5    0.5    0.5    0.5    0.5    0.5
+         *   ERB 1.0   0.5    0.5    0.5    0.5    0.5    0.5    0.5
+         *
+         * 0.5 ms is one column: as vertical as the display can draw. The
+         * answer stops moving below -220 dB and never moves again -- there is
+         * no floor to fall off, because there is no longer a precursor to
+         * find. -300 is chosen for margin against a sharper bake than any that
+         * exists, not because anything changes there.
+         *
+         * It was 1e-5 of each tap's *own maximum* -- a different level for
+         * every tap -- and where that fell between a tap's first and second
+         * peak the search took the second. At ERB 0.6 that put everything
+         * above 305 Hz one cycle late, above 648 Hz two, above 1898 Hz three,
+         * visible as rectangular steps in the leading edge of a click. ERB 1.0
+         * escaped by luck. No fraction can work: at ERB 0.6 a genuine first
+         * peak sits 185 dB below its tap's maximum, deeper than the artefact
+         * an earlier version of this comment was trying to exclude.
+         *
+         * The fraction survives as a floor and not as the rule: a tap whose
+         * entire response sits below the absolute level would otherwise never
+         * be found at all, and would report a delay of zero. */
+        /*  Overridable at build time so it can be swept without editing this
+         *  file -- `-DCOCHLEA_LEAD_ABSOLUTE=1e-10`. The value matters more
+         *  than it looks: see the note below about which machine measures it.
+         */
+#ifndef COCHLEA_LEAD_ABSOLUTE
+#define COCHLEA_LEAD_ABSOLUTE 1e-9    /* -180 dBFS */
+#endif
+        constexpr double kLeadAbsolute = COCHLEA_LEAD_ABSOLUTE;
+#ifndef COCHLEA_LEAD_FRACTION
+#define COCHLEA_LEAD_FRACTION 1e-5
+#endif
+        constexpr double kLeadFraction = COCHLEA_LEAD_FRACTION;
+        /*  Step over a precursor, if there is one.
+         *
+         *  At the sharpest tunings some machines compute a tiny early peak
+         *  ahead of the real response -- smooth, monotone, entirely plausible
+         *  looking, and absent on other hardware running the same source. It
+         *  is a rounding artefact of a cascade whose first peak sits 200 dB
+         *  below its own maximum, and it is not distinguishable from a
+         *  response by anything about its shape or its position.
+         *
+         *  It is distinguishable by what follows it. Measured over both an
+         *  arm64 and an x86 build of ERB 0.5: a genuine first peak is followed
+         *  by a step of 42 to 54 dB, being the next cycle of a response still
+         *  building; a precursor is followed by 62 to 282 dB, being the
+         *  arrival of the response itself. The two ranges do not touch, and on
+         *  the machine with no precursors nothing exceeds 51 dB, so this never
+         *  fires there.
+         *
+         *  A kludge, and deliberately one. The principled fix is to stop
+         *  measuring this per machine at all -- bake the delays at design time
+         *  so every build loads the same numbers -- and until that happens
+         *  this makes the sharpest bake usable on the hardware it is used on.
+         *  See OPEN-QUESTIONS.md. */
+        constexpr double kPrecursorJumpDB = 60.0;
+
         resetState();
         std::vector<long> at(static_cast<size_t>(n), 0);
         std::vector<bool> found(static_cast<size_t>(n), false);
+        /*  The second peak as well, and how far it stands above the first. */
+        std::vector<long>   at2(static_cast<size_t>(n), -1);
+        std::vector<double> lvl1(static_cast<size_t>(n), 0.0);
+        std::vector<double> lvl2(static_cast<size_t>(n), 0.0);
+        /* Counted in *internal* samples, which is what the delays are in and
+         * is twice the resolution the input rate would give. */
+        long isamp = 0;
         for (long i = 0; i < total; ++i) {
-            runCascade(i == 0 ? 1.0 : 0.0);
-            for (int t = 0; t < n; ++t) {
-                if (!found[static_cast<size_t>(t)] &&
-                    held[t] >= kLeadFraction * best[static_cast<size_t>(t)] &&
-                    best[static_cast<size_t>(t)] > 0.0) {
-                    found[static_cast<size_t>(t)] = true;
-                    at[static_cast<size_t>(t)] = i;
+            feedInput(i == 0 ? 1.0 : 0.0, [&] {
+                for (int t = 0; t < n; ++t) {
+                    const size_t T = static_cast<size_t>(t);
+                    const double thresh =
+                        std::min(kLeadAbsolute, kLeadFraction * best[T]);
+                    if (best[T] <= 0.0 || held[t] < thresh) continue;
+                    if (!found[T]) {
+                        found[T] = true;
+                        at[T] = isamp;
+                        lvl1[T] = held[t];
+                    } else if (at2[T] < 0 && held[t] > lvl1[T]) {
+                        /* `held` is a running maximum, so the next time it
+                           moves is the next peak. */
+                        at2[T] = isamp;
+                        lvl2[T] = held[t];
+                    }
                 }
-            }
+                ++isamp;
+            });
         }
         for (int t = 0; t < n; ++t) {
-            gdelay[static_cast<size_t>(t)] =
-                static_cast<double>(at[static_cast<size_t>(t)]) / fs;
+            const size_t T = static_cast<size_t>(t);
+            long when = at[T];
+            if (at2[T] >= 0 && lvl1[T] > 0.0 && lvl2[T] > 0.0) {
+                const double jump = 20.0 * std::log10(lvl2[T] / lvl1[T]);
+                if (jump > kPrecursorJumpDB) when = at2[T];
+            }
+            gdelay[T] = static_cast<double>(when) / fs;
         }
         resetState();
         recomputeShifts();
@@ -725,7 +879,7 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
     int32_t version = 0, n_ch = 0, n_lead = 0, tpo = 0;
     double fs = 0.0;
     bool ok = readAll(f, magic, 4) && std::memcmp(magic, "COCH", 4) == 0 &&
-              readAll(f, &version, 4) && version == 1 &&
+              readAll(f, &version, 4) && (version == 1 || version == 2) &&
               readAll(f, &fs, 8) &&
               readAll(f, &n_ch, 4) && readAll(f, &n_lead, 4) &&
               readAll(f, &tpo, 4) &&
@@ -801,11 +955,33 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
     /*  Last, because it runs audio through the finished engine and then puts
      *  it back the way it found it. */
     e->calibrateCoherence();
-    /*  After the coherence pass, and after the analytic dt_base above was
-     *  derived from the file's delays: this overwrites gdelay with measured
-     *  ones, and doing it earlier would change a fallback that has nothing to
-     *  do with de-skew. */
-    e->calibrateDelays();
+    /*  Version 2 carries a measured de-skew curve in `gdelay`, and the engine
+     *  uses it as it stands.
+     *
+     *  Measuring it here means every machine measures its own, and at the
+     *  sharpest tunings they do not agree: the first peak of a narrow filter
+     *  sits 200 dB below its own maximum, where whether a sample crosses a
+     *  threshold is settled in the last bits of the arithmetic. Two builds of
+     *  this file, clang on arm64 and gcc on x86, choose different peaks for a
+     *  band of taps around 30 Hz at ERB 0.5 and draw a click 87 ms out of line
+     *  from each other. A quantity that depends on the compiler is not a
+     *  property of the filterbank, and no threshold makes it one.
+     *
+     *  So for that bake the curve is baked instead: measured once, written
+     *  into the file, loaded identically everywhere. See tools/bakedelays.py.
+     *
+     *  Version 1 files still calibrate at load, which is every other tuning.
+     *  See OPEN-QUESTIONS.md for what it would take to bake them all -- it
+     *  would also take about 220 ms off every engine build. */
+    if (version < 2) {
+        /*  After the coherence pass, and after the analytic dt_base above was
+         *  derived from the file's delays: this overwrites gdelay with
+         *  measured ones, and doing it earlier would change a fallback that
+         *  has nothing to do with de-skew. */
+        e->calibrateDelays();
+    } else {
+        e->recomputeShifts();
+    }
     return e;
 }
 

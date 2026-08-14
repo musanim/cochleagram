@@ -2,7 +2,7 @@ import AppKit
 
 /// What an untouched column reads. Far below any usable floor, so a bitmap
 /// that has been allocated but not yet filled renders as silence.
-private let kSilentDB: Float = -240
+private let kSilentDB: Float = -600   // matches kTinyLevel in cochlea.cpp
 
 /// The same idea for coherence. Real values are a few hundredths of a cycle,
 /// so anything at or below this is "never written" rather than a measurement;
@@ -65,6 +65,20 @@ final class CochleagramView: NSView {
         /// the boundary of the recording, and worth telling apart from
         /// whatever arrives next.
         case fileEnd
+
+        /// Which mark wins when two land on the same column. Higher is drawn
+        /// later, so it is the one seen. The order is by how much the mark
+        /// says: `seam` only claims that time jumps, which is implied by all
+        /// the others.
+        var rank: Int {
+            switch self {
+            case .seam:         return 0
+            case .scaleChange:  return 1
+            case .tuningChange: return 2
+            case .fileEnd:      return 3
+            }
+        }
+
     }
 
     /// Places where the picture stops meaning what it meant, in bitmap
@@ -129,7 +143,35 @@ final class CochleagramView: NSView {
     // it measures is the thing it controls, and it does not care whether the
     // level it is looking at is signal or noise -- only whether there is a
     // legible amount of ink on the paper.
+    /// The colour behind the picture: gutter, margins, status strip.
+    ///
+    /// Not `windowBackgroundColor`, which is very nearly white in the light
+    /// appearance and so left the frame and the paper indistinguishable -- the
+    /// plot appeared to run to the edge of the window. These are the browser
+    /// version's `--chrome`, and the two now match; a screenshot of one can be
+    /// put beside a screenshot of the other without the difference in framing
+    /// reading as a difference in the picture.
+    private static let chrome = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            ? NSColor(red: 0x1c/255.0, green: 0x1c/255.0, blue: 0x1f/255.0, alpha: 1)
+            : NSColor(red: 0xf2/255.0, green: 0xf2/255.0, blue: 0xf5/255.0, alpha: 1)
+    }
+
     private var autoRef: Float = 0
+
+    /// What Auto gain has arrived at, in dB. The toolbar's Sensitivity control
+    /// reports this while Auto gain is on, so that the setting in force is
+    /// visible rather than merely in effect. Read-only: the controller owns it.
+    var autoReferenceDB: Double { Double(autoRef) }
+
+    /// Start the reference again from nothing.
+    ///
+    /// For the moment Auto gain is switched off: the caller folds the
+    /// reference into Sensitivity, which makes the correct reference zero, and
+    /// leaving the old value here would apply it twice the next time Auto gain
+    /// came back on.
+    func resetAutoReference() { autoRef = 0 }
+
     /// Mean ink to aim for. 0 is blank paper, 1 is solid.
     private let autoTargetInk: Float = 0.30
     /// How fast the reference chases it, in dB per second at full error. Slow
@@ -155,11 +197,16 @@ final class CochleagramView: NSView {
         /// The two ends of the mapping, in dB. Below `whiteDB` everything is
         /// white; above `blackDB` everything is black; between them the curve
         /// below. Under Invert the two colours swap -- the levels do not.
-        var whiteDB: Double = -35
-        var blackDB: Double = 0
+        /// Overwritten from `Settings` before anything is drawn, by the
+        /// `applyToEngine` that follows every engine build. Kept in step with
+        /// those defaults all the same: if the engine never builds -- a denied
+        /// microphone, a missing coefficient file -- this is what the window
+        /// is showing, and it should not be an older idea of the picture.
+        var whiteDB: Double = -180
+        var blackDB: Double = -10
         /// Measure both against the engine's tracked reference rather than
         /// against full scale.
-        var autoGain = true
+        var autoGain = false
         /// false = dark ink on white paper, the original look.
         var inverted = false
         /// Which quantity the picture is drawn from. `whiteDB`, `blackDB`
@@ -308,10 +355,17 @@ final class CochleagramView: NSView {
     }
 
     private func adoptCochlea(_ join: MarkKind) {
-        // A new engine starts its dropped-column count at zero, so a stale
-        // high-water mark here would either miss real drops or, worse, report
-        // one that never happened.
-        lastDropped = 0
+        // Taken from whatever engine we are now on, rather than zeroed. A new
+        // engine does start its count at zero, but a *reused* one -- which is
+        // what a Replay at the same tuning now gets -- carries its running
+        // total. Zeroing here would make the next `tick` find a total already
+        // above the high-water mark, log a drop that did not happen, and paint
+        // a spurious seam beside the genuine join, on every replay.
+        lastDropped = cochlea?.droppedColumns ?? 0
+        // Engine columns drawn since this join went down. Against the samples
+        // the tap has delivered, this says whether a mark placed "on the
+        // newest column" is where the audio actually is.
+        columnsSinceJoin = 0
         let taps = cochlea?.tapCount ?? 0
         guard taps > 0 else {
             height = 0
@@ -540,6 +594,7 @@ final class CochleagramView: NSView {
             self.append(lv, co, rf, columns: n)
         }
         if pending > 0 { needsDisplay = true }
+        columnsSinceJoin += pending
 
         // One line a second, so the log shows whether the display is keeping
         // up and whether marks are surviving.
@@ -568,6 +623,11 @@ final class CochleagramView: NSView {
     /// Last value of the engine's dropped-column counter, so `tick` can notice
     /// it moving rather than its absolute value.
     private var lastDropped: UInt64 = 0
+    /// Engine columns appended since the cochlea was adopted -- not since the
+    /// most recent mark, which `markSeam` and the rest place without touching
+    /// this. Columns the engine *dropped* are not counted either, so a seam in
+    /// the log means this figure is short by however many went with it.
+    private(set) var columnsSinceJoin = 0
     private var frames = 0
     private var colsThisSecond = 0
     private var lastReport = Date()
@@ -786,7 +846,11 @@ final class CochleagramView: NSView {
             out[j] = autoRef
             // Too much ink means the window is too low, so lift it.
             let err = sum / Float(height) - autoTargetInk
-            autoRef = min(60, max(-160, autoRef + step * err))
+            // Wide, because the reference has to carry the window from
+            // wherever Sensitivity was left to wherever the signal actually
+            // is, and those can be a hundred and fifty decibels apart -- a
+            // MacBook and an iPad in one quiet room differ by about fifty.
+            autoRef = min(250, max(-250, autoRef + step * err))
         }
         return out
     }
@@ -1151,7 +1215,7 @@ final class CochleagramView: NSView {
         // the window's own colour so they read as frame rather than as data,
         // and so they follow the system appearance; the plot is always paper
         // white, because the picture is ink on paper unless inverted.
-        ctx.setFillColor(NSColor.windowBackgroundColor.cgColor)
+        ctx.setFillColor(Self.chrome.cgColor)
         ctx.fill(bounds)
         // The plot's backing colour has to agree with what silence renders
         // as, or the margins disagree with the picture.
@@ -1228,7 +1292,15 @@ final class CochleagramView: NSView {
 
         ctx.saveGState()
         ctx.setShouldAntialias(false)
-        for m in marks {
+        // Drawn in order of precedence, not in the order they were recorded.
+        //
+        // At a replay boundary two marks land on the same column -- the old
+        // recording ended and a new one began, both true -- and whichever is
+        // painted second is the one you see. That was insertion order, which
+        // differed between this and the browser version for no reason anybody
+        // chose, so the same moment came out green here and red there. `rank`
+        // is the same table in both.
+        for m in marks.sorted(by: { $0.kind.rank < $1.kind.rank }) {
             ctx.setFillColor(m.color.cgColor)
             var x = plot.minX + CGFloat(m.column) * sx
             x = (x * scale).rounded() / scale          // land on a real pixel

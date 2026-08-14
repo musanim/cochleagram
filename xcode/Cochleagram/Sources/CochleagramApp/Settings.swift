@@ -13,29 +13,84 @@ import Foundation
 /// remembering to undo it in three places.
 struct Settings: Equatable {
 
-    var deskew            = true
+    /// De-skew off, Auto gain off, and a deliberately wide exposure window.
+    ///
+    /// These are also what the toolbar's Defaults button restores, and the
+    /// agreement is deliberate: a first launch and a press of Defaults are the
+    /// same request from the same kind of person, so they should not land in
+    /// different places. The button differs from a fresh `Settings()` only in
+    /// *which* values it touches -- it leaves ERB and Speed alone, because
+    /// those say what the picture is rather than how it is exposed, and
+    /// somebody who has chosen a tuning and a time scale is not asking to be
+    /// moved off them.
+    ///
+    /// Auto gain is **off**, and this is the one place where "show a stranger
+    /// something" loses to something else. Auto gain would guarantee a picture
+    /// on any hardware, but it owns Sensitivity while it is on, and switching
+    /// it off hands back wherever the controller had drifted to -- which
+    /// depends on everything the app has heard since it started. Two copies of
+    /// this program given the same file would then disagree about Sensitivity
+    /// unless they had also had the same history, and one of them is the Mac
+    /// app and the other is the browser. A default that cannot be reproduced
+    /// across the two is not a default worth having.
+    ///
+    /// So the picture has to come from a fixed window wide enough to survive
+    /// not knowing the input level. Mean ink over pink and white noise, from
+    /// the offline engine at ERB 0.6 -- the engine aims for 0.30 when it is
+    /// choosing for itself:
+    ///
+    ///       input   -20   -40   -60   -80  -100  -120 dBFS
+    ///        pink  0.74  0.62  0.51  0.39  0.28  0.16
+    ///       white  0.71  0.60  0.48  0.37  0.25  0.14
+    ///
+    /// Never a black slab at the top, never blank at the bottom, and monotone
+    /// in between. The cost is contrast: 170 dB from white to black is a soft
+    /// picture, and 60 dB around wherever the signal actually is remains the
+    /// better thing to read once you have found it. That is what the two
+    /// sliders are for, and this is only where they start.
+    var deskew            = false
     var invert            = false
-    var autoGain          = true
-    /// The two ends of the level-to-grey mapping, in dB.
+    var autoGain          = false
+    /// Where the middle of the level-to-grey window sits, and how wide it is.
     ///
-    /// Relative to the auto-gain reference when Auto gain is on, and to full
-    /// scale when it is off. `whiteDB` is where the picture reaches white and
-    /// `blackDB` where it reaches black -- or the other way round under
-    /// Invert, which flips the rendering, not these.
+    /// `sensDB` is the *negated* midpoint, so that turning it up moves the
+    /// window down, more of the signal ends up above black, and the picture
+    /// darkens -- the direction the word promises. `rangeDB` is the distance
+    /// from white to black. Both are relative to the auto-gain reference when
+    /// Auto gain is on and to full scale when it is off.
     ///
-    /// This replaced a Gain and a Level slider. Those set *where* black was
-    /// and *how far below it* white was, so moving one moved the other end
-    /// too, and the span you were actually looking at had to be worked out
-    /// rather than read. These are simply the two ends.
+    /// This is the third shape. Gain and Level came first: Gain set where
+    /// black was and Level how far below it white fell, so moving one moved
+    /// the other end and the span you were looking at had to be worked out
+    /// rather than read. White and black replaced them and did read directly
+    /// -- but two ends of one scale *collide*. They cannot cross, they need a
+    /// minimum separation, and the guard enforcing it has nowhere to push once
+    /// one of them is against a limit. In the browser that guard failed
+    /// silently and produced a one-decibel window: a picture with no grey in
+    /// it anywhere, and nothing to say a setting had been refused.
     ///
-    /// Wide open by default -- the two ends of the slider's own range. A
-    /// narrow window is better once you know what you are looking for and is
-    /// the wrong first impression: somebody opening this for the first time,
-    /// on an unknown microphone in an unknown room, should see *something*
-    /// whatever the level turns out to be. Nothing is clipped at either end,
-    /// and closing the window down is the obvious next thing to try.
-    var whiteDB:  Double  = Settings.exposureRange.lowerBound
-    var blackDB:  Double  = Settings.exposureRange.upperBound
+    /// A midpoint and a width cannot interact at all, and the objection that
+    /// sank Gain and Level does not apply to them, because here the span is
+    /// itself a control rather than a consequence of two others.
+    ///
+    /// 95 and 170 -- a window from -180 to -10 dB -- chosen by measurement
+    /// rather than taste, because with Auto gain off it is the only thing
+    /// standing between a stranger and a blank screen. See the note on
+    /// `autoGain` above for the numbers and for why the controller cannot do
+    /// this job instead.
+    ///
+    /// Wide, and knowingly so. 70 and 60 -- the window that used to be written
+    /// -100 to -40 -- is still the one the display is *read* at, and is worth
+    /// reaching for the moment you can see where the signal is. It is simply
+    /// not a safe place to start when nobody knows what the microphone is.
+    var sensDB:  Double = 95
+    var rangeDB: Double = 170
+
+    /// The pair the view actually wants, so the sign of the negation is
+    /// written down in exactly one place.
+    var exposureWindow: (white: Double, black: Double) {
+        (white: -sensDB - rangeDB / 2, black: -sensDB + rangeDB / 2)
+    }
     /// Milliseconds per display column. Always one of `columnSteps`; the
     /// stored value is snapped on load so a defaults file written by an older
     /// build, or by hand, still lands on a detent.
@@ -56,7 +111,24 @@ struct Settings: Equatable {
     /// place the poles -- so each value is a separately baked coefficient
     /// file, and choosing one loads a different file rather than computing
     /// anything. See `prototype/export_coeffs.py --erb-scale`.
-    var erbScale: Double = 1.0
+    ///
+    /// 0.6, which is not the accurate value, and is the right default anyway.
+    ///
+    /// Two kinds of person arrive here. One wants to see what their voice
+    /// looks like, and is served by the clearer picture. The other wants a
+    /// representation faithful to what the cochlea does, and is served by 1.0
+    /// -- but that person knows the difference exists, knows which way they
+    /// want it, and will find the menu. The first person does not know there
+    /// is a question, so the default should be the one that does not need to
+    /// be understood to be worth looking at. Defaulting to fidelity would
+    /// protect the reading of the user who was never going to be misled.
+    ///
+    /// It also settles a second question: the browser starts here too, and two
+    /// programs claiming to be the same display should not draw the same file
+    /// differently before anybody has touched a control. Neither Defaults
+    /// button restores this, so a fresh start is the only place they can be
+    /// made to agree.
+    var erbScale: Double = 0.6
 
     /// Which quantity the picture is drawn from. Not persisted as an enum:
     /// a defaults file naming a mode a later build has dropped would be a
@@ -209,9 +281,11 @@ struct Settings: Equatable {
 
     static func nearestErbScale(_ v: Double) -> Double {
         // NaN fails every comparison, so `min(by:)` would silently return the
-        // first element -- 0.5 -- rather than the default.
-        guard v.isFinite else { return 1.0 }
-        return erbScales.min { abs($0 - v) < abs($1 - v) } ?? 1.0
+        // first element -- 0.5 -- rather than the default. Taken from
+        // `Settings()` rather than written out, so that changing the default
+        // cannot leave a stale number here to be reached by a corrupt file.
+        guard v.isFinite else { return Settings().erbScale }
+        return erbScales.min { abs($0 - v) < abs($1 - v) } ?? Settings().erbScale
     }
 
     /// Ranges, kept here so the sliders and the clamp cannot drift apart.
@@ -228,9 +302,42 @@ struct Settings: Equatable {
     /// octaves. Measured on that signal, a window of -100 to -70 renders a
     /// mean of 33 out of 255; -120 to -90 renders 156. The detail was there
     /// the whole time and the control could not reach it.
-    static let exposureRange = -130.0 ... 10.0
-    /// Closer than this and the knobs overlap on screen anyway.
-    static let minimumExposureSpan = 3.0
+    /// And then it happened a second time, for the same reason, which is why
+    /// the bottom is now -200 rather than the -130 the paragraph above argued
+    /// its way to. On an iPad the browser version's whole picture sat below
+    /// -130 and clipped to white, and no setting could reach it; the argument
+    /// for -130 had been about the level of the *input*, where it is indeed
+    /// below any converter's noise floor, but the scale is per tap and 599
+    /// narrow filters divide the signal among themselves. Nothing bottoms out
+    /// until kTinyLevel, which is also what an untouched column reads. That
+    /// floor has since been moved from -240 to -600 dB, because -240 was
+    /// inside a window this range can express and silence was drawn grey.
+    ///
+    /// The general lesson, twice paid for: the end of a range is a claim about
+    /// what the instrument will ever be pointed at, and it should be set by
+    /// where the arithmetic gives out, not by where the signal is expected.
+    ///
+    /// That history is about the white/black pair, which no longer exists. It
+    /// is kept because the lesson is what set the two ranges below.
+
+    /// What Sensitivity spans, as a negated midpoint. The measurement behind
+    /// the numbers: the cascade is linear, so input level maps one-for-one
+    /// onto a shift of the window -- median tap level runs -53.3 / -103.3 /
+    /// -153.3 dB for inputs of -20 / -70 / -120 dBFS. Covering digital full
+    /// scale down to a very quiet phone microphone is a midpoint from -10 to
+    /// -190, rounded out to 200.
+    ///
+    /// Not chosen so that the two ends are "all white" and "all black". That
+    /// guarantee needs the window pushed past the tails of the distribution,
+    /// and the tails run eighty decibels beyond the first percentile: the last
+    /// third of the travel would do nothing but chase a signal that is not
+    /// there. The window is free to hang off either end of the level scale,
+    /// which is harmless, because levels outside it simply clamp.
+    static let sensitivityRange = 0.0 ... 200.0
+    /// What Range spans. Below about five decibels the picture stops being a
+    /// grey scale and becomes a threshold; above two hundred there is nothing
+    /// outside the window left to bring in.
+    static let rangeRange = 5.0 ... 200.0
     static let columnRange =   0.5 ... 64.0
 
     /// The Time control's detents: ten equal *ratios* across the range, not
@@ -277,10 +384,14 @@ struct Settings: Equatable {
         static let deskew   = "display.deskew"
         static let invert   = "display.invert"
         static let autoGain = "display.autoGain"
+        static let sens     = "display.sensitivityDB"
+        static let range    = "display.rangeDB"
+        /// Two superseded shapes of the same setting, each still read once so
+        /// that an upgrade carries somebody's display over rather than
+        /// silently resetting it. white/black replaced gain/level; sensitivity
+        /// and range replaced white/black.
         static let white    = "display.whiteDB"
         static let black    = "display.blackDB"
-        /// Superseded by white/black; still read once, to carry a setting
-        /// over rather than silently resetting somebody's display.
         static let oldGain  = "display.gainDB"
         static let oldLevel = "display.levelDB"
         static let column   = "display.columnMS"
@@ -293,9 +404,10 @@ struct Settings: Equatable {
         static let logOS    = "diagnostics.logStream"
         static let readout  = "diagnostics.readout"
 
-        static let all = [deskew, invert, autoGain, white, black, column,
+        static let all = [deskew, invert, autoGain, sens, range, column,
                           erbScale, mode, closeUp, closeUpW,
-                          outDev, outPair, logCon, logOS, readout, oldGain, oldLevel]
+                          outDev, outPair, logCon, logOS, readout,
+                          white, black, oldGain, oldLevel]
     }
 
     /// AppKit's own frame autosave writes the window's size and position under
@@ -315,19 +427,31 @@ struct Settings: Equatable {
         if store.object(forKey: K.deskew)   != nil { s.deskew   = store.bool(forKey: K.deskew) }
         if store.object(forKey: K.invert)   != nil { s.invert   = store.bool(forKey: K.invert) }
         if store.object(forKey: K.autoGain) != nil { s.autoGain = store.bool(forKey: K.autoGain) }
-        if store.object(forKey: K.white)    != nil { s.whiteDB  = store.double(forKey: K.white) }
-        if store.object(forKey: K.black)    != nil { s.blackDB  = store.double(forKey: K.black) }
+        if store.object(forKey: K.sens)  != nil { s.sensDB  = store.double(forKey: K.sens) }
+        if store.object(forKey: K.range) != nil { s.rangeDB = store.double(forKey: K.range) }
 
-        // Carried over from the Gain/Level pair, once. Gain set the reference
-        // (negated), Level set how far below it white fell.
-        if store.object(forKey: K.white) == nil,
-           store.object(forKey: K.oldGain) != nil
-            || store.object(forKey: K.oldLevel) != nil {
-            let ref = -store.double(forKey: K.oldGain)
-            let depth = store.object(forKey: K.oldLevel) != nil
-                      ? store.double(forKey: K.oldLevel) : 35
-            s.blackDB = ref
-            s.whiteDB = ref - depth
+        // Carried over from whichever earlier shape is on disk, once, and only
+        // if the current one is not. Both older shapes name the two ends, so
+        // they convert through the same two lines.
+        if store.object(forKey: K.sens) == nil {
+            var ends: (white: Double, black: Double)? = nil
+            if store.object(forKey: K.white) != nil,
+               store.object(forKey: K.black) != nil {
+                ends = (store.double(forKey: K.white),
+                        store.double(forKey: K.black))
+            } else if store.object(forKey: K.oldGain) != nil
+                   || store.object(forKey: K.oldLevel) != nil {
+                // Gain set the reference (negated); Level set how far below
+                // it white fell.
+                let ref = -store.double(forKey: K.oldGain)
+                let depth = store.object(forKey: K.oldLevel) != nil
+                          ? store.double(forKey: K.oldLevel) : 35
+                ends = (ref - depth, ref)
+            }
+            if let e = ends {
+                s.rangeDB = e.black - e.white
+                s.sensDB  = -(e.white + e.black) / 2
+            }
         }
         if store.object(forKey: K.column)   != nil { s.columnMS = store.double(forKey: K.column) }
         if store.object(forKey: K.erbScale) != nil { s.erbScale = store.double(forKey: K.erbScale) }
@@ -336,14 +460,14 @@ struct Settings: Equatable {
         // slider outside its range, where nothing crashes and the picture is
         // quietly wrong. That is the worst kind of bug to be handed, so the
         // values are made safe on the way in rather than trusted.
-        s.blackDB = clamp(s.blackDB, to: exposureRange)
-        s.whiteDB = clamp(s.whiteDB, to: exposureRange)
-        if s.blackDB - s.whiteDB < minimumExposureSpan {
-            s.whiteDB = max(exposureRange.lowerBound,
-                            s.blackDB - minimumExposureSpan)
-            s.blackDB = min(exposureRange.upperBound,
-                            s.whiteDB + minimumExposureSpan)
-        }
+        // `isFinite` before the clamp, not after: a NaN out of a hand-edited
+        // plist survives min and max in Swift as it does in JavaScript, and a
+        // NaN window renders an all-black picture that nothing but deleting
+        // the defaults can undo.
+        if !s.sensDB.isFinite  { s.sensDB  = Settings().sensDB }
+        if !s.rangeDB.isFinite { s.rangeDB = Settings().rangeDB }
+        s.sensDB  = clamp(s.sensDB,  to: sensitivityRange)
+        s.rangeDB = clamp(s.rangeDB, to: rangeRange)
         s.columnMS = columnSteps[nearestColumnStep(s.columnMS)]
         // Only the baked scales exist as files; anything else would fail to
         // load and leave the app with no cochlea at all.
@@ -384,8 +508,8 @@ struct Settings: Equatable {
         store.set(deskew,   forKey: K.deskew)
         store.set(invert,   forKey: K.invert)
         store.set(autoGain, forKey: K.autoGain)
-        store.set(whiteDB,  forKey: K.white)
-        store.set(blackDB,  forKey: K.black)
+        store.set(sensDB,   forKey: K.sens)
+        store.set(rangeDB,  forKey: K.range)
         store.set(columnMS, forKey: K.column)
         store.set(erbScale, forKey: K.erbScale)
         store.set(Int(displayMode.rawValue), forKey: K.mode)

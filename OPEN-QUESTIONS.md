@@ -15,10 +15,80 @@ sample-and-hold level, not the largest. That is the feature the eye follows: a
 tap's response builds over a cycle or two, so aligning maxima aligns something a
 whole cycle late at the apex.
 
-The earlier attempt failed because it picked the largest peak, and because the
-"ignore numerical dirt" threshold was set at a tenth of each tap's maximum --
-high enough to skip to the second peak above 113 Hz and the third above 334.
-It is now 1e-5, which selects nothing and only guards.
+**The threshold is absolute, and matched to what the display draws.**
+*Settled 2026aug14, Stephen's diagnosis.* It was a fraction of each tap's own
+maximum -- a different level for every tap -- and where that level fell between
+a tap's first and second peak the search took the second. At ERB 0.6 that put
+everything above 305 Hz one cycle late, above 648 Hz two, above 1898 Hz three,
+visible as rectangular steps in the leading edge of a click. ERB 1.0 escaped by
+luck. No fraction can work: the level to clear varies by tens of decibels
+across frequency and tuning, and at ERB 0.6 a genuine first peak sits 185 dB
+below its own tap's maximum.
+
+`kLeadAbsolute` is 1e-9, **-180 dBFS**, which is the white point of the default
+exposure. That match is the point of the value. The calibration and the display
+have to look for the feature at the same level: where a cascade computes a
+precursor, calibrating at -300 dB while drawing at -180 is worth 94 ms of
+apparent error on its own, and the edge is vertical only at the exposure the
+calibration was made for.
+
+**Calibration runs through the same front end as the audio.** *2026aug14,
+Stephen's observation.* `calibrateDelays` fed `runCascade` a unit sample
+directly, while real audio arrives through the half-band upsampler. A unit
+sample at the internal rate carries energy to 44 kHz -- an octave above
+anything audio can contain -- and that extra octave leaks down the cascade
+almost instantly, appearing as a tiny "response" ahead of the real one. It was
+never in the picture. Calibration goes through `feedInput` now.
+
+Found by asking why the response changed *earlier* than the curve the
+calibration claimed to be measuring. The two were responses to different
+inputs, compared as though they were the same. Worth remembering as a class of
+error: a measurement harness that does not go through the path it measures.
+
+**ERB 0.5's curve is baked into the coefficient file.** *2026aug14.* Its first
+peak sits 200 dB below its tap's own maximum, which is close enough to double
+precision's floor that *which* peak is found is settled in the last bits of the
+arithmetic. Two builds of the same source disagree: clang on arm64 computes a
+precursor at -154 to -377 dB that gcc on x86 does not compute at all, and the
+two draw a click 87 ms out of line with each other. Measured with
+`tools/caldump.cpp`:
+
+| | agreement between arm64 and x86 |
+|---|---|
+| ERB 0.8 and blunter | identical to the last digit |
+| ERB 0.7 | 12 taps differ, one internal sample each |
+| ERB 0.6 | 168 taps, one sample each; dmax 0.20 ms apart |
+| ERB 0.5 | drifts to 30 ms; dmax 215.07 against 245.75 |
+
+One internal sample is 0.0113 ms, 2% of a column, so everything from 0.6 up is
+verified vertical on both machines -- 1.0 ms of edge spread at 0.6, one column
+at 0.7 and above.
+
+For 0.5 the curve is now measured once and written into the file, which carries
+**version 2** to say so; the engine loads it and does not recalibrate. See
+`tools/bakedelays.py`. The curve currently in the file is the second peak from
+an arm64 build, which is the Mac app's arithmetic.
+
+Consequences, all known and accepted:
+
+* It is right on the machine that measured it. An x86 build of the same source
+  will draw 0.5 wrongly, and **the browser almost certainly needs its own
+  curve** -- Emscripten does not contract multiply-adds the way clang does
+  natively, so the WASM engine probably computes no precursor at all.
+* It is calibrated for exposures where the precursor is below the white point:
+  about 6 ms of spread at -140 dB, 14 at -100, 37 at the Defaults' -180, and
+  worse at maximum sensitivity, where the display draws the precursor itself
+  and no de-skew curve can align a feature that exists in only part of the
+  picture.
+* Three attempts to repair the curve from monotone continuity instead all
+  failed, each a no-op on the machine it was written on and a regression on the
+  other. The errors are not discontinuities -- both curves are smooth and
+  monotone, they are just not the same curve -- so continuity has nothing to
+  grip on.
+
+The general fix is to bake every tuning at design time, in
+`prototype/export_coeffs.py`, so no machine measures its own. That would also
+take about 220 ms off every engine build.
 
 What remains:
 
@@ -27,18 +97,12 @@ What remains:
   and each tap's sub-column remainder survives. Bounded by one column at any
   Speed. Removing it means interpolating between columns on the de-skew read,
   which would blur the one thing this display refuses to blur.
-* **Sharp tunings are still not monotone.** The calibrated delay steps
-  *backwards* by 4.5 ms at 305 Hz at ERB 0.6 and 10.5 ms at 137 Hz at ERB 0.5 --
-  a few taps latching a different peak from their neighbours. ERB 1.0 and above
-  are clean. A median over five taps would fix it and cannot hurt the tunings
-  that are already smooth. Untried.
-* A related clamp bug is fixed: `kMaxDeskewColumns` was 256, which covers a
-  second at 4 ms columns and 12 ms at 0.05 ms ones. At fine Speeds every tap
-  above a crossover frequency got the *same* hold-back instead of one growing
-  with frequency, so the picture kept its skew and merely moved. Now 4096.
 
-`xcode/Cochleagram/tools/skew.cpp` and `tools/leadedge.cpp` measure all of this
-without a Mac.
+`tools/caldump.cpp` prints the delay curve and a build fingerprint;
+`tools/edgeprofile.cpp` says where the leading edge lands, per tap, with no
+app involved; `tools/peakdump.cpp` shows the peaks each tap was choosing
+between. `tools/compare_caldump.sh` and `tools/sweep_threshold.sh` compare two
+machines in one command. Reference curves from x86 are in `figures/caldump/`.
 
 **Harmonic crispness.** Stephen's reference image separates resolved harmonics
 slightly more cleanly than the rebuild does. Candidates: tuning sharper than one
@@ -74,6 +138,30 @@ Parked while the greyscale display is settled. Where it stands:
 - The analysis window is measured in ERBs rather than octaves, which fixed
   resolved harmonics being misread as noise. Probably right, but untested
   against the original's behaviour.
+
+---
+
+## Mac app
+
+**A stale `.dataPlayedBack` completion can be delivered against the next
+source.** *Found 2026aug14, not fixed.* `AVAudioPlayerNode` fires pending
+`scheduleFile` completions when the player is **stopped**, and `startFile`
+begins by stopping the old one. The completion reaches the main thread
+asynchronously, by which time the new file is already running -- so opening a
+file, replaying, or returning to live input mid-playback can run the *old*
+file's `fileDidFinish` against the *new* source: a green line at its start, the
+display frozen, "Finished" reported, and the graph that has just started torn
+down.
+
+The deferred teardown added the same day makes it less damaging -- a new file
+shorter than the 0.2 s wait reaches its own sample boundary first and the
+outcome is correct -- but the hole is still there, and it corrupts exactly the
+kind of comparison the two apps are being measured with.
+
+The fix is a generation token: bump a counter in `startFile`/`stop()`, capture
+it in the `scheduleFile` completion, and drop the callback if it no longer
+matches. The browser already does this for its flush replies (`endToken` in
+`web/site/index.html`), and for the same reason.
 
 ---
 

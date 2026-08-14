@@ -7,7 +7,7 @@
 // Columns leave as transferred buffers, so crossing to the drawing thread
 // costs a pointer rather than a copy of a screenful of floats.
 
-import { Cochlea } from './engine.js';
+import { Cochlea } from './engine.js?v=DEV';
 
 let coch = null;
 
@@ -46,6 +46,15 @@ self.onmessage = async (ev) => {
             }
             break;
         }
+
+        // A sentinel, for the end of a file. Messages are handled in order,
+        // so a reply to this one means every audio block posted before it has
+        // already been turned into columns and sent back. The Mac app gets
+        // the same guarantee by draining the ring synchronously; here the
+        // engine is a hop further away and has to be asked.
+        case 'flush':
+            postMessage({ type: 'flushed', token: m.token });
+            break;
 
         // The engine is safe to reconfigure between process() calls, and every
         // call into it happens on this thread, so there is no moment at which

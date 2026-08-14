@@ -40,6 +40,12 @@ final class Cochlea {
     let tapCount: Int
     let frequencies: [Double]      // best frequency per tap, high to low
     let internalRate: Double
+    /// What this engine was built from, so a caller can tell whether the one
+    /// it is holding is already the one it wants. Building costs about half a
+    /// second -- two calibration sweeps over the whole cascade -- and it is
+    /// spent on the main thread, so "do I need a new one" is worth asking.
+    let coefficientURL: URL
+    let inputRate: Double
 
     /// Column scratch buffers, reused so drawing never allocates.
     private var levelBuffer: [Float]
@@ -60,6 +66,8 @@ final class Cochlea {
         engine = e
         tapCount = Int(cochlea_tap_count(e))
         internalRate = cochlea_internal_rate(e)
+        self.coefficientURL = coefficientURL
+        self.inputRate = inputRate
 
         if tapCount > 0, let f = cochlea_frequencies(e) {
             frequencies = Array(UnsafeBufferPointer(start: f, count: tapCount))
@@ -69,6 +77,20 @@ final class Cochlea {
         levelBuffer = [Float](repeating: 0, count: max(1, tapCount * maxPull))
         coherenceBuffer = [Float](repeating: 0, count: max(1, tapCount * maxPull))
         refBuffer = [Float](repeating: 0, count: maxPull)
+    }
+
+    /// The apex's calibrated delay, in milliseconds: what De-skew costs in
+    /// display latency, and the whole picture's hold-back.
+    ///
+    /// Logged at every engine build because it is also a fingerprint of *which
+    /// calibration* produced this engine. Changing how the delays are measured
+    /// moves it -- ERB 0.5 went from 247.3 ms to 215.1 when calibration
+    /// started running through the resampler -- and an afternoon was spent
+    /// comparing a screenshot against a source tree that no longer described
+    /// the binary taking the screenshot. One number in the log settles that.
+    var maxDelayMS: Double {
+        guard tapCount > 0, let d = cochlea_delays(engine) else { return 0 }
+        return (UnsafeBufferPointer(start: d, count: tapCount).max() ?? 0) * 1000
     }
 
     deinit { cochlea_destroy(engine) }

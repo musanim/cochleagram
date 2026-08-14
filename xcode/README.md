@@ -77,7 +77,8 @@ Cochleagram/
       AudioSource.swift           routes live input or file to the cascade
       Cochlea.swift               Swift face of the C API
       CochleagramView.swift       scrolling bitmap
-      RangeSlider.swift           two-knob slider for Range
+      RangeSlider.swift           two-knob slider; unused since Sensitivity
+                                  and Range replaced white/black
       Resources/cochlea_88200_erb{050..130}.coch
   tools/selftest.cpp              run the engine off-line, write a PGM
 ```
@@ -93,7 +94,7 @@ Two rows, grouped by how often you touch them. The upper row is what you set
 for a session; the lower row is what you move while watching a picture.
 
 **Upper:** ERB · De-skew │ Play File · *filename* … ↻
-**Lower:** Invert · AGC · Range │ Speed
+**Lower:** Invert · De-skew │ Speed · Close-up │ Sensitivity · Auto gain │ Range
 
 | | |
 |---|---|
@@ -102,8 +103,9 @@ for a session; the lower row is what you move while watching a picture.
 | **Play File** | pause, then choose an audio file and play it |
 | **↻** | replay the last file; appears only once one has played through, at the right-hand end of the row |
 | Invert | white-on-black instead of ink-on-paper |
-| AGC | measure Range against a reference that follows the loudest tap |
-| Range | two knobs: where the picture reaches white, and where it reaches black; drag the band between them to move both |
+| Sensitivity | how faint a sound the display can show; right is darker |
+| Auto gain | move Sensitivity automatically, aiming at ~30% mean ink |
+| Range | how many decibels lie between white and black |
 | Speed | fifteen detents, 0.5 to 64 ms per column |
 | **Space** | play / pause |
 | **`[`** / **`]`** | one Speed detent slower / faster |
@@ -180,25 +182,29 @@ whichever device the menu is showing, **without erasing the picture**: the
 file's cochleagram stays where it is and the microphone scrolls in from the
 right, exactly as it does after a normal pause.
 
-**Range** is a single slider with two knobs rather than two sliders. The left
-knob is the level below which everything is white, the right the level above
-which everything is black; between them the mapping is linear, for now.
-Dragging the coloured **band between the knobs** moves both at once, keeping
-the span — a gain change; dragging one knob is a contrast change. The span you
-are looking at can be read straight off rather than worked out.
+**Sensitivity and Range** set the level-to-grey window between them:
+Sensitivity is where its middle sits, Range how wide it is. Neither has a
+numeric readout — they are set to taste, by looking at the picture.
 
-A **filled dot** marks what the next drag or arrow key will move: one knob, or
-both after a band click. The selection persists after the mouse is released, so
-the dots are not decoration — they say what the keyboard will do. Left and
-right (or down and up) step by 1 dB, or 5 with shift. The
-numbers are dB relative to the auto-gain reference when AGC is on — the
-readout says `rel` — and relative to full scale when it is off.
+Sensitivity is the *negated* midpoint, so that further right is more sensitive,
+more ink, a darker picture. **Auto gain** drives it, aiming to keep the average
+pixel about 30% of the way to full ink; while it is on, the control reports
+what the controller is doing rather than accepting instructions, and switching
+it off hands the knob back exactly where the controller had got to, so the
+picture does not jump. Range is yours either way — it is the one exposure
+control Auto gain does not touch.
 
-It replaced a Gain and a Level slider, which set *where* black was and *how far
-below it* white fell. That pair had the property that moving one end moved the
-other, which is not what anyone wants when they are trying to place both.
+This is the third shape of the setting. Gain and Level came first, and set
+*where* black was and *how far below it* white fell, so moving one end moved
+the other. White and black replaced them and did read directly — but two ends
+of one scale collide: they cannot cross, they need a minimum separation, and
+the guard enforcing it has nowhere to push once one end is against a limit. In
+the browser version that guard failed silently and produced a one-decibel
+window: a picture with no grey in it at all. A midpoint and a width cannot
+interact, and unlike Gain and Level the span here is a control rather than a
+consequence of two others.
 
-**Range, Invert and AGC re-expose the whole picture**, not just
+**Sensitivity, Range, Invert and Auto gain re-expose the whole picture**, not just
 the columns still to come. The engine emits levels in dB and the view keeps
 them — about 3.6 MB for a screenful — so the grey bitmap is only a cache of how
 those levels currently look. Moving a control recomputes it: a subtract, a

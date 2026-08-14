@@ -70,6 +70,45 @@ final class AudioSource {
     /// exchange for a cosmetic one.
     private(set) var meters = Meters()
 
+    /// `meters.samples` as it stood when the current file started, so the
+    /// samples belonging to *this* file can be counted without resetting a
+    /// meter that spans every source since launch. Subtract to get the length
+    /// of file the tap has actually delivered so far.
+    private(set) var samplesAtFileStart = 0
+
+    /// How long the file is, in frames, and how many of those have actually
+    /// reached the cascade.
+    ///
+    /// The end of a recording is a fact about the audio. Dating it by the
+    /// `.dataPlayedBack` completion instead measures the *output's* timeline,
+    /// which the tap runs behind -- so the mark landed while the last 35 ms of
+    /// the file had still not been drawn, and the picture stopped short of the
+    /// sound. Counting what has been fed puts the boundary where the audio is.
+    private var fileFrames = 0
+    private var fileFramesFed = 0
+
+    /// Whether the length is known, and so whether a sample boundary is coming
+    /// at all. `AVAudioFile.length` can be zero or an estimate -- some
+    /// compressed formats only know once decoded -- and waiting for a boundary
+    /// that cannot arrive would leave the display running on the player's
+    /// silence until the wait gave up.
+    var knowsFileLength: Bool { fileFrames > 0 }
+
+    /// Set on the audio thread when the last frame of the file has been fed,
+    /// read by the main thread's frame tick. A single store and a single load
+    /// of a `Bool`: no lock, because a lock here would be a real bug traded
+    /// for a cosmetic one, and the worst a missed read can do is mark on the
+    /// next frame instead of this one.
+    private(set) var fileSamplesEnded = false
+
+    /// TEMPORARY DIAGNOSTIC. Where the first non-silent sample of this file
+    /// landed in the stream the tap actually delivered. An *absolute* position
+    /// in that stream: subtract `samplesAtFileStart` for the file-relative
+    /// frame. `reference/pureimpulse.wav` has exactly one non-zero sample, at
+    /// 4410, so anything larger is silence the tap captured before the file
+    /// began playing. -1 until one is seen.
+    private(set) var firstNonZeroFrame = -1
+
     /// Renders the input unit could not complete. Should stay at zero.
     var renderErrors: UInt64 { input?.renderErrors ?? 0 }
 
@@ -259,13 +298,26 @@ final class AudioSource {
 
         // Tap the player rather than the main mixer: it is one node earlier,
         // and the mixer's format can differ from the file's.
+        // 512 rather than something larger, but the size does not matter as
+        // much as it looks like it should: the 35 ms by which both marks miss
+        // the audio was measured at 512 and again at 2048, unchanged. Tap
+        // buffers in flight are not where that time goes.
+        // The time is no longer discarded. It is what says which part of a
+        // buffer is the file and which part is the silence the engine renders
+        // before the player starts.
         node.installTap(onBus: 0, bufferSize: 512,
-                        format: format) { [weak self] buf, _ in
-            self?.feed(buf)
+                        format: format) { [weak self] buf, when in
+            self?.feed(buf, when: when)
         }
         tappedNode = node
         e.prepare()
         applyChannelMap(e, quiet: true)
+        // Before the engine runs, and so before the tap can fire.
+        samplesAtFileStart = meters.samples
+        firstNonZeroFrame = -1
+        fileFrames = Int(file.length)
+        fileFramesFed = 0
+        fileSamplesEnded = false
         try e.start()
         // `.dataPlayedBack`, not the default. The plain `scheduleFile`
         // completion fires when the player has *consumed* the file, which on
@@ -313,7 +365,22 @@ final class AudioSource {
     /// is handed to another queue. The captured nodes keep themselves alive
     /// until it has finished with them.
     func finishedPlayingFile() {
-        let node = player, engineToStop = engine, tapped = tappedNode
+        let node = player, engineToStop = engine
+        // The tap comes off *here*, synchronously, and not with the rest.
+        //
+        // It is the cheap call -- unlike `stop()` it does not wait on the
+        // render thread -- and it is the one that decides when this graph
+        // stops feeding the cascade. Deferred with the others, the old tap
+        // went on delivering the finished player's silence into whatever
+        // engine came next, while that engine's own tap was also running: two
+        // producers on a structure whose contract (`cochlea.h`) is one.
+        //
+        // That window was survivable only by accident. Building a `Cochlea`
+        // took about half a second, and the next `startFile` spent it before
+        // starting any audio, which was long enough for the utility queue to
+        // have finished. The engine is reused now, that half second is gone,
+        // and with it the thing that was serialising these.
+        tappedNode?.removeTap(onBus: 0)
         player = nil
         engine = nil
         tappedNode = nil
@@ -326,7 +393,6 @@ final class AudioSource {
         // Nothing is waiting for this teardown, so the lowest useful band is
         // the correct one.
         DispatchQueue.global(qos: .utility).async {
-            tapped?.removeTap(onBus: 0)
             node?.stop()
             engineToStop?.stop()
             Log.say("FILE graph torn down off the main thread")
@@ -347,37 +413,91 @@ final class AudioSource {
     // MARK: - audio thread
 
     /// File path: downmix an engine buffer and hand it on.
-    private func feed(_ buf: AVAudioPCMBuffer) {
+    private func feed(_ buf: AVAudioPCMBuffer, when: AVAudioTime) {
         guard let channels = buf.floatChannelData else { return }
         let frames = Int(buf.frameLength)
         guard frames > 0 else { return }
-        let ch = Int(buf.format.channelCount)
 
-        if ch == 1 {
-            feedMono(channels[0], frames: frames)
-            return
-        }
-        if monoScratch.count < frames {
-            // Only grows on a format change, not per buffer.
-            monoScratch = [Float](repeating: 0, count: frames)
-        }
-        monoScratch.withUnsafeMutableBufferPointer { mono in
-            guard let base = mono.baseAddress else { return }
-            let scale = 1.0 / Float(ch)
-            for i in 0..<frames { base[i] = channels[0][i] }
-            for k in 1..<ch {
-                let src = channels[k]
-                for i in 0..<frames { base[i] += src[i] }
+        // Which part of this buffer is the file. For live input the answer is
+        // always "all of it": there is no player, and no length to run out of.
+        var skip = 0
+        var take = frames
+        var ended = false
+        if let node = player {
+            // Nil until the player is really playing. That covers the silence
+            // the engine renders between `start()` and `play()` -- three
+            // render quanta of it, 1536 frames, which used to be fed to the
+            // cascade as though it were the opening of the file and put
+            // everything in the picture 34.8 ms late.
+            guard let played = node.playerTime(forNodeTime: when),
+                  played.isSampleTimeValid else { return }
+            // And a buffer that straddles the start is part silence too. The
+            // frames before zero are measured, not assumed.
+            if played.sampleTime < 0 {
+                skip = min(frames, Int(-played.sampleTime))
             }
-            for i in 0..<frames { base[i] *= scale }
-            feedMono(base, frames: frames)
+            // Never past the end either. What follows the last frame is the
+            // player rendering silence, and drawing it would push the end of
+            // the file away from the mark exactly as the pre-roll pushed the
+            // beginning.
+            let remaining = fileFrames > 0 ? fileFrames - fileFramesFed
+                                           : frames - skip
+            take = min(frames - skip, max(0, remaining))
+            guard take > 0 else { return }
+            fileFramesFed += take
+            ended = fileFrames > 0 && fileFramesFed >= fileFrames
         }
+
+        let ch = Int(buf.format.channelCount)
+        if ch == 1 {
+            feedMono(channels[0] + skip, frames: take)
+        } else {
+            if monoScratch.count < take {
+                // Only grows on a format change, not per buffer.
+                monoScratch = [Float](repeating: 0, count: take)
+            }
+            monoScratch.withUnsafeMutableBufferPointer { mono in
+                guard let base = mono.baseAddress else { return }
+                let scale = 1.0 / Float(ch)
+                for i in 0..<take { base[i] = channels[0][skip + i] }
+                for k in 1..<ch {
+                    let src = channels[k]
+                    for i in 0..<take { base[i] += src[skip + i] }
+                }
+                for i in 0..<take { base[i] *= scale }
+                feedMono(base, frames: take)
+            }
+        }
+
+        // Published last, and that ordering is the point of it. Set before the
+        // cascade ran, the main thread could see the boundary, mark and freeze
+        // while the columns for this final chunk were still being made -- and
+        // a frozen view drains and discards them, putting the green line short
+        // by a buffer. Intermittently, which is worse than the constant error
+        // this method exists to remove.
+        //
+        // Program order, not a barrier: the ring's own release store sits
+        // inside `process`, and a plain store after it is not formally ordered
+        // against a plain load on the other side. It is the same latitude the
+        // meters already take, and the cost of the theoretical reordering is
+        // one dropped column rather than anything unsafe -- but it is latitude
+        // and not a guarantee, and the difference is worth writing down.
+        if ended { fileSamplesEnded = true }
     }
 
     /// Where both paths meet. Audio thread: no allocation, no locks, no
     /// syscalls -- counting and the cascade, nothing else.
     private func feedMono(_ samples: UnsafePointer<Float>, frames: Int) {
         guard let c = cochlea else { return }
+        // Before the cascade, and before `meters.samples` moves: the answer is
+        // an offset into the stream as it stood when this buffer arrived. A
+        // comparison and a store, so the audio thread stays as it was.
+        if firstNonZeroFrame < 0 {
+            for i in 0..<frames where samples[i] != 0 {
+                firstNonZeroFrame = meters.samples + i
+                break
+            }
+        }
         let t0 = CACurrentMediaTime()
         c.process(samples, count: frames)
         meters.dspSeconds += CACurrentMediaTime() - t0
