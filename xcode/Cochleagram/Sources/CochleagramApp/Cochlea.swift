@@ -93,6 +93,33 @@ final class Cochlea {
         return (UnsafeBufferPointer(start: d, count: tapCount).max() ?? 0) * 1000
     }
 
+    /// The base's calibrated delay, in milliseconds: the fastest anything in
+    /// the cascade can respond, and so the earliest the picture can show an
+    /// event at all.
+    var minDelayMS: Double {
+        guard tapCount > 0, let d = cochlea_delays(engine) else { return 0 }
+        return (UnsafeBufferPointer(start: d, count: tapCount).min() ?? 0) * 1000
+    }
+
+    /// How far behind the sound the picture is, in milliseconds.
+    ///
+    /// This is the number that turns a column back into a moment of audio, and
+    /// De-skew changes it by nearly two hundred milliseconds.
+    ///
+    /// With De-skew **on** every tap is held back to the slowest, so a column
+    /// stands for one instant, uniformly `maxDelayMS` in the past. That is the
+    /// whole point of the feature -- a click stands vertical -- and it is also
+    /// the largest single offset anywhere in the app.
+    ///
+    /// With it **off** there is no one answer: the column holds each tap's own
+    /// response to an event `gdelay[k]` ago, so it is a smear from the base's
+    /// delay to the apex's, which is exactly the slant De-skew exists to
+    /// remove. The base's is the number used, because the top of the slant is
+    /// the leading edge -- the first ink an event produces, and what the eye
+    /// reads a click's position from. Anything lower on the picture is later,
+    /// as the picture itself shows.
+    var displayLagMS: Double { deskew ? maxDelayMS : minDelayMS }
+
     deinit { cochlea_destroy(engine) }
 
     // MARK: - configuration
@@ -166,6 +193,47 @@ final class Cochlea {
     }
 
     var droppedColumns: UInt64 { cochlea_dropped_columns(engine) }
+
+    // MARK: - keeping the input
+
+    /// Whether the engine is also keeping the samples the picture is drawn
+    /// from, so that what is on screen can be played back.
+    ///
+    /// Turned off while the display is frozen on live input, which is how the
+    /// recording comes to skip exactly the interval the picture skips. See
+    /// `cochlea.h`.
+    var capturing: Bool = false {
+        didSet {
+            guard capturing != oldValue else { return }
+            cochlea_set_capture(engine, capturing ? 1 : 0)
+        }
+    }
+
+    /// Room for one display link's worth of input at any rate anyone runs at.
+    /// A 60 Hz frame is 800 samples at 48 kHz; this is a frame at ten times
+    /// the rate, or ten frames at the real one, which covers a late tick
+    /// without another lap of the loop.
+    private var inputBuffer = [Float](repeating: 0, count: 8192)
+
+    /// Hand the caller everything captured since the last call.
+    ///
+    /// The closure can be called more than once, as `drainColumns` can, when
+    /// more is waiting than the scratch buffer holds.
+    func drainInput(_ body: (UnsafeBufferPointer<Float>) -> Void) {
+        while true {
+            let n = inputBuffer.withUnsafeMutableBufferPointer { p -> Int in
+                guard let b = p.baseAddress else { return 0 }
+                return Int(cochlea_pull_input(engine, b, Int32(p.count)))
+            }
+            if n == 0 { break }
+            inputBuffer.withUnsafeBufferPointer { p in
+                body(UnsafeBufferPointer(rebasing: p[0..<n]))
+            }
+            if n < inputBuffer.count { break }
+        }
+    }
+
+    var droppedInput: UInt64 { cochlea_dropped_input(engine) }
 
     /// Peak input level since the previous call, linear.
     var peakLevel: Float { cochlea_peak_level(engine) }

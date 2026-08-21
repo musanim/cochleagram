@@ -45,6 +45,12 @@ em++ -std=c++17 -O3 \
         "_cochlea_process","_cochlea_pull_columns",
         "_cochlea_dropped_columns","_cochlea_peak_level"]'
 
+# Not exported: the engine's input capture ring, which the Mac app uses to keep
+# the audio behind the picture. The browser already has those samples on the
+# main thread -- the capture worklet posts them there on the way to this engine
+# -- so it keeps its own copy and never asks. Exporting the four functions
+# would put a second recording in the WASM heap that nothing ever reads.
+
 # The coefficients the page fetches. Copied rather than tracked twice: they
 # already live in the app's Resources, and a second set in the repository is a
 # second set to forget to regenerate.

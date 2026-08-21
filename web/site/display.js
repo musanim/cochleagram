@@ -15,6 +15,11 @@
 const SILENT_DB = -600;   // matches kTinyLevel in cochlea.cpp
 const NO_COHERENCE = -1000;
 
+/// The playback line. Violet: far enough from the orange of the measurement to
+/// be told apart at a glance, and from the red seam and the green end-of-file
+/// mark. The same number as `CochleagramView.playheadInk`.
+const PLAYHEAD_INK = 'rgb(140, 61, 242)';
+
 export class Display {
 
     constructor(canvas) {
@@ -28,6 +33,34 @@ export class Display {
         this.levels = new Float32Array(0);
         this.coherence = new Float32Array(0);
         this.refs = new Float32Array(0);
+        /// Which engine column each screen column was drawn from, or -1 where
+        /// nothing has been drawn. What RePlay needs to turn a position on the
+        /// picture back into a position in the recorded audio, and the only
+        /// coordinate that survives the two things the picture routinely does
+        /// to its own time base: it is not wiped when Speed changes, so the
+        /// columns either side of a scale mark stand for different numbers of
+        /// milliseconds; and with the close-up open there are two time bases on
+        /// screen at once by design. There is always exactly one engine column
+        /// behind every screen column. See REPLAY-DESIGN.md.
+        ///
+        /// Doubles, not Int32: at the close-up's finest setting the engine
+        /// makes twenty thousand columns a second, and integers stay exact in a
+        /// double far longer than a session can last.
+        ///
+        /// Shifted wherever `refs` is shifted, being anchored to content in the
+        /// same way.
+        this.fine = new Float64Array(0);
+        /// Bumped whenever the engine-column numbering starts again, which is
+        /// whenever the picture is wiped. Anything still holding a column index
+        /// from before the bump is holding a number that now names other audio.
+        this.contentEpoch = 0;
+        /// Playback position as an engine column, or null when nothing is
+        /// playing.
+        this.playhead = null;
+        /// Something has changed what a playback would be playing -- a click
+        /// that begins a measurement, or a grab of the close-up boundary, which
+        /// clears the measurement as soon as it moves. Either is a Stop.
+        this.onSelectionDisturbed = null;
 
         // The bitmap lives on its own canvas so it can be blitted in one call
         // and scaled to the plot without the browser resampling it vertically.
@@ -172,6 +205,10 @@ export class Display {
                 // Whatever was being measured is about to be measured against
                 // a different time scale, and its lines would sit there in
                 // orange looking like part of the boundary.
+                //
+                // Which also changes what a playback is playing, so it is a
+                // Stop for the same reason a click on the picture is.
+                this.onSelectionDisturbed?.();
                 this.clearMeasurement();
                 return;
             }
@@ -180,6 +217,9 @@ export class Display {
             this.measurement = { anchor: this.columnAt(p.x), cursor: null, y: p.y };
             this.measuring = true;
             this.hover = p;
+            // A click chooses what to play, so it cannot also be ignored while
+            // something is playing. The new lines stay.
+            this.onSelectionDisturbed?.();
             // The frequency line and the duration would be drawn at the same
             // height during a drag, the arrows running along the line. It comes
             // back when the pointer next *moves* rather than when the button
@@ -271,6 +311,12 @@ export class Display {
         this.levels.fill(SILENT_DB);
         this.coherence.fill(NO_COHERENCE);
         this.refs.fill(0);
+        this.fine.fill(-1);
+        // A wipe ends the old numbering, so a recorder that missed it would go
+        // on mapping columns to audio through an origin that no longer means
+        // anything.
+        this.contentEpoch++;
+        this.playhead = null;
         this.marks.length = 0;
         this.clearMeasurement();
         if (this.image) this.renderColumns(0, this.width);
@@ -282,6 +328,132 @@ export class Display {
     }
 
     get hasMeasurement() { return this.measurement !== null; }
+
+    // MARK: RePlay -- from the picture back to the audio
+    //
+    // The picture is several seconds of sound. These turn a position on it back
+    // into a position in the recording, so what is on screen can be heard.
+    // Everything here is in *engine columns*: the one coordinate still
+    // meaningful when the close-up puts two time scales on the screen at once,
+    // and when a change of Speed leaves the older half of the picture at a
+    // scale the newer half is not. The Mac app has the same six members, doing
+    // the same arithmetic. See REPLAY-DESIGN.md.
+
+    /// The index the next engine column to arrive will have.
+    get nextEngineColumn() { return this.fineIndex; }
+
+    /// The engine column drawn at a fractional screen column, or null where
+    /// nothing has been drawn yet.
+    engineColumnAt(u) {
+        if (!this.width || this.fine.length !== this.width) return null;
+        const x = Math.min(Math.max(Math.floor(u), 0), this.width - 1);
+        const g = this.fine[x];
+        return g >= 0 ? g : null;
+    }
+
+    /// How much of the stream one screen column stands for: one engine column
+    /// in the close-up strip, `aggregate` of them in the main picture.
+    ///
+    /// It matters at the right-hand end of a selection. A main-picture column
+    /// *names* the first of the engine columns it draws, so a selection
+    /// stopping at that name would be short by the rest of them -- at aggregate
+    /// 8, a single column would play an eighth of what it shows.
+    engineSpanAt(x) {
+        const near = this.nearDrawn;
+        if (near > 0 && x >= this.width - near) return 1;
+        return Math.max(1, this.aggregate);
+    }
+
+    /// The oldest and newest engine columns anywhere on screen, or null.
+    ///
+    /// Not simply the two ends of the array: after a wipe, or on a window just
+    /// widened, the left of the picture is columns that were never drawn.
+    get drawnColumns() {
+        if (!this.width || this.fine.length !== this.width) return null;
+        let lo = -1, hi = -1;
+        for (let x = 0; x < this.width; x++) {
+            if (this.fine[x] >= 0) { lo = this.fine[x]; break; }
+        }
+        for (let x = this.width - 1; x >= 0; x--) {
+            if (this.fine[x] >= 0) { hi = this.fine[x]; break; }
+        }
+        if (lo < 0 || hi < lo) return null;
+        return { lo, hi };
+    }
+
+    /// What Play Selection would play: the first engine column, and one past
+    /// the last.
+    ///
+    /// The measurement's three states are the three playback modes, which is
+    /// why RePlay has no selection of its own: no lines plays the width of the
+    /// picture, one line plays from there to the right-hand edge, two play what
+    /// is between them.
+    ///
+    /// The upper bound is exclusive and already extended past the last column
+    /// by that column's own span, so a one-column selection is a column's worth
+    /// of sound rather than none.
+    get selectionColumns() {
+        const drawn = this.drawnColumns;
+        if (!drawn || !this.width) return null;
+        const lastX = this.width - 1;
+        const m = this.measurement;
+        if (!m) return { lo: drawn.lo, end: drawn.hi + this.engineSpanAt(lastX) };
+
+        const ax = Math.min(Math.max(Math.floor(m.anchor), 0), lastX);
+        // Where a line stands over picture that was never drawn, the sound it
+        // names does not exist. Undrawn columns are only ever at the left, so
+        // both ends fall back to the oldest column there is and never to the
+        // newest: falling back to the right-hand edge would turn a leftward
+        // drag into a rightward selection.
+        const a = this.engineColumnAt(m.anchor) ?? drawn.lo;
+        if (m.cursor === null) {
+            return { lo: a, end: drawn.hi + this.engineSpanAt(lastX) };
+        }
+        const bx = Math.min(Math.max(Math.floor(m.cursor), 0), lastX);
+        const b = this.engineColumnAt(m.cursor) ?? drawn.lo;
+        const hiX = a <= b ? bx : ax;
+        return { lo: Math.min(a, b),
+                 end: Math.max(a, b) + this.engineSpanAt(hiX) };
+    }
+
+    /// Where an engine column sits on screen, as a fractional screen column, or
+    /// null.
+    ///
+    /// Interpolated inside whichever column it lands in, because in the main
+    /// picture one column stands for `aggregate` engine columns and a line that
+    /// only ever sat on column boundaries would advance in visible jerks at the
+    /// coarser Speed settings. `fine` is non-decreasing left to right in both
+    /// regions, so this is a binary search.
+    screenColumnForEngine(g) {
+        if (!this.width || this.fine.length !== this.width) return null;
+        let first = -1;
+        for (let x = 0; x < this.width; x++) {
+            if (this.fine[x] >= 0) { first = x; break; }
+        }
+        if (first < 0 || g < this.fine[first]) return null;
+        let lo = first, hi = this.width - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (this.fine[mid] <= g) lo = mid; else hi = mid - 1;
+        }
+        const g0 = this.fine[lo];
+        // A wipe with the close-up open refills the main region and the strip
+        // from opposite ends, so for a fraction of a second there is a run of
+        // never-drawn columns *between* two runs of real ones and the search
+        // can land in it. Nothing sensible can be drawn against a column with
+        // no engine column behind it.
+        if (g0 < 0) return null;
+        // How much of the stream this column stands for. Taken from the next
+        // column along where there is one -- which is right across the close-up
+        // boundary too, where the two regions' widths differ -- and from the
+        // region's own rate at the right-hand edge, where there is no next.
+        let span = this.engineSpanAt(lo);
+        if (lo + 1 < this.width && this.fine[lo + 1] > g0) {
+            span = this.fine[lo + 1] - g0;
+        }
+        const frac = (g - g0) / Math.max(1, span);
+        return lo + Math.min(Math.max(frac, 0), 1);
+    }
 
     /// Fractional column under an x, clamped to the picture.
     columnAt(x) {
@@ -368,6 +540,10 @@ export class Display {
         const nl = new Float32Array(w * this.taps).fill(SILENT_DB);
         const nc = new Float32Array(w * this.taps).fill(NO_COHERENCE);
         const nr = new Float32Array(w);
+        // -1 for "never drawn here", which is what the columns a widened window
+        // exposes are. Distinct from 0, which is a real column: the first one
+        // after a wipe.
+        const nf = new Float64Array(w).fill(-1);
         if (this.width > 0) {
             const keep = Math.min(w, this.width);
             nl.set(this.levels.subarray((this.width - keep) * this.taps),
@@ -375,6 +551,9 @@ export class Display {
             nc.set(this.coherence.subarray((this.width - keep) * this.taps),
                    (w - keep) * this.taps);
             nr.set(this.refs.subarray(this.width - keep), w - keep);
+            if (this.fine.length === this.width) {
+                nf.set(this.fine.subarray(this.width - keep), w - keep);
+            }
             // The measurement's lines are anchored to content in the same way
             // the marks are, and a resize right-aligns what it keeps. Left
             // alone they would go on stating the same duration over different
@@ -394,6 +573,7 @@ export class Display {
         this.levels = nl;
         this.coherence = nc;
         this.refs = nr;
+        this.fine = nf;
         this.width = w;
 
         this.bitmap.width = w;
@@ -459,9 +639,17 @@ export class Display {
         // seconds finding the room from a standing start.
         this.autoExpose(levels, refs, count);
 
+        // Belt and braces: everything below indexes it as `width` long, and it
+        // is written in more places than `refs` is.
+        if (this.fine.length !== this.width) {
+            this.fine = new Float64Array(this.width).fill(-1);
+        }
+
         const near = this.nearDrawn;
         if (near > 0) { this.appendTwoBases(levels, coherence, refs, count, near); return; }
 
+        // The engine index of levels[c] is `first + c`.
+        const first = this.fineIndex;
         if (count >= this.width) {
             // More arrived than fit: keep the newest screenful.
             this.marks.length = 0;         // nothing older survived
@@ -469,7 +657,17 @@ export class Display {
             this.levels.set(levels.subarray(skip * taps));
             this.coherence.set(coherence.subarray(skip * taps));
             this.refs.set(refs.subarray(skip));
+            for (let c = 0; c < this.width; c++) this.fine[c] = first + skip + c;
             this.renderColumns(0, this.width);
+            // Advanced on this path too, now that it names the audio as well as
+            // the close-up's delay line. It used to move only when the close-up
+            // was on, which was harmless while nothing else read it; left at
+            // zero here every column of an ordinary picture would carry the
+            // same engine index, and RePlay would play one instant of sound
+            // however wide a span was selected. Both ways into and out of the
+            // two-time-base mode go through `setCloseUp`, which resets it and
+            // wipes, so the two readings can never be mixed on one screen.
+            this.fineIndex += count;
             return;
         }
 
@@ -483,9 +681,11 @@ export class Display {
         this.levels.copyWithin(0, n * taps);
         this.coherence.copyWithin(0, n * taps);
         this.refs.copyWithin(0, n);
+        this.fine.copyWithin(0, n);
         this.levels.set(levels.subarray(0, n * taps), (this.width - n) * taps);
         this.coherence.set(coherence.subarray(0, n * taps), (this.width - n) * taps);
         this.refs.set(refs.subarray(0, n), this.width - n);
+        for (let c = 0; c < n; c++) this.fine[this.width - n + c] = first + c;
 
         const d = this.image.data;
         const rowBytes = this.width * 4;
@@ -494,6 +694,7 @@ export class Display {
             d.copyWithin(row, row + n * 4, row + rowBytes);
         }
         this.renderColumns(this.width - n, n);
+        this.fineIndex += count;
     }
 
     /// Move columns [lo+k, hi) left to [lo, hi-k) in a column-major plane.
@@ -544,8 +745,14 @@ export class Display {
         const keepL = new Float32Array(take * taps);
         const keepC = new Float32Array(take * taps);
         const keepR = new Float32Array(take);
+        // A promoted column keeps the engine index it entered the strip with,
+        // which is `g` -- so a column of the main picture names the first of
+        // the `aggregate` engine columns it stands for, which is where in the
+        // audio it begins.
+        const keepF = new Float64Array(take);
         for (let i = 0; i < take; i++) {
             const g = promoted[from + i];
+            keepF[i] = g;
             if (g >= first) {                          // still in flight
                 const c = g - first;
                 keepL.set(levels.subarray(c * taps, (c + 1) * taps), i * taps);
@@ -564,10 +771,12 @@ export class Display {
             this.shiftPlane(this.levels, 0, mainHi, take);
             this.shiftPlane(this.coherence, 0, mainHi, take);
             this.refs.copyWithin(0, take, mainHi);
+            this.fine.copyWithin(0, take, mainHi);
             this.shiftPixels(0, mainHi, take);
             this.levels.set(keepL, (mainHi - take) * taps);
             this.coherence.set(keepC, (mainHi - take) * taps);
             this.refs.set(keepR, mainHi - take);
+            this.fine.set(keepF, mainHi - take);
         }
 
         const fill = Math.min(count, near);
@@ -575,10 +784,13 @@ export class Display {
         this.shiftPlane(this.levels, mainHi, W, fill);
         this.shiftPlane(this.coherence, mainHi, W, fill);
         this.refs.copyWithin(mainHi, mainHi + fill, W);
+        this.fine.copyWithin(mainHi, mainHi + fill, W);
         this.shiftPixels(mainHi, W, fill);
         this.levels.set(levels.subarray(skip * taps, count * taps), (W - fill) * taps);
         this.coherence.set(coherence.subarray(skip * taps, count * taps), (W - fill) * taps);
         this.refs.set(refs.subarray(skip, count), W - fill);
+        // One engine column each in the strip, so the index is the stream's own.
+        for (let c = 0; c < fill; c++) this.fine[W - fill + c] = first + skip + c;
 
         // Marks travel at whichever rate the region they are in moves. One
         // that crosses the boundary lands just inside the main picture -- at
@@ -720,6 +932,14 @@ export class Display {
                 this.hairline(plot, m.cursor, ink);
                 this.drawDimension(plot, m.anchor, m.cursor, m.y, ink);
             }
+        }
+        // On top of the measurement, and a different colour: the orange lines
+        // say where the sound will be taken from, this one says where in it the
+        // ear has got to. Two statements about the same axis, so they must not
+        // be mistakable for each other. The same violet as the Mac app.
+        if (this.playhead !== null) {
+            const u = this.screenColumnForEngine(this.playhead);
+            if (u !== null) this.hairline(plot, u, PLAYHEAD_INK);
         }
     }
 

@@ -301,6 +301,90 @@ private:
     std::atomic<uint64_t> head_{0}, tail_{0}, dropped_{0};
 };
 
+/* ---------------------------------------------------------------------------
+ *  The same thing again for raw input samples, so what is on screen can be
+ *  played back.
+ *
+ *  Deliberately a separate ring rather than a wider ColumnRing.  The two carry
+ *  different quantities at different rates -- one item per column against one
+ *  per sample, some hundreds of times more often -- and a consumer that wants
+ *  columns without audio is the ordinary case, not a special one.
+ *
+ *  Sized in seconds rather than in buffers.  The consumer is a display link,
+ *  so the ring is normally emptied sixty times a second and a fraction of a
+ *  second would do; the margin is for the case where the link stops -- a
+ *  minimised or fully occluded window -- which also drops columns and is
+ *  already marked in the picture as a seam.
+ * ------------------------------------------------------------------------ */
+class InputRing {
+public:
+    void init(double rate_hz) {
+        const size_t n = static_cast<size_t>(
+            std::fmax(1.0, rate_hz * kCaptureSeconds));
+        buf_.assign(n, 0.0f);
+        head_.store(0);
+        tail_.store(0);
+        dropped_.store(0);
+    }
+
+    void setEnabled(bool on) { enabled_.store(on, std::memory_order_relaxed); }
+    bool enabled() const { return enabled_.load(std::memory_order_relaxed); }
+
+    /* audio thread */
+    void push(const float *in, int n) {
+        if (!enabled() || buf_.empty() || n <= 0) return;
+        const size_t cap = buf_.size();
+        const uint64_t h = head_.load(std::memory_order_relaxed);
+        const uint64_t t = tail_.load(std::memory_order_acquire);
+        const size_t free_now = cap - static_cast<size_t>(h - t);
+        size_t take = static_cast<size_t>(n);
+        if (take > free_now) {
+            /*  Drop the tail of the buffer rather than the head of the ring.
+             *  Overwriting what the consumer has not read yet would silently
+             *  reorder the recording; losing the newest samples leaves what is
+             *  already held still contiguous and still true. */
+            dropped_.fetch_add(take - free_now, std::memory_order_relaxed);
+            take = free_now;
+            if (take == 0) return;
+        }
+        const size_t at = static_cast<size_t>(h % cap);
+        const size_t first = std::min(take, cap - at);
+        std::memcpy(&buf_[at], in, first * sizeof(float));
+        if (take > first) {
+            std::memcpy(&buf_[0], in + first, (take - first) * sizeof(float));
+        }
+        head_.store(h + take, std::memory_order_release);
+    }
+
+    /* drawing thread */
+    int pull(float *out, int max) {
+        if (buf_.empty() || max <= 0 || !out) return 0;
+        const size_t cap = buf_.size();
+        const uint64_t h = head_.load(std::memory_order_acquire);
+        const uint64_t t = tail_.load(std::memory_order_relaxed);
+        size_t take = static_cast<size_t>(h - t);
+        if (take > static_cast<size_t>(max)) take = static_cast<size_t>(max);
+        if (take == 0) return 0;
+        const size_t at = static_cast<size_t>(t % cap);
+        const size_t first = std::min(take, cap - at);
+        std::memcpy(out, &buf_[at], first * sizeof(float));
+        if (take > first) {
+            std::memcpy(out + first, &buf_[0], (take - first) * sizeof(float));
+        }
+        tail_.store(t + take, std::memory_order_release);
+        return static_cast<int>(take);
+    }
+
+    uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
+
+private:
+    static constexpr double kCaptureSeconds = 4.0;
+
+    std::vector<float>    buf_;
+    std::atomic<bool>     enabled_{false};
+    std::atomic<uint64_t> head_{0}, tail_{0}, dropped_{0};
+};
+
 }  // namespace
 
 /* ------------------------------------------------------------------------- */
@@ -405,6 +489,7 @@ struct CochleaEngine {
 
     std::vector<float> scratch, scratch_dt;
     ColumnRing ring;
+    InputRing  capture;
     std::atomic<float> peak{0.0f};
 
     void recomputeShifts() {
@@ -938,6 +1023,9 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
     e->history.assign(static_cast<size_t>(e->n_taps) * kMaxDeskewColumns, 0.0f);
     e->history_dt.assign(static_cast<size_t>(e->n_taps) * kMaxDeskewColumns, 0.0f);
     e->ring.init(e->n_taps);
+    /*  At the host's rate, not the internal one: what is kept is the input as
+     *  handed over, so that playing it back reproduces what was heard. */
+    e->capture.init(input_rate);
 
     /*  Rate handling.  The common cases are exact: 44.1 -> 88.2 and 48 -> 96
      *  are a clean 2x, handled by the half-band filter.  Anything else falls
@@ -1022,6 +1110,11 @@ void cochlea_set_deskew(CochleaEngine *e, int enabled) {
 
 void cochlea_process(CochleaEngine *e, const float *in, int n) {
     if (!e || !in) return;
+    /*  Before the cascade, so that a buffer which is captured is captured
+     *  whole: the loop below can leave part of a buffer unprocessed on no path
+     *  today, but a recording that is sometimes short by a few samples is a
+     *  drift nobody would find. */
+    e->capture.push(in, n);
     float pk = e->peak.load(std::memory_order_relaxed);
 
     for (int i = 0; i < n; ++i) {
@@ -1069,6 +1162,23 @@ int cochlea_pull_columns(CochleaEngine *e, float *levels, float *coherence,
 
 uint64_t cochlea_dropped_columns(const CochleaEngine *e) {
     return e ? e->ring.dropped() : 0;
+}
+
+void cochlea_set_capture(CochleaEngine *e, int enabled) {
+    if (e) e->capture.setEnabled(enabled != 0);
+}
+
+int cochlea_capture_enabled(const CochleaEngine *e) {
+    return (e && e->capture.enabled()) ? 1 : 0;
+}
+
+int cochlea_pull_input(CochleaEngine *e, float *out, int max) {
+    if (!e) return 0;
+    return e->capture.pull(out, max);
+}
+
+uint64_t cochlea_dropped_input(const CochleaEngine *e) {
+    return e ? e->capture.dropped() : 0;
 }
 
 float cochlea_peak_level(CochleaEngine *e) {

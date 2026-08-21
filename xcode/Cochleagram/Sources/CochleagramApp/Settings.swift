@@ -86,6 +86,16 @@ struct Settings: Equatable {
     var sensDB:  Double = 95
     var rangeDB: Double = 170
 
+    /// How loud Play Selection is, in dB relative to what the microphone heard.
+    ///
+    /// Zero by default -- unity -- so that what you hear is the recording, not
+    /// an opinion about it. The travel runs above unity as well as below
+    /// because a microphone recording often sits well below full scale and
+    /// nothing else in the app can lift it; anything that then exceeds full
+    /// scale clips at the device, audibly, which is the right thing for an
+    /// instrument to do rather than pretending to headroom it has not got.
+    var replayGainDB: Double = 0
+
     /// The pair the view actually wants, so the sign of the negation is
     /// written down in exactly one place.
     var exposureWindow: (white: Double, black: Double) {
@@ -338,6 +348,12 @@ struct Settings: Equatable {
     /// grey scale and becomes a threshold; above two hundred there is nothing
     /// outside the window left to bring in.
     static let rangeRange = 5.0 ... 200.0
+    /// What the RePlay volume slider spans, in dB about unity. Forty below is
+    /// as quiet as anything needs to be before the bottom of the travel, which
+    /// is silence rather than -40; twelve above brings a recording that peaks
+    /// around -20 dBFS up to a comfortable level without inviting clipping on
+    /// one that does not need it.
+    static let replayGainRange = -40.0 ... 12.0
     static let columnRange =   0.5 ... 64.0
 
     /// The Time control's detents: ten equal *ratios* across the range, not
@@ -400,13 +416,14 @@ struct Settings: Equatable {
         static let closeUpW = "display.closeUpColumns"
         static let outDev   = "audio.outputDeviceUID"
         static let outPair  = "audio.outputChannelPair"
+        static let replayDB = "audio.replayGainDB"
         static let logCon   = "diagnostics.console"
         static let logOS    = "diagnostics.logStream"
         static let readout  = "diagnostics.readout"
 
         static let all = [deskew, invert, autoGain, sens, range, column,
                           erbScale, mode, closeUp, closeUpW,
-                          outDev, outPair, logCon, logOS, readout,
+                          outDev, outPair, replayDB, logCon, logOS, readout,
                           white, black, oldGain, oldLevel]
     }
 
@@ -464,10 +481,15 @@ struct Settings: Equatable {
         // plist survives min and max in Swift as it does in JavaScript, and a
         // NaN window renders an all-black picture that nothing but deleting
         // the defaults can undo.
+        if store.object(forKey: K.replayDB) != nil {
+            s.replayGainDB = store.double(forKey: K.replayDB)
+        }
         if !s.sensDB.isFinite  { s.sensDB  = Settings().sensDB }
         if !s.rangeDB.isFinite { s.rangeDB = Settings().rangeDB }
+        if !s.replayGainDB.isFinite { s.replayGainDB = Settings().replayGainDB }
         s.sensDB  = clamp(s.sensDB,  to: sensitivityRange)
         s.rangeDB = clamp(s.rangeDB, to: rangeRange)
+        s.replayGainDB = clamp(s.replayGainDB, to: replayGainRange)
         s.columnMS = columnSteps[nearestColumnStep(s.columnMS)]
         // Only the baked scales exist as files; anything else would fail to
         // load and leave the app with no cochlea at all.
@@ -517,6 +539,7 @@ struct Settings: Equatable {
         store.set(closeUpColumns, forKey: K.closeUpW)
         store.set(outputDeviceUID, forKey: K.outDev)
         store.set(outputChannelPair, forKey: K.outPair)
+        store.set(replayGainDB,   forKey: K.replayDB)
         store.set(logToConsole,   forKey: K.logCon)
         store.set(logToLogStream, forKey: K.logOS)
         store.set(showReadout,    forKey: K.readout)

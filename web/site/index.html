@@ -76,6 +76,20 @@
       </select>
     </label>
     <div class="rule"></div>
+    <!-- RePlay: hearing what the picture shows. A group of two, because
+         neither is any use alone, with a line on each side -- the one above is
+         the left. Hidden rather than disabled when it does not apply: a
+         disabled control is an invitation with a reason to find, and this one
+         applies only to a frozen live picture, which is a state you are either
+         in or not. The button is sized for its longer title so that changing
+         to "Stop" does not shove the file controls along. -->
+    <button id="playsel" style="min-width: 8.5em"
+            title="Play the sound the picture was drawn from. With no measurement lines this is the whole width of the display; with one line it starts there; with two it plays what is between them."
+            hidden>Play Selection</button>
+    <input type="range" id="vol" min="-40" max="12" step="1" value="0"
+           title="How loud. Unity — the level the microphone heard — is towards the right; the far left is silent."
+           hidden>
+    <div class="rule" id="selrule" hidden></div>
     <button id="open">Play file…</button>
     <button id="replay" title="Play the same file again" hidden>&#8635;</button>
     <span id="fname" hidden></span>
@@ -223,6 +237,204 @@ let playedThrough = false;
 let playingFile = false, paused = false, fileEnded = false;
 let colsSeen = 0, lastReport = performance.now();
 
+// ---- RePlay: the audio behind the picture ---------------------------------
+//
+// A port of `ReplayRecorder` in the Mac app's AudioSource.swift, doing the
+// same arithmetic. Read REPLAY-DESIGN.md before changing either.
+//
+// Where the Mac app drains a ring inside the engine, this keeps its own copy:
+// the capture worklet posts every block to *this* thread on its way to the
+// worker, so the samples are already here and asking the engine for them again
+// would be a second recording in the WASM heap. That is the only difference.
+
+class ReplayRecorder {
+    constructor() { this.reset(0); }
+
+    /// Throw everything away and start again -- a new input device, a new
+    /// engine, or a wiped picture.
+    reset(rate) {
+        /// One stretch of recording at one column rate and one display lag.
+        ///
+        /// A list rather than a single origin, because three ordinary actions
+        /// break the correspondence without wiping the picture: changing Speed
+        /// changes how much audio a column stands for; resuming after a pause
+        /// starts recording again after an interval that is in neither the
+        /// picture nor the recording; and De-skew moves the whole picture by
+        /// nearly two hundred milliseconds. Everything drawn before the change
+        /// still has to map correctly, so the old terms are kept.
+        this.segments = [];
+        /// Blocks as they arrived, oldest first, and how many samples they hold
+        /// between them. Kept as a list rather than one array because trimming
+        /// then drops whole blocks off the front instead of moving everything
+        /// that survives.
+        this.blocks = [];
+        this.held = 0;
+        /// Stream position of the first sample still held.
+        this.base = 0;
+        /// Total ever taken, so a position means the same thing for ever.
+        this.written = 0;
+        this.rate = rate;
+    }
+
+    get isEmpty() { return this.held === 0 || this.segments.length === 0; }
+    /// Where the oldest sample still held sits in the stream.
+    get oldestSample() { return this.base; }
+
+    /// Begin a new stretch: engine column `column` is the next one that will be
+    /// drawn, and it stands for audio that arrived `lagSamples` ago.
+    ///
+    /// The lag is folded into the stretch's own origin rather than kept as a
+    /// term of its own, so every mapping downstream is the same arithmetic it
+    /// would otherwise have been. It can put the origin before the start of the
+    /// recording, which is not an error: at the beginning of a stretch the
+    /// first columns really were drawn from audio nobody was keeping yet, and
+    /// the callers clamp.
+    beginSegment(column, perColumn, lagSamples) {
+        if (!(perColumn > 0)) return;
+        const seg = { column, sample: this.written - lagSamples, perColumn };
+        const last = this.segments[this.segments.length - 1];
+        // A stretch describing no columns yet is replaced rather than stacked:
+        // two at the same place would only be one, and Speed or De-skew can be
+        // changed twice while paused.
+        if (last && last.column === column) {
+            this.segments[this.segments.length - 1] = seg;
+            return;
+        }
+        this.segments.push(seg);
+    }
+
+    take(block) {
+        if (!block.length) return;
+        this.blocks.push(block);
+        this.held += block.length;
+        this.written += block.length;
+    }
+
+    /// Where an engine column begins, in the recording, or null.
+    sampleForColumn(g) {
+        let i = -1;
+        for (let k = this.segments.length - 1; k >= 0; k--) {
+            if (this.segments[k].column <= g) { i = k; break; }
+        }
+        if (i < 0) return null;
+        const s = this.segments[i];
+        return s.sample + Math.round((g - s.column) * s.perColumn);
+    }
+
+    /// The engine column a position in the recording belongs to.
+    ///
+    /// Not a search on `sample`, which would be the obvious thing and is wrong.
+    /// Stretches are ordered and monotone in column but *not* in sample:
+    /// turning De-skew on holds the picture back, so the stretch beginning at
+    /// the toggle starts from audio the one before it has already used. The
+    /// overlap is real -- it is what the seam is saying -- and a search for the
+    /// last stretch starting at or before `at` would jump forward the instant
+    /// the new one began.
+    ///
+    /// So the walk is forward, from the stretch `from` lies in, and it steps
+    /// only when `at` has passed the boundary expressed in the current
+    /// stretch's own terms. Columns are contiguous across a boundary even when
+    /// samples are not, which is what makes that well defined.
+    columnForSample(at, from) {
+        let i = -1;
+        for (let k = this.segments.length - 1; k >= 0; k--) {
+            if (this.segments[k].column <= from) { i = k; break; }
+        }
+        if (i < 0) return null;
+        while (i + 1 < this.segments.length) {
+            const s = this.segments[i], next = this.segments[i + 1];
+            const boundary = s.sample
+                + Math.round((next.column - s.column) * s.perColumn);
+            if (at < boundary) break;
+            i++;
+        }
+        const s = this.segments[i];
+        const g = s.column + Math.round((at - s.sample) / s.perColumn);
+        // The line only ever moves forward, and `from` alone does not ensure
+        // it. Turning De-skew *off* is the mirror of turning it on: the audio
+        // between the boundary and the new stretch's origin belongs to no
+        // column at all, and extrapolating the new stretch's formula backwards
+        // over that gap lands inside the previous stretch's columns.
+        return Math.max(g, s.column, from);
+    }
+
+    /// Drop everything older than engine column `oldest`, the left-hand edge of
+    /// the picture. This is the whole of the memory policy: the recording is as
+    /// long as the picture is wide and no longer, so it grows with Speed and
+    /// with the window and needs no ceiling of its own.
+    trim(oldest) {
+        const cut = this.sampleForColumn(oldest);
+        if (cut === null || cut <= this.base) return;
+        // Whole blocks only. Dropping part of one would mean copying the rest,
+        // which is the cost this shape exists to avoid.
+        while (this.blocks.length && this.base + this.blocks[0].length <= cut) {
+            const b = this.blocks.shift();
+            this.base += b.length;
+            this.held -= b.length;
+        }
+        let keep = 0;
+        for (let k = this.segments.length - 1; k >= 0; k--) {
+            if (this.segments[k].column <= oldest) { keep = k; break; }
+        }
+        // The stretch covering the new left edge stays; the ones entirely
+        // behind it describe audio nobody can reach any more.
+        if (keep > 0) this.segments.splice(0, keep);
+    }
+
+    /// The audio between two engine columns, exclusive of the last, as one
+    /// Float32Array, or null when none of it is still held.
+    slice(lo, end) {
+        if (end <= lo) return null;
+        let b = this.sampleForColumn(end);
+        if (b === null) return null;
+        // The left-hand end is clamped up to the oldest sample still held
+        // rather than refused. The picture is deliberately kept across some of
+        // the things that restart the recording -- a change of input device, or
+        // of ERB -- so for one screen width afterwards the left of the picture
+        // is older than anything recorded. Playing what there is of it is the
+        // useful answer.
+        let a = this.sampleForColumn(lo);
+        if (a === null) a = this.base;
+        // A span across a De-skew seam can run backwards: for a selection
+        // narrower than the lag the right-hand end names an earlier sample than
+        // the left, and there is no honest span between them. What there is, is
+        // the sound the left end names for as long as the selection is wide on
+        // that side of the seam -- never empty, and what a listener reading the
+        // left of the picture expects.
+        if (b <= a) {
+            let s = null;
+            for (let k = this.segments.length - 1; k >= 0; k--) {
+                if (this.segments[k].column <= lo) { s = this.segments[k]; break; }
+            }
+            if (s) b = a + Math.round((end - lo) * s.perColumn);
+        }
+        const from = Math.max(0, a - this.base);
+        const to = Math.min(this.held, b - this.base);
+        if (to <= from) return null;
+        const out = new Float32Array(to - from);
+        let at = 0, pos = 0;
+        for (const blk of this.blocks) {
+            const s = Math.max(from, pos), e = Math.min(to, pos + blk.length);
+            if (e > s) { out.set(blk.subarray(s - pos, e - pos), s - from); at = e; }
+            pos += blk.length;
+            if (pos >= to) break;
+        }
+        return at > from ? out : null;
+    }
+}
+
+const recorder = new ReplayRecorder();
+/// The picture's numbering, the column rate and the display lag when the
+/// recorder was last told about them.
+let recordedEpoch = -1, recordedPerColumn = 0, recordedLag = -1;
+/// Where a playback started, and where it must not pass.
+let replayFrom = 0, replayTo = 0, replayFromSample = 0;
+/// The playing graph, and when it started.
+let replaySource = null, replayGainNode = null;
+let replayStarted = 0, replaySeconds = 0;
+/// Per-tap group delay in seconds, from the engine. What De-skew is made of.
+let engineDelays = null;
+
 // ---- what is remembered between visits -----------------------------------
 //
 // localStorage, which is per-origin: settings from a local server and from
@@ -274,7 +486,18 @@ const defaults = {
     // and a stranger meeting a display already divided into two regions
     // scrolling at different rates would reasonably conclude it was broken.
     closeUpSpanMs: 0, closeUpColumns: 400,
+    // How loud Play Selection is, in dB relative to what the microphone heard.
+    // Zero -- unity -- so what you hear is the recording, not an opinion about
+    // it. The travel runs above unity as well as below because a microphone
+    // recording often sits well below full scale and nothing else here can lift
+    // it; anything that then exceeds full scale clips, audibly, which is the
+    // right thing for an instrument to do. One of the values the two apps have
+    // to agree on.
+    replayGainDb: 0,
 };
+/// What the volume slider spans, in dB about unity. Matches
+/// `Settings.replayGainRange` in the Mac app.
+const REPLAY_GAIN_RANGE = [-40, 12];
 /// Which of the defaults the Defaults button restores: all of them except
 /// `columnMs` and `erb`.
 ///
@@ -290,7 +513,7 @@ const defaults = {
 /// copy of the values would only be a way for the two to drift apart. The Mac
 /// app's Defaults button omits the same two, for the same reason.
 const DISPLAY_KEYS = ['deskew', 'invert', 'autoGain', 'sensDB', 'rangeDB',
-                      'closeUpSpanMs', 'closeUpColumns'];
+                      'closeUpSpanMs', 'closeUpColumns', 'replayGainDb'];
 const displayDefaults =
     Object.fromEntries(DISPLAY_KEYS.map(k => [k, defaults[k]]));
 // The window is set by where its middle is and how wide it is, not by its two
@@ -355,6 +578,9 @@ Object.assign(S, stored);
 // one-decibel window would otherwise keep it forever, through every reload.
 S.sensDB  = clampSens(S.sensDB);
 S.rangeDB = clampRange(S.rangeDB);
+S.replayGainDb = Number.isFinite(S.replayGainDb)
+    ? Math.min(REPLAY_GAIN_RANGE[1], Math.max(REPLAY_GAIN_RANGE[0], S.replayGainDb))
+    : defaults.replayGainDb;
 // The tuning has to survive the same treatment, and it is the one that cannot
 // be recovered from without knowing about localStorage. A value naming no
 // coefficient file leaves the ERB menu blank, asks the worker for a file that
@@ -394,6 +620,7 @@ function applySettings() {
     $('auto').checked = S.autoGain;
     $('sens').value = String(S.sensDB);
     $('rng').value  = String(S.rangeDB);
+    $('vol').value  = String(S.replayGainDb);
     // Auto gain owns sensitivity while it is on: the control reports what the
     // controller is doing rather than accepting instructions. Wanting it
     // somewhere else is what turning Auto gain off is for.
@@ -484,6 +711,10 @@ function startWorker() {
         const m = ev.data;
         if (m.type === 'ready') {
             display.setGeometry(m.taps, m.frequencies);
+            // Kept for RePlay: how far behind the sound the picture is depends
+            // on these and on De-skew, and is nearly two hundred milliseconds
+            // with De-skew on. See `displayLagMs`.
+            engineDelays = m.delays;
             applyCloseUp();              // the width limit needs the geometry
         } else if (m.type === 'columns') {
             // Dropped rather than queued while frozen. Live input carries on
@@ -533,6 +764,13 @@ async function ensureAudio() {
             if (a > inPeak) inPeak = a;
         }
         samplesSent += s.length;
+        // Kept before the transfer, which takes the buffer away. Only while a
+        // live picture is running: nothing is recorded once it is frozen, so
+        // the recording skips exactly the interval the picture skips, and a
+        // selection spanning a seam plays straight across it with no gap to
+        // reason about. It also keeps the microphone from recording the
+        // playback coming out of the speakers. See REPLAY-DESIGN.md.
+        if (capturing()) recorder.take(s.slice());
         worker.postMessage({ type: 'audio', samples: ev.data },
                            [ev.data.buffer]);
         // Ask the engine to report as soon as it has consumed the last of the
@@ -589,6 +827,9 @@ function showTransport() {
     // there after the microphone had taken over.
     $('fname').hidden  = !lastBuffer;
     $('replay').hidden = !lastBuffer || !playedThrough;
+    // In the same place as the rest of the transport, so there is one answer to
+    // "which buttons are on screen" rather than two.
+    showReplayControls();
 }
 
 /// A file that has run out has nothing to resume, so rather than have the
@@ -608,6 +849,8 @@ function togglePause() {
 }
 
 function stopSources() {
+    // RePlay belongs to whatever was on screen, which is about to be replaced.
+    stopReplay();
     // Whatever was playing is not going to reach its end now, so the count
     // that was waiting for it must not fire against the next thing.
     fileEndsAt = 0;
@@ -627,6 +870,12 @@ function stopSources() {
     if (micSource) { micSource.disconnect(); micSource = null; }
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     playingFile = false;
+    // Whatever comes next is a different recording. Restarted rather than
+    // carried over, because a new source can be at a different sample rate and
+    // playing old audio back at a new one would pitch-shift it.
+    recorder.reset(ctx ? ctx.sampleRate : 0);
+    recordedPerColumn = 0;
+    recordedLag = -1;
 }
 
 // ---- sources -------------------------------------------------------------
@@ -850,6 +1099,18 @@ view.addEventListener('drop', e => {
 // ---- transport -----------------------------------------------------------
 
 function setPaused(on, mark = true) {
+    // Before `paused` moves, not after. Resuming starts the picture moving
+    // again and starts recording over what is being played, so it is the one
+    // control that must interrupt -- and it has to interrupt while `capturing`
+    // still answers false, or the tail draining out of the speakers would be
+    // recorded as though it were the room.
+    if (!on) {
+        stopReplay();
+        // A new stretch: the interval about to be skipped is in neither the
+        // picture nor the recording, so the old terms will not describe what
+        // arrives next.
+        recordedPerColumn = 0;
+    }
     paused = on;
     // A measurement is anchored to a column of a frozen picture. Once the
     // picture starts moving again the two lines are over whatever has scrolled
@@ -1007,6 +1268,11 @@ $('reset').onclick = () => {
     // put the two apps back where they were: agreeing on the control and
     // disagreeing about the picture.
     display.autoRef = 0;
+    // Applied to any sound already running, so the button's effect is audible
+    // rather than only stored.
+    if (replayGainNode) {
+        replayGainNode.gain.value = replayGainLinear(S.replayGainDb);
+    }
     save();
     // The sensitivity control is written only when the number it shows would
     // change, so the remembered value has to be forgotten or the slider can be
@@ -1033,7 +1299,189 @@ $('reset').onclick = () => {
 /// when the number it shows would change rather than sixty times a second.
 let shownSens = null;
 
+// ---- RePlay ---------------------------------------------------------------
+//
+// Hearing what is on screen. Only ever offered on a frozen picture from live
+// input: a file is already audible and already on disk, so a second way to play
+// it would be two controls doing one job -- and that also disposes of every
+// question about how the two transports interact, because they never coexist.
+
+/// Whether the audio arriving now belongs to the picture.
+function capturing() { return !playingFile && !paused; }
+
+const isReplaying = () => replaySource !== null;
+
+/// How far behind the sound the picture is, in milliseconds.
+///
+/// With De-skew **on** every tap is held back to the slowest, so a column
+/// stands for one instant, uniformly the apex's travel time in the past -- 186
+/// ms at ERB 0.6. That is the largest single offset anywhere in the app, and
+/// ignoring it would play a fifth of a second later than the lines said.
+///
+/// With it **off** there is no one answer: the column holds each tap's own
+/// response to an event `gdelay[k]` ago, a smear from the base's delay to the
+/// apex's, which is exactly the slant De-skew exists to remove. The base's is
+/// the number used, because the top of the slant is the leading edge -- the
+/// first ink an event makes, and what the eye reads a click's position from.
+///
+/// `delays` comes from the engine on 'ready', in seconds.
+function displayLagMs() {
+    if (!engineDelays || !engineDelays.length) return 0;
+    let lo = Infinity, hi = -Infinity;
+    for (const d of engineDelays) { if (d < lo) lo = d; if (d > hi) hi = d; }
+    return (S.deskew ? hi : lo) * 1000;
+}
+
+/// Keep the recorder's arithmetic in step with the picture's.
+function syncRecorder() {
+    if (!ctx) return;
+    // A change of input device keeps the picture, so the epoch alone would not
+    // notice it, and everything already recorded is at the old rate. The rate
+    // is part of what makes a recording the same recording.
+    if (display.contentEpoch !== recordedEpoch || ctx.sampleRate !== recorder.rate) {
+        stopReplay();
+        recorder.reset(ctx.sampleRate);
+        recordedEpoch = display.contentEpoch;
+        recordedPerColumn = 0;
+        recordedLag = -1;
+        showReplayControls();
+    }
+    const perColumn = ctx.sampleRate * (S.columnMs / closeUpK) / 1000;
+    const lag = Math.round(displayLagMs() / 1000 * ctx.sampleRate);
+    if (perColumn > 0 && (perColumn !== recordedPerColumn || lag !== recordedLag)) {
+        recorder.beginSegment(display.nextEngineColumn, perColumn, lag);
+        recordedPerColumn = perColumn;
+        recordedLag = lag;
+    }
+}
+
+/// On screen only while a live picture is frozen. Hidden rather than disabled:
+/// a disabled control is an invitation with a reason to find, and this one
+/// applies to a state the user is either in or not.
+function showReplayControls() {
+    const show = !playingFile && paused && !recorder.isEmpty;
+    if (!show) stopReplay();
+    for (const id of ['playsel', 'vol', 'selrule']) $(id).hidden = !show;
+    $('playsel').textContent = isReplaying() ? 'Stop' : 'Play Selection';
+}
+
+function startReplay() {
+    const sel = display.selectionColumns;
+    if (!sel || !ctx) return;
+    // `sel.end` is one past the last column, extended by that column's own
+    // span, so a one-column selection is a column's worth of sound rather than
+    // none.
+    const frames = recorder.slice(sel.lo, sel.end);
+    if (!frames || !frames.length) {
+        say('that part of the picture is no longer in the recording');
+        return;
+    }
+    stopReplay();
+    const buf = ctx.createBuffer(1, frames.length, ctx.sampleRate);
+    buf.copyToChannel(frames, 0);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    const gain = ctx.createGain();
+    gain.gain.value = replayGainLinear(S.replayGainDb);
+    src.connect(gain).connect(ctx.destination);
+    src.start();
+
+    replaySource = src;
+    replayGainNode = gain;
+    replayFrom = sel.lo;
+    replayTo = sel.end - 1;
+    // Clamped the same way `slice` clamps it, so the line and the sound agree
+    // about where the playback began. With De-skew on the start of a selection
+    // can point a fifth of a second before anything recorded -- the picture is
+    // held back by that much -- and the sound then starts at the oldest sample
+    // there is.
+    const a = recorder.sampleForColumn(sel.lo);
+    replayFromSample = Math.max(a === null ? recorder.oldestSample : a,
+                                recorder.oldestSample);
+    replayStarted = ctx.currentTime;
+    replaySeconds = frames.length / ctx.sampleRate;
+    display.playhead = sel.lo;
+    showReplayControls();
+    say(`playing ${Math.round(replaySeconds * 1000)} mS of the picture`);
+}
+
+/// Stop, not pause. Nothing remembers where the sound had got to, so the next
+/// press starts at the beginning of the selection again -- which is what the
+/// button says it will do.
+function stopReplay() {
+    if (!isReplaying() && display.playhead === null) return;
+    if (replaySource) {
+        // Silenced before it is stopped. `stop()` takes effect at the next
+        // quantum either way, and resuming turns the recording back on within
+        // microseconds of this call: the tail must not be recorded as though it
+        // were the room.
+        try { replayGainNode.gain.value = 0; } catch {}
+        try { replaySource.onended = null; replaySource.stop(); } catch {}
+        try { replaySource.disconnect(); replayGainNode.disconnect(); } catch {}
+    }
+    replaySource = null;
+    replayGainNode = null;
+    replaySeconds = 0;
+    display.playhead = null;
+    showReplayControls();
+}
+
+/// The bottom of the travel is silence, not the quietest audible setting: a
+/// volume control that cannot reach zero is not a volume control.
+function replayGainLinear(db) {
+    if (db <= REPLAY_GAIN_RANGE[0] + 0.001) return 0;
+    return Math.pow(10, db / 20);
+}
+
+/// Move the line, and notice the end of the sound.
+///
+/// The clock rather than the node: `onended` would do, but it is one more thing
+/// that can arrive on behalf of a playback already replaced, and the frame is
+/// running anyway to move the line.
+function replayTick() {
+    if (!isReplaying()) {
+        if (display.playhead !== null) stopReplay();
+        return;
+    }
+    const elapsed = ctx.currentTime - replayStarted;
+    // Running out is one of the ways playback ends, and it ends the same way
+    // the button does.
+    if (elapsed >= replaySeconds) { stopReplay(); return; }
+    // The selection has to still be on the picture. Narrowing the window
+    // right-aligns what is drawn, so the left of a selection can scroll off
+    // while it is being played, and a line cannot follow columns that are no
+    // longer there.
+    const drawn = display.drawnColumns;
+    if (drawn && drawn.lo > replayFrom) { stopReplay(); return; }
+    const at = replayFromSample + Math.round(elapsed * ctx.sampleRate);
+    const g = recorder.columnForSample(at, replayFrom);
+    if (g === null) return;
+    // Never outside what was selected, however the arithmetic rounds.
+    display.playhead = Math.min(Math.max(g, replayFrom), replayTo);
+}
+
+$('playsel').onclick = () => { isReplaying() ? stopReplay() : startReplay(); };
+$('vol').oninput = e => {
+    S.replayGainDb = Math.round(Number(e.target.value));
+    // Live, unlike every other control's effect on a playback in progress. The
+    // others change how the picture is drawn; this one is the sound itself, and
+    // a volume that only took effect next time could not be set by ear.
+    if (replayGainNode) {
+        replayGainNode.gain.value = replayGainLinear(S.replayGainDb);
+    }
+    save();
+};
+// A click on the picture, or a grab of the close-up boundary, chooses what to
+// play -- so neither can be ignored while something is playing.
+display.onSelectionDisturbed = stopReplay;
+
 function frame(t) {
+    syncRecorder();
+    // What has scrolled off the left of the picture is audio nobody can select
+    // any more, and this is the whole of the memory policy.
+    const drawn = display.drawnColumns;
+    if (drawn) recorder.trim(drawn.lo);
+    replayTick();
     display.render();
     if (S.autoGain) {
         const shown = clampSens(S.sensDB - display.autoRef);

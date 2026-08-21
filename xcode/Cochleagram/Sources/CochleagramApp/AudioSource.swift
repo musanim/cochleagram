@@ -338,6 +338,11 @@ final class AudioSource {
     deinit { stop() }
 
     func stop() {
+        // Its own graph, so it survives everything below unless it is named.
+        // Nothing else here would take it down, and a playback left running
+        // over a source change would be audible over a picture it no longer
+        // belongs to.
+        stopReplay()
         input?.close()
         input = nil
 
@@ -504,5 +509,387 @@ final class AudioSource {
         meters.samples += frames
         meters.buffers += 1
         meters.lastFrames = frames
+    }
+
+    // MARK: - RePlay
+    //
+    // A second, much simpler graph: one buffer, scheduled whole, through a gain
+    // stage to the same output device a file would use. It never coexists with
+    // file playback -- the button that starts it is only on screen while live
+    // input is frozen -- so the two cannot fight over the device, and the
+    // channel map and device selection can be reused as they stand.
+
+    private var replayEngine: AVAudioEngine?
+    private var replayNode: AVAudioPlayerNode?
+    private var replayGain: AVAudioUnitEQ?
+    /// How long the scheduled buffer is, so the caller can tell when the
+    /// position has run off the end of it.
+    private(set) var replayLength: AVAudioFramePosition = 0
+
+    var isReplaying: Bool { replayNode?.isPlaying ?? false }
+
+    /// Start playing `frames` at `rate`. Returns false if the graph would not
+    /// start, in which case nothing is left running.
+    func startReplay(_ frames: UnsafeBufferPointer<Float>, rate: Double,
+                     gainDB: Double) -> Bool {
+        stopReplay()
+        guard !frames.isEmpty, rate > 0,
+              let format = AVAudioFormat(standardFormatWithSampleRate: rate,
+                                         channels: 1),
+              let buffer = AVAudioPCMBuffer(
+                  pcmFormat: format,
+                  frameCapacity: AVAudioFrameCount(frames.count)),
+              let dst = buffer.floatChannelData
+        else {
+            Log.say("REPLAY could not make a \(frames.count)-frame buffer "
+                    + "at \(Int(rate)) Hz")
+            return false
+        }
+        buffer.frameLength = AVAudioFrameCount(frames.count)
+        guard let src = frames.baseAddress else { return false }
+        memcpy(dst[0], src, frames.count * MemoryLayout<Float>.size)
+
+        let e = AVAudioEngine()
+        // Before anything is attached or connected, exactly as `startFile`
+        // does and for the reason written there: asking for the output node's
+        // audio unit is what instantiates it, and the device has to be chosen
+        // while it is still stopped. Touching `mainMixerNode` first would
+        // connect the mixer to the *default* device's format and then have the
+        // device changed underneath it.
+        routeOutput(e)
+
+        let node = AVAudioPlayerNode()
+        // One band, bypassed. The EQ is here for `globalGain` alone, which is
+        // in decibels and can be moved while the sound is running;
+        // `AVAudioPlayerNode.volume` would not do, being linear and stopping at
+        // unity, and a microphone recording often sits far enough below full
+        // scale that the only useful settings are above it. A band count of
+        // zero looks tidier and is nowhere documented as legal, and an
+        // Objective-C exception out of an initialiser cannot be caught in
+        // Swift -- so it is one band that does nothing.
+        let eq = AVAudioUnitEQ(numberOfBands: 1)
+        eq.bands[0].bypass = true
+        eq.globalGain = Self.replayGainClamp(gainDB)
+        e.attach(node)
+        e.attach(eq)
+        e.connect(node, to: eq, format: format)
+        e.connect(eq, to: e.mainMixerNode, format: format)
+
+        e.prepare()
+        applyChannelMap(e, quiet: true)
+        do {
+            try e.start()
+        } catch {
+            Log.say("REPLAY engine would not start: \(error)")
+            return false
+        }
+
+        // No completion handler. An `AVAudioPlayerNode` fires pending
+        // completions when it is stopped, so a handler is a message from a
+        // playback that may already have been replaced -- the same trap the
+        // file path is still carrying. The display link is polling the position
+        // every frame anyway to move the line, so it can see the end for
+        // itself.
+        node.scheduleBuffer(buffer, at: nil, options: [])
+        node.play()
+
+        replayEngine = e
+        replayNode = node
+        replayGain = eq
+        replayLength = AVAudioFramePosition(frames.count)
+        replayStarted = CACurrentMediaTime()
+        replaySeconds = Double(frames.count) / rate
+        Log.say("REPLAY \(frames.count) frames at \(Int(rate)) Hz, "
+                + String(format: "%.1f dB", gainDB))
+        return true
+    }
+
+    /// When it started and how long it is, so the end can be recognised without
+    /// asking the node. See `hasReplayFinished`.
+    private var replayStarted: CFTimeInterval = 0
+    private var replaySeconds: Double = 0
+
+    func stopReplay() {
+        // No early return on `replayEngine`: `isReplaying` is answered by
+        // `replayNode`, and a caller that trusted one field while this trusted
+        // the other could bounce between here and the delegate's own
+        // `stopReplay` without terminating. Idempotent instead.
+        let node = replayNode, engineToStop = replayEngine
+        // Silence it *now*, synchronously. Taking the graph down blocks, and is
+        // therefore deferred below -- but until it has gone the old buffer is
+        // still being rendered, and two things depend on the sound stopping
+        // when the caller says so rather than when the teardown gets round to
+        // it: resuming turns the microphone's recording back on within
+        // microseconds of this call, and pressing Play again builds a second
+        // graph on the same device. A gain parameter takes effect at the next
+        // render quantum, which is a fraction of what either of those would
+        // otherwise overlap by.
+        replayGain?.globalGain = -96
+        replayEngine = nil
+        replayNode = nil
+        replayGain = nil
+        replayLength = 0
+        replaySeconds = 0
+        guard node != nil || engineToStop != nil else { return }
+        // Both of these block until the render thread quiesces, and this is
+        // called from the display link -- a user-interactive thread waiting on
+        // a default-QoS one, which is the priority inversion the "Hang Risk"
+        // diagnostic reports. The references above are cleared synchronously so
+        // this object's state is consistent the instant this returns; only the
+        // blocking part is handed away, and the captured nodes keep themselves
+        // alive until it has finished with them. Same shape as
+        // `finishedPlayingFile`, and for the same reason.
+        DispatchQueue.global(qos: .utility).async {
+            node?.stop()
+            engineToStop?.stop()
+        }
+    }
+
+    /// Move the gain while the sound is running.
+    func setReplayGain(_ dB: Double) {
+        replayGain?.globalGain = Self.replayGainClamp(dB)
+    }
+
+    /// The bottom of the slider's travel is silence, not the quietest audible
+    /// setting: a volume control that cannot reach zero is not a volume
+    /// control. Written once so the live path and the starting path cannot
+    /// disagree about where that point is.
+    private static func replayGainClamp(_ dB: Double) -> Float {
+        if dB <= Settings.replayGainRange.lowerBound + 0.001 { return -96 }
+        return Float(min(max(dB, -96), 24))
+    }
+
+    /// How many frames of the buffer have been played, or nil when there is
+    /// nothing playing or the node has not yet rendered.
+    var replayFramePosition: AVAudioFramePosition? {
+        guard let node = replayNode, node.isPlaying,
+              let t = node.lastRenderTime,
+              let p = node.playerTime(forNodeTime: t),
+              p.isSampleTimeValid
+        else { return nil }
+        return max(0, p.sampleTime)
+    }
+
+    /// Whether the sound has run out.
+    ///
+    /// Wall clock, not the node. `AVAudioPlayerNode` can stop vending a player
+    /// time once its last scheduled buffer has drained, and the position is the
+    /// only other thing that would say the playback was over -- so a playback
+    /// left to finish by itself could hang with the line parked on the picture
+    /// and the button still saying Stop. The clock cannot fail that way. The
+    /// margin covers the output device's own buffering.
+    var hasReplayFinished: Bool {
+        guard replayEngine != nil, replaySeconds > 0 else { return false }
+        return CACurrentMediaTime() - replayStarted > replaySeconds + 0.25
+    }
+}
+
+/// The audio behind the picture.
+///
+/// Holds the samples the display was drawn from, and the arithmetic that turns
+/// a column of the picture into a position in them. Filled on the display
+/// link, from the engine's capture ring, so nothing here runs on the audio
+/// thread and nothing here has to be real-time safe.
+///
+/// See REPLAY-DESIGN.md for why the mapping is by engine column rather than by
+/// elapsed time.
+final class ReplayRecorder {
+
+    /// One stretch of recording at one column rate.
+    ///
+    /// A list of these rather than a single anchor, because two ordinary
+    /// actions break the correspondence without wiping the picture. Changing
+    /// the Speed detent changes how much audio a column stands for, and the
+    /// picture deliberately keeps what is already drawn at the old scale.
+    /// Resuming after a pause starts recording again after an interval that is
+    /// in neither the picture nor the ring. Either way, everything drawn before
+    /// the change still has to map correctly, so the old terms are kept rather
+    /// than replaced.
+    private struct Segment {
+        /// First engine column this segment describes.
+        var column: Int64
+        /// Where in the recording that column begins.
+        var sample: Int64
+        /// Input samples per engine column while it was in force.
+        var perColumn: Double
+    }
+
+    private var segments: [Segment] = []
+    private var samples: [Float] = []
+    /// Stream position of `samples[0]`: everything older has been trimmed.
+    private var base: Int64 = 0
+    /// Total samples ever taken, so a position means the same thing forever.
+    private(set) var written: Int64 = 0
+    private(set) var rate: Double = 0
+
+    var isEmpty: Bool { samples.isEmpty || segments.isEmpty }
+
+    /// Where the oldest sample still held sits in the stream. What a selection
+    /// reaching back further than the recording is clamped to.
+    var oldestSample: Int64 { base }
+
+    /// Throw everything away and start again -- a new input device, a new
+    /// engine, or a wiped picture.
+    func reset(rate: Double) {
+        segments.removeAll()
+        samples.removeAll()
+        base = 0
+        written = 0
+        self.rate = rate
+    }
+
+    /// Begin a new stretch: engine column `column` is the next one that will be
+    /// drawn, and it stands for audio that arrived `lagSamples` ago.
+    ///
+    /// Called when recording starts, when it resumes after a pause, when the
+    /// column rate changes, and when the display's lag changes -- which is what
+    /// De-skew does, by nearly two hundred milliseconds.
+    ///
+    /// The lag is folded into the segment's own origin rather than kept as a
+    /// term of its own, so every mapping downstream is the same arithmetic it
+    /// always was. It can put the origin before the start of the recording,
+    /// which is not an error: at the beginning of a stretch the first columns
+    /// really were drawn from audio nobody was keeping yet, and the callers
+    /// clamp.
+    func beginSegment(atColumn column: Int64, perColumn: Double,
+                      lagSamples: Int64) {
+        guard perColumn > 0 else { return }
+        let origin = written - lagSamples
+        // A segment that describes no columns yet is replaced rather than
+        // stacked: two of them at the same place would only be one, and Speed
+        // or De-skew can be changed twice while paused.
+        if let last = segments.last, last.column == column {
+            segments[segments.count - 1] =
+                Segment(column: column, sample: origin, perColumn: perColumn)
+            return
+        }
+        segments.append(Segment(column: column, sample: origin,
+                                perColumn: perColumn))
+    }
+
+    /// Take what the engine has captured.
+    func take(_ buf: UnsafeBufferPointer<Float>) {
+        guard !buf.isEmpty else { return }
+        samples.append(contentsOf: buf)
+        written += Int64(buf.count)
+    }
+
+    /// Where an engine column begins, in the recording.
+    func sample(forColumn g: Int64) -> Int64? {
+        guard let i = segments.lastIndex(where: { $0.column <= g })
+        else { return nil }
+        let s = segments[i]
+        let at = s.sample
+            + Int64((Double(g - s.column) * s.perColumn).rounded())
+        return at
+    }
+
+    /// Drop everything older than engine column `oldest`, which is the
+    /// left-hand edge of the picture.
+    ///
+    /// This is the whole of the memory policy. The recording is as long as the
+    /// picture is wide and no longer, so it grows with the Speed setting and
+    /// the window and needs no ceiling of its own: the worst case is the
+    /// coarsest Speed across the widest window, which is a couple of minutes.
+    func trim(olderThan oldest: Int64) {
+        guard let cut = sample(forColumn: oldest), cut > base else { return }
+        // Amortised. `removeFirst` on an array is a memmove of everything that
+        // survives, and this is called on every frame: at the coarsest Speed on
+        // a wide window that is tens of megabytes sixty times a second to let
+        // go of a few hundred samples. Waiting until a second's worth is dead
+        // makes it a hundredth as often for the same ceiling plus one second.
+        guard cut - base > Int64(max(rate, 1)) else { return }
+        let drop = Int(min(cut - base, Int64(samples.count)))
+        guard drop > 0 else { return }
+        samples.removeFirst(drop)
+        base += Int64(drop)
+        // The segment covering the new left edge has to stay; the ones entirely
+        // behind it describe audio nobody can reach any more.
+        if let keep = segments.lastIndex(where: { $0.column <= oldest }),
+           keep > 0 {
+            segments.removeFirst(keep)
+        }
+    }
+
+    /// The audio between two engine columns, exclusive of the last, handed to
+    /// `body` where it lies.
+    ///
+    /// A closure rather than an array: the caller copies straight into whatever
+    /// it will play from, where returning `[Float]` meant the selection was
+    /// copied twice on one display-link tick -- at the widest window and
+    /// coarsest Speed, tens of megabytes each way.
+    ///
+    /// Returns what `body` returns, or nil when none of the span is still held.
+    func withSamples<T>(from lo: Int64, to end: Int64,
+                        _ body: (UnsafeBufferPointer<Float>) -> T) -> T? {
+        guard end > lo, var b = sample(forColumn: end) else { return nil }
+        // The left-hand end is clamped up to the oldest sample still held
+        // rather than refused. The picture is deliberately kept across some of
+        // the things that restart the recording -- a change of input device, or
+        // of ERB -- so for one screen width afterwards the left of the picture
+        // is older than anything recorded. Playing what there is of it is the
+        // useful answer; refusing the whole selection because its first column
+        // predates the recording is not. A span lying *entirely* before the
+        // recording still fails, at the guard above.
+        let a = sample(forColumn: lo) ?? base
+
+        // A span across a De-skew seam can run backwards. Turning it on holds
+        // the picture back, so the stretch after the seam starts from audio the
+        // stretch before it already used, and for a selection narrower than the
+        // lag the right-hand end names an *earlier* sample than the left. There
+        // is no honest span between them. What there is, is the sound the left
+        // end names, for as long as the selection is wide on that side of the
+        // seam -- which is what a listener reading the left of the picture
+        // expects, and is never empty.
+        if b <= a, let s = segments.last(where: { $0.column <= lo }) {
+            b = a + Int64((Double(end - lo) * s.perColumn).rounded())
+        }
+        let from = Int(max(0, a - base))
+        let to = Int(min(Int64(samples.count), b - base))
+        guard to > from else { return nil }
+        return samples.withUnsafeBufferPointer { p in
+            body(UnsafeBufferPointer(rebasing: p[from..<to]))
+        }
+    }
+
+    /// The engine column a position in the recording belongs to -- the inverse
+    /// of `sample(forColumn:)`, for putting the playback line on the picture.
+    ///
+    /// Not a search on `sample`, which would be the obvious thing and is wrong.
+    /// Segments are ordered by column and monotone in column, but they are
+    /// **not** monotone in sample: turning De-skew on holds the picture back by
+    /// the apex's travel time, so the stretch that begins at the toggle starts
+    /// from audio that the stretch before it has already used. The two really
+    /// do overlap -- that is what the seam at the toggle is saying -- and a
+    /// search for the last segment starting at or before `at` would jump
+    /// forward the instant the new one began.
+    ///
+    /// So the walk is forward, from the stretch that `from` lies in, and it
+    /// steps only when `at` has passed the boundary *expressed in the current
+    /// stretch's own terms*. Columns are contiguous across a boundary even when
+    /// samples are not, which is what makes that well defined.
+    func column(forSample at: Int64, from: Int64) -> Int64? {
+        guard let start = segments.lastIndex(where: { $0.column <= from })
+        else { return nil }
+        var i = start
+        while i + 1 < segments.count {
+            let s = segments[i], next = segments[i + 1]
+            let boundary = s.sample
+                + Int64((Double(next.column - s.column) * s.perColumn).rounded())
+            guard at >= boundary else { break }
+            i += 1
+        }
+        let s = segments[i]
+        let g = s.column
+            + Int64((Double(at - s.sample) / s.perColumn).rounded())
+        // The line only ever moves forward, and `from` alone does not ensure
+        // it. Turning De-skew *off* is the mirror of turning it on: the picture
+        // stops being held back, so the audio between the boundary and the new
+        // stretch's origin belongs to no column at all, and extrapolating the
+        // new stretch's formula backwards over that gap lands inside the
+        // previous stretch's columns. Clamping to the stretch's own first
+        // column costs nothing in the overlap direction, where the answer is
+        // already past it.
+        return max(g, s.column, from)
     }
 }

@@ -186,6 +186,25 @@ final class CochleagramView: NSView {
     private var coherence = [Float]()
     private var columnRefs = [Float]()
 
+    /// Which engine column each screen column was drawn from.
+    ///
+    /// Carried so that a position on screen can be turned back into a position
+    /// in the recorded audio -- what RePlay needs, and the only way to get it
+    /// that survives the two things the picture routinely does to its own time
+    /// base. Elapsed time will not do: the picture is *not* wiped when the
+    /// Speed detent changes, because keeping what is already drawn is worth
+    /// more than the mixed scale costs, so the columns on either side of a
+    /// scale mark stand for different numbers of milliseconds and no single
+    /// figure describes the display. And with the close-up on there are two
+    /// time bases on screen at once by design. There is always, though, exactly
+    /// one engine column behind every screen column, whatever scale it was
+    /// drawn at -- so the close-up needs no special case here, and neither does
+    /// a scale change. See REPLAY-DESIGN.md.
+    ///
+    /// Shifted wherever `columnRefs` is shifted, and for the same reason: it is
+    /// anchored to content, not to the screen.
+    private var columnFine = [Int64]()
+
     /// How the levels currently look. Rebuilt incrementally as columns
     /// arrive, and wholesale when the mapping changes.
     private var pixels = [UInt8]()
@@ -373,6 +392,7 @@ final class CochleagramView: NSView {
             pixels = []
             levels = []
             columnRefs = []
+            columnFine = []
             marks.removeAll()
             return
         }
@@ -417,6 +437,10 @@ final class CochleagramView: NSView {
         var nextLevels = [Float](repeating: kSilentDB, count: w * height)
         var nextCoh = [Float](repeating: kNoCoherence, count: w * height)
         var nextRefs = [Float](repeating: 0, count: w)
+        // -1 for "no engine column was ever drawn here", which is what the
+        // freshly exposed columns of a widened window are. Distinct from 0,
+        // which is a real column: the first one after a wipe.
+        var nextFine = [Int64](repeating: -1, count: w)
         var keptFrom = w                 // first column that has to be rendered
         if width > 0, !pixels.isEmpty {
             // Keep the right-hand (most recent) part of the old image.
@@ -454,11 +478,28 @@ final class CochleagramView: NSView {
                     }
                 }
             }
-            nextRefs.withUnsafeMutableBufferPointer { d in
-                columnRefs.withUnsafeBufferPointer { sp in
-                    guard let dp = d.baseAddress, let s0 = sp.baseAddress else { return }
-                    memcpy(dp + (w - keep), s0 + (width - keep),
-                           keep * MemoryLayout<Float>.size)
+            // Length checked, like `columnFine` below. A raw memcpy out of an
+            // array shorter than `width` is an out-of-bounds read that shows up
+            // as a wrong exposure somewhere else entirely; no path produces one
+            // today, and this is a cheap way of keeping it that way.
+            if columnRefs.count == width {
+                nextRefs.withUnsafeMutableBufferPointer { d in
+                    columnRefs.withUnsafeBufferPointer { sp in
+                        guard let dp = d.baseAddress, let s0 = sp.baseAddress
+                        else { return }
+                        memcpy(dp + (w - keep), s0 + (width - keep),
+                               keep * MemoryLayout<Float>.size)
+                    }
+                }
+            }
+            if columnFine.count == width {
+                nextFine.withUnsafeMutableBufferPointer { d in
+                    columnFine.withUnsafeBufferPointer { sp in
+                        guard let dp = d.baseAddress, let s0 = sp.baseAddress
+                        else { return }
+                        memcpy(dp + (w - keep), s0 + (width - keep),
+                               keep * MemoryLayout<Int64>.size)
+                    }
                 }
             }
             // Seams are anchored to content, so they move with it.
@@ -495,6 +536,7 @@ final class CochleagramView: NSView {
         levels = nextLevels
         coherence = nextCoh
         columnRefs = nextRefs
+        columnFine = nextFine
         width = w
         // Whatever was just *allocated* has to be rendered, not assumed: the
         // newly exposed columns are silence, and silence is white on paper but
@@ -527,11 +569,18 @@ final class CochleagramView: NSView {
     /// drawn is worth more than the mixed scale costs.
     func clear() {
         clearMeasurement()
+        // Before the guard, not after: a wipe that found nothing to wipe has
+        // still ended the old numbering, and a recorder that missed the bump
+        // would go on mapping columns to audio through an anchor that no longer
+        // means anything.
+        contentEpoch &+= 1
+        playhead = nil
         guard height > 0, width > 0 else { return }
         fineIndex = 0
         levels = [Float](repeating: kSilentDB, count: width * height)
         coherence = [Float](repeating: kNoCoherence, count: width * height)
         columnRefs = [Float](repeating: 0, count: width)
+        columnFine = [Int64](repeating: -1, count: width)
         renderColumns(from: 0, count: width)
         marks.removeAll()
         needsDisplay = true
@@ -742,6 +791,12 @@ final class CochleagramView: NSView {
         }
         draggingBoundary = true
         measuring = false
+        // Dragging the boundary clears the measurement as soon as it moves, so
+        // it changes the selection just as surely as a click on the picture
+        // does -- and it is reached by a mouse-down that never gets as far as
+        // `beginMeasurement`. Announced here too, or a playback would carry on
+        // over a selection that had quietly become a different one.
+        onSelectionDisturbed?()
         dragGrab = p.x - bx
         // One mark for the whole drag, at the moment it starts: what is to the
         // left of it was drawn with the boundary somewhere else.
@@ -864,6 +919,12 @@ final class CochleagramView: NSView {
               n > 0, width > 0, height > 0
         else { return }
         let srcRef = autoExpose(src, columns: n)
+        // Belt and braces: everything below indexes it as `width` long, and it
+        // is written in more places than `columnRefs` is. A wrong length here
+        // would be an out-of-bounds crash rather than a wrong picture.
+        if columnFine.count != width {
+            columnFine = [Int64](repeating: -1, count: width)
+        }
 
         // Never more than half the window: the strip is now wide enough that
         // on a small window it could otherwise leave the ordinary picture a
@@ -888,17 +949,33 @@ final class CochleagramView: NSView {
                        take * height * MemoryLayout<Float>.size)
             }
             shiftPixels(0, width, take)
+            // The engine index of in[c] is `first + c`, so the columns that
+            // land are `first + skip ..< first + n`.
+            let firstIn = Int64(fineIndex)
             if take < width {
                 columnRefs.removeFirst(take)
                 columnRefs.append(contentsOf: (0..<take).map { srcRef[skip + $0] })
+                columnFine.removeFirst(take)
+                columnFine.append(contentsOf:
+                    (0..<take).map { firstIn + Int64(skip + $0) })
             } else {
                 columnRefs = (0..<take).map { srcRef[skip + $0] }
+                columnFine = (0..<take).map { firstIn + Int64(skip + $0) }
             }
             marks = marks.compactMap {
                 var m = $0; m.column -= take
                 return m.column >= 0 ? m : nil
             }
             renderColumns(from: width - take, count: take)
+            // Advanced on this path too, now that it names the audio as well as
+            // the close-up's delay line. It used to move only when the close-up
+            // was on, which was harmless while nothing else read it; leaving it
+            // at zero here would give every column of an ordinary picture the
+            // same engine index, and RePlay would play one instant of sound
+            // however wide a span was selected. Both ways into and out of the
+            // two-time-base mode go through `setCloseUp`, which resets it and
+            // wipes, so the two readings can never be mixed on one screen.
+            fineIndex += n
             lastTake = take
             if take > maxTake { maxTake = take }
             return
@@ -1000,8 +1077,16 @@ final class CochleagramView: NSView {
             shiftPixels(0, mainHi, put)
             if put < mainHi {
                 for x in 0..<(mainHi - put) { columnRefs[x] = columnRefs[x + put] }
+                for x in 0..<(mainHi - put) { columnFine[x] = columnFine[x + put] }
             }
             for i in 0..<put { columnRefs[mainHi - put + i] = keepR[m - put + i] }
+            // A promoted column keeps the engine index it entered the strip
+            // with -- `promoteG` is that index. So a column of the main picture
+            // names the first of the `aggregate` engine columns it stands for,
+            // which is where in the audio it begins.
+            for i in 0..<put {
+                columnFine[mainHi - put + i] = Int64(promoteG[m - put + i])
+            }
         }
 
         // Close-up region: it holds the last `near` columns of the stream,
@@ -1023,8 +1108,13 @@ final class CochleagramView: NSView {
         shiftPixels(mainHi, width, fill)
         if fill < near {
             for x in mainHi..<(width - fill) { columnRefs[x] = columnRefs[x + fill] }
+            for x in mainHi..<(width - fill) { columnFine[x] = columnFine[x + fill] }
         }
         for c in 0..<fill { columnRefs[width - fill + c] = srcRef[skip + c] }
+        // One engine column each, so the index is the stream's own.
+        for c in 0..<fill {
+            columnFine[width - fill + c] = Int64(first + skip + c)
+        }
 
         // Marks travel at whichever rate the region they are in moves. One
         // that crosses the boundary lands on it: the alternative is to lose
@@ -1428,6 +1518,16 @@ final class CochleagramView: NSView {
         needsDisplay = true
     }
 
+    /// Something has changed what a playback would be playing -- a click that
+    /// begins a new measurement, or a grab of the close-up boundary, which
+    /// clears the measurement as soon as it moves.
+    ///
+    /// RePlay listens, because the measurement is the thing it plays: leaving
+    /// the sound running while the span underneath it changed would put the
+    /// line across something nobody chose. Either gesture is therefore a Stop,
+    /// and whatever the gesture goes on to do, it does.
+    var onSelectionDisturbed: (() -> Void)?
+
     private func beginMeasurement(at p: CGPoint) {
         measurement = Measurement(anchor: column(atX: p.x, plotRect),
                                   cursor: nil, y: p.y)
@@ -1435,6 +1535,7 @@ final class CochleagramView: NSView {
         hover = p
         frequencyHeldBack = true
         needsDisplay = true
+        onSelectionDisturbed?()
     }
 
     private func extendMeasurement(to p: CGPoint) {
@@ -1456,6 +1557,140 @@ final class CochleagramView: NSView {
     /// True when there is something for Escape to dismiss, so the delegate can
     /// leave the key alone when there is not.
     var hasMeasurement: Bool { measurement != nil }
+
+    // MARK: - RePlay: from the picture back to the audio
+    //
+    // The picture is several seconds of sound. These turn a position on it
+    // back into a position in the recording, so that what is on screen can be
+    // heard. Everything here is in *engine columns*: the one coordinate that
+    // is still meaningful when the close-up puts two time scales on the screen
+    // at once, and when a change of Speed leaves the older half of the picture
+    // at a scale the newer half is not. See REPLAY-DESIGN.md.
+
+    /// Bumped whenever the engine-column numbering starts again -- which is
+    /// whenever the picture is wiped. Anything still holding a column index
+    /// from before the bump is holding a number that now names other audio.
+    private(set) var contentEpoch = 0
+
+    /// The index the next engine column to arrive will have. What a recorder
+    /// pairs with its own position to line the two up.
+    var nextEngineColumn: Int64 { Int64(fineIndex) }
+
+    /// Playback position as an engine column, or nil when nothing is playing.
+    var playhead: Int64? {
+        didSet { if playhead != oldValue { needsDisplay = true } }
+    }
+
+    /// The engine column drawn at a fractional screen column, or nil where
+    /// nothing has been drawn yet.
+    private func engineColumn(at u: Double) -> Int64? {
+        guard width > 0, columnFine.count == width else { return nil }
+        let x = min(max(Int(u.rounded(.down)), 0), width - 1)
+        let g = columnFine[x]
+        return g >= 0 ? g : nil
+    }
+
+    /// The oldest and newest engine columns anywhere on screen.
+    ///
+    /// Not simply the two ends of the array: after a wipe, or on a window that
+    /// has just been widened, the left of the picture is columns that were
+    /// never drawn, and playing from there would begin with silence that is not
+    /// in the recording.
+    var drawnColumns: (lo: Int64, hi: Int64)? {
+        guard width > 0, columnFine.count == width else { return nil }
+        guard let lo = columnFine.first(where: { $0 >= 0 }),
+              let hi = columnFine.last(where: { $0 >= 0 }), hi >= lo
+        else { return nil }
+        return (lo, hi)
+    }
+
+    /// How much of the stream one screen column stands for.
+    ///
+    /// One engine column in the close-up strip, `aggregate` of them in the main
+    /// picture. The distinction matters at the right-hand end of a selection: a
+    /// main-picture column *names* the first of the engine columns it draws, so
+    /// a selection that stopped at that name would be short by the rest of them
+    /// -- at aggregate 8, a single column would play an eighth of what it
+    /// shows.
+    private func engineSpan(atScreenColumn x: Int) -> Int64 {
+        let near = min(closeUpColumns, max(0, width / 2))
+        if near > 0 && x >= width - near { return 1 }
+        return Int64(max(1, aggregate))
+    }
+
+    /// The screen column a fractional position falls in, clamped to the picture.
+    private func screenIndex(at u: Double) -> Int {
+        min(max(Int(u.rounded(.down)), 0), max(0, width - 1))
+    }
+
+    /// What Play Selection would play: the first engine column, and one past
+    /// the last.
+    ///
+    /// The measurement's three states are the three playback modes, which is
+    /// why RePlay has no selection of its own: no lines plays the width of the
+    /// picture, one line plays from there to the right-hand edge, two lines
+    /// play what is between them. A selection that could disagree with what is
+    /// drawn would be a second thing to keep in step.
+    ///
+    /// The upper bound is exclusive and already extended past the last column
+    /// by that column's own span, so a one-column selection is a column's worth
+    /// of sound rather than none.
+    var selectionColumns: (lo: Int64, end: Int64)? {
+        guard let drawn = drawnColumns, width > 0 else { return nil }
+        let lastX = width - 1
+        let wholePicture = (drawn.lo, drawn.hi + engineSpan(atScreenColumn: lastX))
+        guard let m = measurement else { return wholePicture }
+
+        let ax = screenIndex(at: m.anchor)
+        // Where a line stands over picture that was never drawn, the sound it
+        // would name does not exist. Undrawn columns are only ever at the left
+        // -- a wipe, or a window just widened -- so both ends fall back to the
+        // oldest column there is, never to the newest: falling back to the
+        // right-hand edge would turn a leftward drag into a rightward
+        // selection.
+        let a = engineColumn(at: m.anchor) ?? drawn.lo
+        guard let c = m.cursor else {
+            return (a, drawn.hi + engineSpan(atScreenColumn: lastX))
+        }
+        let bx = screenIndex(at: c)
+        let b = engineColumn(at: c) ?? drawn.lo
+        let hiX = a <= b ? bx : ax
+        return (min(a, b), max(a, b) + engineSpan(atScreenColumn: hiX))
+    }
+
+    /// Where an engine column sits on screen, as a fractional screen column.
+    ///
+    /// Interpolated inside whichever column it lands in, because in the main
+    /// picture one column stands for `aggregate` engine columns and a line that
+    /// only ever sat on column boundaries would advance in visible jerks at the
+    /// coarser Speed settings. `columnFine` is non-decreasing left to right in
+    /// both regions, so this is a binary search.
+    private func screenColumn(forEngine g: Int64) -> Double? {
+        guard width > 0, columnFine.count == width else { return nil }
+        guard let first = columnFine.firstIndex(where: { $0 >= 0 }),
+              g >= columnFine[first] else { return nil }
+        var lo = first, hi = width - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if columnFine[mid] <= g { lo = mid } else { hi = mid - 1 }
+        }
+        let g0 = columnFine[lo]
+        // A wipe with the close-up open refills the main region and the strip
+        // from opposite ends, so for a fraction of a second there is a run of
+        // never-drawn columns *between* two runs of real ones, and the search
+        // above can land in it. Nothing sensible can be drawn against a column
+        // that has no engine column behind it.
+        guard g0 >= 0 else { return nil }
+        // How much of the stream this column stands for. Taken from the next
+        // column along where there is one -- which is right across the close-up
+        // boundary too, where the two regions' widths differ -- and from the
+        // region's own rate at the right-hand edge, where there is no next.
+        let near = min(closeUpColumns, max(0, width / 2))
+        var span = Int64(lo >= width - near && near > 0 ? 1 : max(1, aggregate))
+        if lo + 1 < width, columnFine[lo + 1] > g0 { span = columnFine[lo + 1] - g0 }
+        let frac = Double(g - g0) / Double(max(Int64(1), span))
+        return Double(lo) + min(max(frac, 0), 1)
+    }
 
     // MARK: converting a position into a quantity
 
@@ -1535,7 +1770,21 @@ final class CochleagramView: NSView {
                 drawDimension(ctx, plot, m.anchor, c, m.y, ink)
             }
         }
+        // On top of the measurement, and a different colour from it: the orange
+        // lines say where the sound will be taken from, and this one says where
+        // in it the ear has got to. Two statements about the same axis, so they
+        // must not be mistakable for each other.
+        if let g = playhead, let u = screenColumn(forEngine: g) {
+            drawMeasureLine(ctx, plot, at: u, Self.playheadInk)
+        }
     }
+
+    /// Violet. Far enough from the orange of the measurement to be told apart
+    /// at a glance, and from the red seam and the green end-of-file mark. Named
+    /// here rather than written at the point of use so the browser has one
+    /// number to match.
+    static let playheadInk = NSColor(srgbRed: 0.55, green: 0.24, blue: 0.95,
+                                     alpha: 1.0)
 
     /// The horizontal line, with its frequency at the left end.
     ///

@@ -64,6 +64,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var modePopup: NSPopUpButton!
     private var pauseButton: NSButton!
 
+    // ---- RePlay ---------------------------------------------------------
+    //
+    // Hearing what is on screen. Only ever offered on a frozen picture from
+    // live input: a file is already audible and already on disk, so a second
+    // way to play it would be two controls doing one job.
+    /// Named for what it plays, not for the feature: `replayButton` is already
+    /// taken by the button that plays the *file* again, and the two are
+    /// different enough that sharing a name would be a trap.
+    private var selectionButton: NSButton!
+    private var selectionSlider: NSSlider!
+    private var selectionDivider: NSView!
+    /// The samples the picture was drawn from, and the arithmetic that turns a
+    /// column back into a position in them.
+    private let recorder = ReplayRecorder()
+    /// Where the sound started, in engine columns, so the moving line can be
+    /// placed without asking the audio graph what it is playing.
+    private var replayFromColumn: Int64 = 0
+    private var replayToColumn: Int64 = 0
+    /// Where in the recording the sound began, taken once at the start.
+    private var replayFromSample: Int64 = 0
+    /// The picture's numbering when recording began. A wipe restarts it, and a
+    /// column index from before the wipe names other audio.
+    private var recordedEpoch = -1
+    /// What the recorder was last told a column is worth, so a change of Speed
+    /// can be noticed without asking every frame.
+    private var recordedPerColumn = 0.0
+    /// And how far behind the sound the picture was, which De-skew changes by
+    /// nearly two hundred milliseconds. `-1` is "not yet asked".
+    private var recordedLag: Int64 = -1
+
     /// Settings lives in its own window rather than the toolbar. Held so it
     /// survives being closed -- with `isReleasedWhenClosed` left at its
     /// default, reopening a closed window is a use-after-free.
@@ -147,7 +177,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func redrawTick(_ sender: AnyObject?) { frameTick() }
 
     private func frameTick() {
+        captureTick()
         view.tick()
+        // What has scrolled off the left of the picture is audio nobody can
+        // select any more, and this is the whole of the memory policy: the
+        // recording is as long as the picture is wide.
+        if let drawn = view.drawnColumns { recorder.trim(olderThan: drawn.lo) }
+        replayTick()
         // The end of the file, as the audio defines it: the frame after the
         // last one was fed to the cascade. Noticed here rather than signalled
         // from the audio thread, which is not a place to be scheduling work.
@@ -326,7 +362,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // seam to mark and drawing one would be a lie in the other direction.
         if paused && live { view.markSeam() }
 
+        // Resuming starts the picture moving again and starts recording over
+        // what was being played, so it is the one control that must interrupt.
+        //
+        // *Before* capture is turned back on, not after. Stopping a playback is
+        // not instantaneous -- the graph has its own buffered latency to drain
+        // -- and with the microphone already recording, the tail of the
+        // selection would come back in through it and be written into the ring
+        // as though it were the room.
+        if !paused {
+            stopReplay()
+            // A new stretch: the interval just skipped is in neither the
+            // picture nor the recording, so the old terms no longer describe
+            // what arrives next.
+            recordedPerColumn = 0
+        }
+        // Recording follows the picture exactly. Nothing is kept while the
+        // display is frozen, so the recording skips the same interval the
+        // picture skips and a selection spanning the seam plays straight across
+        // it -- the join the red line marks, and no gap to reason about. It
+        // also keeps the microphone from recording the playback it is about to
+        // hear out of the speakers. See REPLAY-DESIGN.md.
+        cochlea?.capturing = live && !paused
+
         showPauseButton()
+        showReplayControls()
         report(paused
                ? (live ? "Paused — the red line is where time will jump."
                        : "Paused — space resumes.")
@@ -507,6 +567,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         topRow.addArrangedSubview(divider())
 
+        // ---- RePlay ------------------------------------------------------
+        //
+        // A group of two between the display's controls and the file's, with a
+        // line on each side: the divider above is the left one, and the button
+        // and its volume belong together because neither is any use alone.
+        //
+        // Hidden rather than disabled when it does not apply. A disabled
+        // control is an invitation with a reason to find; this one applies only
+        // to a frozen live picture, which is a state the user is already in or
+        // not, and a greyed-out slider beside it would say nothing.
+        selectionButton = button(replayIdleTitle, #selector(replayPressed(_:)))
+        // Pinned at the width of the longer title, so it does not shrink to
+        // "Stop" and grow again. A button that changes size when it changes
+        // what it says moves everything to the right of it, and the thing you
+        // are about to press a second time is not where you just pressed it.
+        // Measured rather than written down: the number would be wrong the
+        // moment the title, the font or the control size changed.
+        selectionButton.widthAnchor.constraint(
+            equalToConstant: selectionButton.intrinsicContentSize.width)
+            .isActive = true
+        selectionButton.toolTip =
+            "Play the sound the picture was drawn from. With no measurement "
+          + "lines this is the whole width of the display; with one line it "
+          + "starts there; with two it plays what is between them."
+        topRow.addArrangedSubview(selectionButton)
+
+        selectionSlider = NSSlider(value: Settings().replayGainDB,
+                                   minValue: Settings.replayGainRange.lowerBound,
+                                   maxValue: Settings.replayGainRange.upperBound,
+                                   target: self,
+                                   action: #selector(replayGainChanged(_:)))
+        selectionSlider.toolTip = "How loud. Unity -- the level the microphone "
+                                + "heard -- is towards the right; the far left "
+                                + "is silent."
+        selectionSlider.widthAnchor.constraint(equalToConstant: 110)
+            .isActive = true
+        topRow.addArrangedSubview(selectionSlider)
+
+        // Held, because it is hidden and shown with the pair it closes.
+        selectionDivider = divider()
+        topRow.addArrangedSubview(selectionDivider)
+
+        // Nothing is frozen at launch, and nothing has been recorded. Set here
+        // as well as in `showReplayControls` because the window is on screen
+        // before the first frame tick.
+        selectionButton.isHidden = true
+        selectionSlider.isHidden = true
+        selectionDivider.isHidden = true
+
         // No "Live Input" button. The device menu in Settings starts live
         // input on whatever you choose, and two controls doing the same job
         // is how they came to disagree: the button ignored the menu and
@@ -598,6 +707,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.applyCloseUp()          // the divisor changes with the width
             self.save()
         }
+        // A click on the picture chooses what to play, so it cannot also be
+        // ignored while something is playing.
+        view.onSelectionDisturbed = { [weak self] in self?.stopReplay() }
 
         closeUpPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         closeUpPopup.target = self
@@ -1127,6 +1239,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.fileTornDown = false
                 self.fileEndDeadline = nil
                 self.view.isPaused = false
+                // Live input is the only source RePlay offers, so this is
+                // where keeping the audio starts. The recorder itself is
+                // reset by `syncRecorder`, which notices that a new engine
+                // has restarted the picture's numbering.
+                self.stopReplay()
+                self.recorder.reset(rate: self.cochlea?.inputRate ?? 0)
+                self.recordedPerColumn = 0
+                // A new engine counts its own drops from zero. Re-seeded here
+                // as well as in `syncRecorder`, because the picture is kept
+                // when the tap count is unchanged and neither the epoch nor the
+                // rate need have moved -- an ERB change is exactly that.
+                self.seenDroppedColumns = self.cochlea?.droppedColumns ?? 0
+                self.seenDroppedInput = self.cochlea?.droppedInput ?? 0
+                self.cochlea?.capturing = true
                 self.showCurrentDevice()
                 // The file is gone, but it is still what Replay would play,
                 // so the name and the button stay as they were.
@@ -1185,7 +1311,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Set before starting: a very short file can finish before this
             // line would otherwise be reached.
             audio.onFinish = { [weak self] in self?.fileDidFinish() }
+            // RePlay and file playback are either/or. A file is already audible
+            // and already on disk, so keeping a second copy of it would be
+            // paying for something nobody can ask for.
+            stopReplay()
             try audio.startFile(url: url) { makeCochlea(inputRate: $0, join: join) }
+            // After the throw, not before: a file that fails to open should
+            // cost nothing, and throwing the live recording away on the way to
+            // an error message would lose the picture's sound for no reason.
+            recorder.reset(rate: 0)
+            cochlea?.capturing = false
             lastFileURL = url
             hasPlayedThrough = false
             paused = false
@@ -1532,6 +1667,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         replayButton.isHidden = lastFileURL == nil || !hasPlayedThrough
         showPauseButton()
+        // In the same place as the rest of the transport, so there is one
+        // answer to "which buttons are on screen" rather than two.
+        showReplayControls()
     }
 
     /// The transport convention: the button shows what pressing it will do,
@@ -1566,6 +1704,242 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func pauseButtonPressed(_ sender: Any) { togglePause() }
+
+    // MARK: - RePlay
+
+    private var replayIdleTitle: String { "Play Selection" }
+
+    /// On screen only while a live picture is frozen. See the note where the
+    /// controls are built for why this is hidden rather than disabled.
+    private func showReplayControls() {
+        guard selectionButton != nil else { return }
+        let live = !audio.isFilePlayback
+        let show = live && paused && !recorder.isEmpty
+        if !show { stopReplay() }
+        selectionButton.isHidden = !show
+        selectionSlider.isHidden = !show
+        selectionDivider.isHidden = !show
+        selectionButton.title = audio.isReplaying ? "Stop" : replayIdleTitle
+    }
+
+    @objc private func replayPressed(_ sender: Any) {
+        if audio.isReplaying {
+            stopReplay()
+        } else {
+            startReplay()
+        }
+    }
+
+    @objc private func replayGainChanged(_ sender: NSSlider) {
+        settings.replayGainDB = sender.doubleValue.rounded()
+        // Live, unlike every other control's effect on a playback in progress.
+        // The others change how the picture is drawn; this one is the sound
+        // itself, and a volume that only took effect next time would be a
+        // volume control nobody could set by ear.
+        audio.setReplayGain(settings.replayGainDB)
+        save()
+    }
+
+    private func startReplay() {
+        guard let sel = view.selectionColumns, let c = cochlea else { return }
+        // No refusal when the volume is at the bottom of its travel. It plays
+        // silently, the line moves, and that is exactly what a volume control
+        // at zero should do; refusing instead would be a second, invisible
+        // rule about a control whose position already says what it does.
+        //
+        // `sel.end` is one past the last column, extended by that column's own
+        // span, so a one-column selection is a column's worth of sound rather
+        // than none. The samples are handed over where they lie and copied once,
+        // into the playback buffer.
+        let started = recorder.withSamples(from: sel.lo, to: sel.end) { frames in
+            (frames.count,
+             audio.startReplay(frames, rate: c.inputRate,
+                               gainDB: settings.replayGainDB))
+        }
+        guard let (count, ok) = started else {
+            report("That part of the picture is no longer in the recording.",
+                   isProblem: true)
+            return
+        }
+        guard ok else {
+            report("Could not start playback.", isProblem: true)
+            return
+        }
+        replayFromColumn = sel.lo
+        replayToColumn = sel.end - 1
+        // Where the sound starts, taken once. The recorder trims as the picture
+        // scrolls, and asking again later can find the segment gone -- the
+        // audio itself is safe, having been copied into the playback buffer
+        // already.
+        // Clamped the same way `withSamples` clamps it, so the line and the
+        // sound agree about where the playback began. With De-skew on, the
+        // start of a selection can point a fifth of a second before anything
+        // that was recorded -- the picture is held back by that much, so its
+        // leftmost columns were drawn from audio that predates the recording --
+        // and the sound then starts at the oldest sample there is.
+        replayFromSample = max(recorder.sample(forColumn: sel.lo)
+                               ?? recorder.oldestSample,
+                               recorder.oldestSample)
+        view.playhead = sel.lo
+        showReplayControls()
+        let ms = Double(count) / c.inputRate * 1000
+        report(String(format: "Playing %.0f mS of the picture.", ms))
+    }
+
+    /// Stop, not pause. Nothing remembers where the sound had got to, so the
+    /// next press starts at the beginning of the selection again -- which is
+    /// what the button says it will do.
+    private func stopReplay() {
+        guard audio.isReplaying || view.playhead != nil else { return }
+        audio.stopReplay()
+        view.playhead = nil
+        showReplayControls()
+    }
+
+    /// Keep the recorder's arithmetic in step with the picture's.
+    ///
+    /// Two things break the correspondence without wiping anything: a change of
+    /// Speed, which changes how much audio a column stands for, and a resume,
+    /// which starts recording again after an interval that is in neither the
+    /// picture nor the recording. Both open a new segment. A wipe is different
+    /// in kind -- the numbering itself starts again -- so it starts the whole
+    /// recording again.
+    private func syncRecorder() {
+        guard let c = cochlea else { return }
+        // A change of input device keeps the picture when the tap count is
+        // unchanged -- which is the ordinary case -- so the epoch alone would
+        // not notice it, and everything already recorded is at the old device's
+        // rate. Playing that back at the new one would pitch-shift the older
+        // half of a selection. The rate is therefore part of what makes a
+        // recording the same recording.
+        if view.contentEpoch != recordedEpoch || c.inputRate != recorder.rate {
+            stopReplay()
+            recorder.reset(rate: c.inputRate)
+            recordedEpoch = view.contentEpoch
+            recordedPerColumn = 0
+            // A replaced engine starts its own counters at zero, which would
+            // otherwise read as a drop on the next tick.
+            seenDroppedColumns = c.droppedColumns
+            seenDroppedInput = c.droppedInput
+            // The button's visibility depends on the recorder having something
+            // in it, and a wipe while paused is reachable -- changing Speed, or
+            // closing the close-up. Without this the button would sit there
+            // over an empty recorder, doing nothing when pressed.
+            showReplayControls()
+        }
+        let perColumn = c.inputRate * c.columnMilliseconds / 1000
+        // How far behind the sound the picture is. De-skew moves this by nearly
+        // two hundred milliseconds -- it holds every tap back to the slowest --
+        // and it can be switched at any time without wiping what is drawn, so
+        // the columns on either side of the seam it leaves stand for audio at
+        // two different offsets. Noticed here, like a change of Speed, and for
+        // the same reason: a new stretch, with the old terms kept for the
+        // columns that were drawn under them.
+        let lag = Int64((c.displayLagMS / 1000 * c.inputRate).rounded())
+        if perColumn > 0, perColumn != recordedPerColumn || lag != recordedLag {
+            recorder.beginSegment(atColumn: view.nextEngineColumn,
+                                  perColumn: perColumn, lagSamples: lag)
+            recordedPerColumn = perColumn
+            recordedLag = lag
+        }
+    }
+
+    /// Drops seen so far, so a gap in either stream can be noticed.
+    private var seenDroppedColumns: UInt64 = 0
+    private var seenDroppedInput: UInt64 = 0
+
+    /// Take what the engine captured, and let go of what has scrolled off.
+    ///
+    /// Before `view.tick()`, so the samples behind a column are already held by
+    /// the time the column itself is drawn.
+    private func captureTick() {
+        guard let c = cochlea else { return }
+        // Before the guard below, not after. A wipe or a change of Speed while
+        // the picture is frozen has to be noticed even though nothing is being
+        // recorded then, or the terms in force when recording resumes would be
+        // the ones from before it stopped.
+        syncRecorder()
+
+        // The two streams drop independently and to different depths -- the
+        // column ring holds a thousand columns, the capture ring four seconds
+        // -- so anything that stalls the display link, a minimised window most
+        // obviously, loses different amounts of each. The picture already marks
+        // that as a seam; without the same notice here the recording would go
+        // on being mapped by terms that no longer describe it, and the sound
+        // would be confidently wrong by seconds with nothing to say so.
+        let dc = c.droppedColumns, di = c.droppedInput
+        if dc != seenDroppedColumns || di != seenDroppedInput {
+            // Not the difference. These are the *engine's* counters, and a new
+            // engine starts them again at zero while the picture is kept -- an
+            // ERB change does exactly that -- so the new value can be smaller
+            // than the remembered one, and an unsigned subtraction there is a
+            // trap, not a negative number.
+            Log.say("REPLAY re-anchoring: a gap in the picture or the "
+                    + "recording (\(seenDroppedColumns)->\(dc) columns, "
+                    + "\(seenDroppedInput)->\(di) samples)")
+            seenDroppedColumns = dc
+            seenDroppedInput = di
+            stopReplay()
+            c.drainInput { _ in }        // whatever survived is unplaceable
+            recordedPerColumn = 0        // and the next arrival starts afresh
+            return
+        }
+
+        // Kept empty while it is not wanted. Turning capture off does not flush
+        // the ring, so whatever the audio thread pushed between the last drain
+        // and the pause would otherwise sit there and be handed over on the
+        // first tick after the resume -- audio from before the join, spliced
+        // into the segment that begins after it, whose columns were thrown
+        // away. The same residue would cross a live/file/live round trip.
+        guard c.capturing else {
+            c.drainInput { _ in }
+            return
+        }
+        c.drainInput { recorder.take($0) }
+    }
+
+    /// Move the line, and notice the end of the sound.
+    ///
+    /// Polled rather than driven by a completion handler. An
+    /// `AVAudioPlayerNode` fires pending completions when it is stopped, so a
+    /// handler can arrive on behalf of a playback that has already been
+    /// replaced; the link is running anyway to move the line.
+    private func replayTick() {
+        guard audio.isReplaying else {
+            // The graph can also be taken down from underneath this -- opening
+            // a file, or changing the input device, stops everything the audio
+            // side owns. Catching it here rather than at each of those places
+            // means a line cannot be left behind on the picture by a path
+            // nobody thought to name.
+            if view.playhead != nil { stopReplay() }
+            return
+        }
+        // The clock, which cannot stop reporting, before the node's position,
+        // which can once its buffer has drained.
+        if audio.hasReplayFinished { stopReplay(); return }
+        // The selection has to still be on the picture. Narrowing the window
+        // right-aligns what is drawn, so the left of a selection can scroll off
+        // while it is being played, and a line cannot follow columns that are
+        // no longer there.
+        if let drawn = view.drawnColumns, drawn.lo > replayFromColumn {
+            stopReplay()
+            return
+        }
+        guard let pos = audio.replayFramePosition else { return }
+        // Running out is one of the ways playback ends, and it ends the same
+        // way the button does: the line goes, and the next press starts at the
+        // beginning of the selection again.
+        if pos >= audio.replayLength {
+            stopReplay()
+            return
+        }
+        guard let g = recorder.column(forSample: replayFromSample + pos,
+                                      from: replayFromColumn)
+        else { return }
+        // Never outside what was selected, however the arithmetic rounds at
+        // either end.
+        view.playhead = min(max(g, replayFromColumn), replayToColumn)
+    }
 
     /// The device the menu is showing, which is the one the user last chose.
     private var selectedDeviceID: AudioDeviceID? {
@@ -1805,6 +2179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         autoBox.state = settings.autoGain ? .on : .off
         sensSlider.doubleValue = settings.sensDB
         rangeSlider.doubleValue = settings.rangeDB
+        selectionSlider.doubleValue = settings.replayGainDB
         // Forget what the knob was last shown, having just overwritten it with
         // the raw setting. Without this, `showAutoSensitivity` recomputes the
         // same reference-corrected value it wrote before, finds it unchanged,
@@ -1871,6 +2246,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.displayMode    = d.displayMode
         settings.closeUpSpanMS  = d.closeUpSpanMS
         settings.closeUpColumns = d.closeUpColumns
+        // Volume is a display control in the sense that matters here: it is on
+        // the toolbar and it is one of the values the two apps have to agree
+        // on. Applied to any sound already running, so the button's effect is
+        // audible rather than only stored.
+        settings.replayGainDB   = d.replayGainDB
+        audio.setReplayGain(settings.replayGainDB)
 
         showSettingsInControls()
         applyToEngine()

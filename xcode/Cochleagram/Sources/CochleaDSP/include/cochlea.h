@@ -123,6 +123,41 @@ int cochlea_pull_columns(CochleaEngine *e, float *levels, float *coherence,
  *  as a health check while tuning buffer sizes; should stay at zero.      */
 uint64_t cochlea_dropped_columns(const CochleaEngine *e);
 
+/* ---- keeping the input, so the picture can be heard ---------------------- */
+
+/*  The display holds several seconds of sound as a picture.  With capture on,
+ *  the engine also keeps the samples that picture was drawn from, in a second
+ *  single-producer / single-consumer ring, so a host can offer to play back
+ *  what is on screen.
+ *
+ *  Off by default: a host that does not drain the ring would only be paying
+ *  for a copy nobody reads.
+ *
+ *  What goes in is the input exactly as handed to cochlea_process() -- the
+ *  host's rate, before the resampler, before the middle ear.  Not the internal
+ *  signal: the point is to reproduce what was heard, and the cascade's input is
+ *  the last place that is still true.
+ *
+ *  Enabling and disabling are the host's way of saying which audio belongs to
+ *  the picture.  A display frozen on live input throws away the columns that
+ *  arrive while it is frozen; turning capture off at the same moment makes the
+ *  ring skip exactly the same interval, so the two stay in step across the join
+ *  with no gap to reason about at either end.  The change takes effect at the
+ *  next cochlea_process() call, so up to one buffer of audio can cross it. */
+void cochlea_set_capture(CochleaEngine *e, int enabled);
+
+/*  Whether capture is on.                                                 */
+int cochlea_capture_enabled(const CochleaEngine *e);
+
+/*  Copy up to `max` captured samples.  Drawing thread; non-blocking; returns
+ *  the number written, 0 if none are waiting.                             */
+int cochlea_pull_input(CochleaEngine *e, float *out, int max);
+
+/*  How many captured samples were dropped because the consumer fell behind.
+ *  The ring holds several seconds, so this only moves when the consumer stops
+ *  entirely -- a minimised window, which also drops columns.              */
+uint64_t cochlea_dropped_input(const CochleaEngine *e);
+
 /*  Peak input level since the last call, linear.  For a level meter.      */
 float cochlea_peak_level(CochleaEngine *e);
 
