@@ -343,6 +343,14 @@ final class AudioSource {
         // over a source change would be audible over a picture it no longer
         // belongs to.
         stopReplay()
+        // The file being taken down has no samples still to end, and the flag
+        // belongs to it. Cleared here because it was only ever cleared when the
+        // *next file* started, so going back to live input left it standing --
+        // and the frame tick reads it against whatever source is running now.
+        // See the note in `AppDelegate.startLiveInput`.
+        fileSamplesEnded = false
+        fileFrames = 0
+        fileFramesFed = 0
         input?.close()
         input = nil
 

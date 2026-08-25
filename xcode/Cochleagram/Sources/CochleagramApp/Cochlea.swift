@@ -48,9 +48,10 @@ final class Cochlea {
     let inputRate: Double
 
     /// Column scratch buffers, reused so drawing never allocates.
-    private var levelBuffer: [Float]
-    private var coherenceBuffer: [Float]
-    private var refBuffer: [Float]
+    /// One allocation behind everything `drainColumns` pulls, laid out as
+    /// levels | coherence | refs | input low | input high. See `drainColumns`
+    /// for why it is one buffer and not five.
+    private var scratch: [Float]
     /// Columns per drain call. At the close-up's finest setting the engine
     /// makes 20,000 a second, which is 333 in a 60 Hz frame and more after a
     /// dropped one, so 512 was about to become the limit rather than a
@@ -74,9 +75,9 @@ final class Cochlea {
         } else {
             frequencies = []
         }
-        levelBuffer = [Float](repeating: 0, count: max(1, tapCount * maxPull))
-        coherenceBuffer = [Float](repeating: 0, count: max(1, tapCount * maxPull))
-        refBuffer = [Float](repeating: 0, count: maxPull)
+        // Two planes of tapCount-per-column, then three of one-per-column.
+        scratch = [Float](repeating: 0,
+                          count: max(1, tapCount * maxPull * 2 + maxPull * 3))
     }
 
     /// The apex's calibrated delay, in milliseconds: what De-skew costs in
@@ -165,28 +166,47 @@ final class Cochlea {
     ///
     /// Both quantities arrive on every column whichever one is being drawn,
     /// so switching mode costs a re-render rather than a wipe.
-    func drainColumns(_ body: (UnsafeBufferPointer<Float>,
-                               UnsafeBufferPointer<Float>,
-                               UnsafeBufferPointer<Float>, Int) -> Void) {
+    /// `inLo` and `inHi` are the input's smallest and largest sample over each
+    /// column, already delayed by the engine to match de-skew -- so a caller
+    /// drawing them under the picture needs no correction of its own.
+    ///
+    /// One buffer behind five pointers, rather than five arrays behind five
+    /// nested `withUnsafeMutableBufferPointer` closures. The nesting was three
+    /// deep with three quantities and would be five with five, which is both
+    /// unreadable and the shape that makes Swift's type checker give up.
+    func drainColumns(_ body: (_ levels: UnsafeBufferPointer<Float>,
+                               _ coherence: UnsafeBufferPointer<Float>,
+                               _ refs: UnsafeBufferPointer<Float>,
+                               _ inLo: UnsafeBufferPointer<Float>,
+                               _ inHi: UnsafeBufferPointer<Float>,
+                               _ count: Int) -> Void) {
         guard tapCount > 0 else { return }
+        let plane = maxPull * tapCount
+        let offLevels = 0
+        let offCoherence = plane
+        let offRefs = plane * 2
+        let offLo = offRefs + maxPull
+        let offHi = offLo + maxPull
         while true {
-            let n = levelBuffer.withUnsafeMutableBufferPointer { lv -> Int in
-                coherenceBuffer.withUnsafeMutableBufferPointer { co -> Int in
-                    refBuffer.withUnsafeMutableBufferPointer { rf -> Int in
-                        guard let l = lv.baseAddress, let c = co.baseAddress,
-                              let r = rf.baseAddress else { return 0 }
-                        return Int(cochlea_pull_columns(engine, l, c, r,
-                                                        Int32(maxPull)))
-                    }
-                }
+            let n = scratch.withUnsafeMutableBufferPointer { p -> Int in
+                guard let b = p.baseAddress else { return 0 }
+                return Int(cochlea_pull_columns(engine,
+                                                b + offLevels,
+                                                b + offCoherence,
+                                                b + offRefs,
+                                                b + offLo,
+                                                b + offHi,
+                                                Int32(maxPull)))
             }
             if n == 0 { break }
-            levelBuffer.withUnsafeBufferPointer { lv in
-                coherenceBuffer.withUnsafeBufferPointer { co in
-                    refBuffer.withUnsafeBufferPointer { rf in
-                        body(lv, co, rf, n)
-                    }
-                }
+            scratch.withUnsafeBufferPointer { p in
+                guard let b = p.baseAddress else { return }
+                body(UnsafeBufferPointer(start: b + offLevels, count: n * tapCount),
+                     UnsafeBufferPointer(start: b + offCoherence, count: n * tapCount),
+                     UnsafeBufferPointer(start: b + offRefs, count: n),
+                     UnsafeBufferPointer(start: b + offLo, count: n),
+                     UnsafeBufferPointer(start: b + offHi, count: n),
+                     n)
             }
             if n < maxPull { break }
         }

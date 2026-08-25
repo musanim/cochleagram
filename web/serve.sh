@@ -13,11 +13,22 @@
 #
 #   ./serve.sh ~/Documents/Active/HTMirror/musanim/Cochleagram
 DIR="${1:-$(cd "$(dirname "$0")/site" && pwd)}"
+# The version the page's title will carry, from the Mac app's Info.plist -- the
+# one place either app's version is written. Read before the `cd`, because the
+# directory being served may be anywhere; passed through the environment,
+# because the server below is a heredoc and cannot see shell variables.
+COCHLEAGRAM_VERSION=$(sed -n \
+    '/CFBundleShortVersionString/{n;s/.*<string>\(.*\)<\/string>.*/\1/p;}' \
+    "$(dirname "$0")/../xcode/Cochleagram/Info.plist" 2>/dev/null)
+export COCHLEAGRAM_VERSION
 cd "$DIR"
 echo "serving $DIR"
+echo "version ${COCHLEAGRAM_VERSION:-unknown}"
 echo "http://localhost:8000/"
 exec python3 - <<'PY'
 import http.server, socketserver, os, re, time
+
+VERSION = os.environ.get('COCHLEAGRAM_VERSION', '').encode()
 
 class NoCache(http.server.SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -44,6 +55,13 @@ class NoCache(http.server.SimpleHTTPRequestHandler):
                 body = f.read()
             body = re.sub(rb'\?v=[A-Za-z0-9]*',
                           b'?v=' + str(time.time_ns()).encode(), body)
+            # And the version in the title, the same substitution `publish.sh`
+            # makes on the way to the mirror -- so what is being looked at here
+            # says the same thing the published page will.
+            if VERSION:
+                body = re.sub(rb'<title>Cochleagram \([^<)]*\)</title>',
+                              b'<title>Cochleagram (' + VERSION + b')</title>',
+                              body)
             self.send_response(200)
             self.send_header('Content-Type', self.guess_type(path))
             self.send_header('Content-Length', str(len(body)))

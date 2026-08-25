@@ -248,13 +248,15 @@ public:
         taps_ = taps;
         buf_.assign(static_cast<size_t>(taps) * 2 * kRingColumns, 0.0f);
         refs_.assign(kRingColumns, 0.0f);
+        range_.assign(static_cast<size_t>(kRingColumns) * 2, 0.0f);
         head_.store(0);
         tail_.store(0);
         dropped_.store(0);
     }
 
     /* audio thread */
-    void push(const float *level, const float *coherence, float ref) {
+    void push(const float *level, const float *coherence, float ref,
+              float lo, float hi) {
         const uint64_t h = head_.load(std::memory_order_relaxed);
         const uint64_t t = tail_.load(std::memory_order_acquire);
         if (h - t >= static_cast<uint64_t>(kRingColumns)) {
@@ -265,11 +267,14 @@ public:
         std::memcpy(&buf_[at], level, taps_ * sizeof(float));
         std::memcpy(&buf_[at + taps_], coherence, taps_ * sizeof(float));
         refs_[h % kRingColumns] = ref;
+        range_[(h % kRingColumns) * 2] = lo;
+        range_[(h % kRingColumns) * 2 + 1] = hi;
         head_.store(h + 1, std::memory_order_release);
     }
 
     /* drawing thread */
-    int pull(float *levels, float *coherence, float *refs, int max_cols) {
+    int pull(float *levels, float *coherence, float *refs,
+             float *lo, float *hi, int max_cols) {
         const uint64_t h = head_.load(std::memory_order_acquire);
         uint64_t t = tail_.load(std::memory_order_relaxed);
         int n = 0;
@@ -285,6 +290,8 @@ public:
                             &buf_[at + taps_], taps_ * sizeof(float));
             }
             if (refs) refs[n] = refs_[t % kRingColumns];
+            if (lo) lo[n] = range_[(t % kRingColumns) * 2];
+            if (hi) hi[n] = range_[(t % kRingColumns) * 2 + 1];
             ++t;
             ++n;
         }
@@ -298,6 +305,11 @@ private:
     int                   taps_ = 0;
     std::vector<float>    buf_;
     std::vector<float>    refs_;
+    /*  The input's smallest and largest sample over each column, so a host can
+     *  draw the waveform the picture was made from.  Two floats a column, in
+     *  the same slot as everything else, because they describe the same
+     *  column and must not be able to arrive out of step with it. */
+    std::vector<float>    range_;
     std::atomic<uint64_t> head_{0}, tail_{0}, dropped_{0};
 };
 
@@ -469,6 +481,15 @@ struct CochleaEngine {
      * that was filled with the other one. */
     std::vector<float> history;    /* [column][tap] */
     std::vector<float> history_dt; /* [column][tap], cycles */
+    /*  The input's range over each column, in the same ring and at the same
+     *  position, so that it can be read back with the same delay the taps are.
+     *  See emitColumn. */
+    std::vector<float> history_range;  /* [column][lo, hi] */
+    /*  Accumulated over the input samples since the last column was emitted.
+     *  Deliberately impossible values, so "nothing arrived" is distinguishable
+     *  from "arrived and was silent". */
+    float  in_lo =  1e30f;
+    float  in_hi = -1e30f;
     int    hist_pos = 0;
     std::vector<int> shift;        /* per tap, in columns */
     int    max_shift = 0;
@@ -900,6 +921,9 @@ struct CochleaEngine {
         std::fill(peak_time.begin(), peak_time.end(), kNoPeak);
         std::fill(history.begin(), history.end(), 0.0f);
         std::fill(history_dt.begin(), history_dt.end(), 0.0f);
+        std::fill(history_range.begin(), history_range.end(), 0.0f);
+        in_lo =  1e30f;
+        in_hi = -1e30f;
         hist_pos = 0;
         sample_index = 0.0;
         column_accum = 0.0;
@@ -934,9 +958,35 @@ struct CochleaEngine {
              * logarithm.  Tap 0 has no tap above it and stays at zero. */
             scratch_dt[t] = history_dt[at];
         }
+        /*  The input's range, written into this column's slot and read back
+         *  `max_shift` columns, which is the same delay the *slowest* tap is
+         *  held to.
+         *
+         *  That is what makes the waveform line up with the picture instead of
+         *  needing a correction somewhere else. De-skew holds every tap back to
+         *  the apex's travel time, so the column being emitted depicts events
+         *  from `max_shift` columns ago -- and the input from `max_shift`
+         *  columns ago is exactly the sound those events were made of. With
+         *  De-skew off `max_shift` is zero and this is simply the input during
+         *  this column, which is right for the same reason.
+         *
+         *  Written before it is read, so with no delay a column reports its own
+         *  input rather than the previous one's.  */
+        const size_t here = static_cast<size_t>(hist_pos) * 2;
+        const bool any = in_hi >= in_lo;
+        history_range[here]     = any ? in_lo : 0.0f;
+        history_range[here + 1] = any ? in_hi : 0.0f;
+        in_lo =  1e30f;
+        in_hi = -1e30f;
+
+        int rsrc = hist_pos - max_shift;
+        while (rsrc < 0) rsrc += kMaxDeskewColumns;
+        const size_t rat = static_cast<size_t>(rsrc) * 2;
+
         ring.push(scratch.data(), scratch_dt.data(),
                   static_cast<float>(20.0 * std::log10(
-                      std::fmax(auto_ref, 1e-12))));
+                      std::fmax(auto_ref, 1e-12))),
+                  history_range[rat], history_range[rat + 1]);
         hist_pos = (hist_pos + 1) % kMaxDeskewColumns;
     }
 };
@@ -1022,6 +1072,7 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
     e->scratch_dt.assign(e->n_taps, 0.0f);
     e->history.assign(static_cast<size_t>(e->n_taps) * kMaxDeskewColumns, 0.0f);
     e->history_dt.assign(static_cast<size_t>(e->n_taps) * kMaxDeskewColumns, 0.0f);
+    e->history_range.assign(static_cast<size_t>(kMaxDeskewColumns) * 2, 0.0f);
     e->ring.init(e->n_taps);
     /*  At the host's rate, not the internal one: what is kept is the input as
      *  handed over, so that playing it back reproduces what was heard. */
@@ -1121,6 +1172,12 @@ void cochlea_process(CochleaEngine *e, const float *in, int n) {
         const double x = static_cast<double>(in[i]);
         const float ax = std::fabs(in[i]);
         if (ax > pk) pk = ax;
+        /*  Signed, unlike the peak above: a waveform is drawn about zero and
+         *  wants both ends of the excursion, not its magnitude. Taken at the
+         *  host's rate, before the resampler, so it is the sound as handed
+         *  over. */
+        if (in[i] < e->in_lo) e->in_lo = in[i];
+        if (in[i] > e->in_hi) e->in_hi = in[i];
 
         if (e->need_upsample) {
             double two[2];
@@ -1155,9 +1212,10 @@ void cochlea_process(CochleaEngine *e, const float *in, int n) {
 }
 
 int cochlea_pull_columns(CochleaEngine *e, float *levels, float *coherence,
-                         float *refs, int max_cols) {
+                         float *refs, float *in_lo, float *in_hi,
+                         int max_cols) {
     if (!e || max_cols <= 0) return 0;
-    return e->ring.pull(levels, coherence, refs, max_cols);
+    return e->ring.pull(levels, coherence, refs, in_lo, in_hi, max_cols);
 }
 
 uint64_t cochlea_dropped_columns(const CochleaEngine *e) {

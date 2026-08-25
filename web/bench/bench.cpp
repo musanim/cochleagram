@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     double dl = 0, dc = 0;
     for (int i = 0; i + BLOCK <= N; i += BLOCK) {
         cochlea_process(e, in.data() + i, BLOCK);
-        int got = cochlea_pull_columns(e, lv.data(), ch.data(), rf.data(), 64);
+        int got = cochlea_pull_columns(e, lv.data(), ch.data(), rf.data(), nullptr, nullptr, 64);
         for (int k = 0; k < got * taps; ++k) { dl += lv[k]; dc += ch[k]; }
         pulled += got;
     }

@@ -78,6 +78,11 @@ export class Cochlea {
         this.pLevels = M._malloc(this.maxCols * this.tapCount * 4);
         this.pCoherence = M._malloc(this.maxCols * this.tapCount * 4);
         this.pRefs = M._malloc(this.maxCols * 4);
+        // The input's range over each column, for drawing the waveform the
+        // picture was made from. Delayed by the engine to match de-skew, so
+        // nothing here or above has to correct for it.
+        this.pInLo = M._malloc(this.maxCols * 4);
+        this.pInHi = M._malloc(this.maxCols * 4);
     }
 
     _copyDoubles(ptr) {
@@ -110,7 +115,8 @@ export class Cochlea {
         const M = this.M;
         const want = Math.min(maxCols, this.maxCols);
         const n = M._cochlea_pull_columns(this.e, this.pLevels, this.pCoherence,
-                                          this.pRefs, want);
+                                          this.pRefs, this.pInLo, this.pInHi,
+                                          want);
         if (n === 0) return null;
         const k = n * this.tapCount;
         return {
@@ -119,6 +125,8 @@ export class Cochlea {
             levels: M.HEAPF32.slice(this.pLevels / 4, this.pLevels / 4 + k),
             coherence: M.HEAPF32.slice(this.pCoherence / 4, this.pCoherence / 4 + k),
             refs: M.HEAPF32.slice(this.pRefs / 4, this.pRefs / 4 + n),
+            inLo: M.HEAPF32.slice(this.pInLo / 4, this.pInLo / 4 + n),
+            inHi: M.HEAPF32.slice(this.pInHi / 4, this.pInHi / 4 + n),
         };
     }
 
@@ -131,7 +139,8 @@ export class Cochlea {
 
     destroy() {
         const M = this.M;
-        for (const p of [this.pIn, this.pLevels, this.pCoherence, this.pRefs]) {
+        for (const p of [this.pIn, this.pLevels, this.pCoherence, this.pRefs,
+                         this.pInLo, this.pInHi]) {
             M._free(p);
         }
         M._cochlea_destroy(this.e);

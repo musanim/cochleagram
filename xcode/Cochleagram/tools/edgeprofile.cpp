@@ -112,7 +112,7 @@ int main(int argc, char **argv) {
         cochlea_process(e, in.data() + i, n);
         int got;
         while ((got = cochlea_pull_columns(e, pull.data(), nullptr, nullptr,
-                                           512)) > 0) {
+                                           nullptr, nullptr, 512)) > 0) {
             for (int c = 0; c < got; ++c, ++col) {
                 for (int t = 0; t < taps; ++t) {
                     if (first[t] < 0.0 &&

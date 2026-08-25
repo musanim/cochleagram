@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
         cochlea_process(e, in.data() + i, n);
         int got;
         while ((got = cochlea_pull_columns(e, pull.data(), nullptr, pull_refs.data(),
-                                           512)) > 0) {
+                                           nullptr, nullptr, 512)) > 0) {
             cols.insert(cols.end(), pull.begin(),
                         pull.begin() + static_cast<size_t>(got) * taps);
             col_refs.insert(col_refs.end(), pull_refs.begin(),

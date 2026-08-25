@@ -116,8 +116,24 @@ void cochlea_process(CochleaEngine *e, const float *in, int n);
  *
  *  Returns the number of columns written.  Non-blocking; returns 0 if none
  *  are ready.                                                             */
+/*  `in_lo` and `in_hi` receive one float each per column: the smallest and
+ *  largest *input* sample over that column, at the host's rate and before the
+ *  resampler -- the sound as it was handed over, so that a host can draw the
+ *  waveform the picture was made from.
+ *
+ *  Delayed to match the picture.  De-skew holds every tap back to the apex's
+ *  travel time, so a column depicts events from that far in the past; these are
+ *  read back through the same delay, and therefore describe the same moment the
+ *  rest of the column does.  With de-skew off the delay is zero and they are
+ *  the input during that column.  A caller drawing them under the display needs
+ *  no correction of its own, whichever way de-skew is set and however it is
+ *  changed while running.
+ *
+ *  Signed, and both ends: a waveform is drawn about zero and wants the whole
+ *  excursion, which is not what cochlea_peak_level() reports.  */
 int cochlea_pull_columns(CochleaEngine *e, float *levels, float *coherence,
-                         float *refs, int max_cols);
+                         float *refs, float *in_lo, float *in_hi,
+                         int max_cols);
 
 /*  How many columns were dropped because the consumer fell behind.  Useful
  *  as a health check while tuning buffer sizes; should stay at zero.      */

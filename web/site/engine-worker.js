@@ -42,7 +42,8 @@ self.onmessage = async (ev) => {
             if (got) {
                 postMessage({ type: 'columns', ...got, ref: coch.currentRefDb },
                             [got.levels.buffer, got.coherence.buffer,
-                             got.refs.buffer]);
+                             got.refs.buffer,
+                             got.inLo.buffer, got.inHi.buffer]);
             }
             break;
         }

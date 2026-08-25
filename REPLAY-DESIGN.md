@@ -334,14 +334,34 @@ match:
 
 ---
 
-## What the browser will do differently
+## What the browser does differently
 
-The engine, the pause semantics and the measurement lines are already the same
-there, so the design carries over unchanged. Two mechanical differences:
+The engine, the pause semantics and the measurement lines are the same there,
+so everything above carries over. The differences are mechanical, and none of
+them changes what the two apps do:
 
-- The ring is filled from the capture worklet's messages rather than from a
-  tap, so the SPSC queue is the worklet port and no extra queue is needed.
-- Playback is an `AudioBufferSourceNode` through a `GainNode`, and the output
-  device is whatever the page is using — there is no device popup to honour.
-
-Neither changes anything above.
+- **The recording is kept on the page, not in the engine.** The capture worklet
+  already posts every block to the main thread on its way to the worker, so the
+  samples are there before the engine sees them. The engine's capture ring is
+  therefore not even exported to WASM — using it would put a second copy of the
+  recording in the heap that nothing reads. `capturing()` asserts a live
+  microphone source rather than deducing one from the absence of a file: there
+  are windows in the browser, unlike on the Mac, where no source is connected
+  and neither flag says so.
+- **The recording restarts whenever the engine is opened.** Opening one nulls
+  the old engine and then fetches a coefficient file and builds a cascade, and
+  every block arriving in that window is discarded by the worker while the page
+  is still recording it. Unnoticed, that offset would be added to every column
+  afterwards, and again at every change of ERB.
+- **Playback is an `AudioBufferSourceNode` through a `GainNode`** to the page's
+  own output; there is no device popup to honour.
+- **Two clocks.** The line follows `ctx.currentTime`, which is the render
+  clock and the counterpart of the Mac's `playerTime`. The *end* is found with
+  `performance.now()`, because an AudioContext's clock stops while the context
+  is suspended — and RePlay lives on a frozen picture, where the page
+  deliberately does not auto-resume. Without the wall clock, backgrounding the
+  tab mid-playback would leave the line parked and the button saying Stop.
+- **Rounding.** JavaScript's `Math.round` takes a half towards positive
+  infinity where Swift's `rounded()` takes it away from zero. One sample, at
+  exact halves — and the two apps agreeing is the whole point, so the recorder
+  uses a helper.

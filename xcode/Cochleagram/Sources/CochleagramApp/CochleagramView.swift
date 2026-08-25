@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore                // CACurrentMediaTime, for the spectrum's decay
 
 /// What an untouched column reads. Far below any usable floor, so a bitmap
 /// that has been allocated but not yet filled renders as silence.
@@ -185,6 +186,16 @@ final class CochleagramView: NSView {
     /// rather than wiping it and waiting for the sound to come round again.
     private var coherence = [Float]()
     private var columnRefs = [Float]()
+    /// The input's smallest and largest sample behind each screen column, from
+    /// the engine and already delayed there to match de-skew. What the waveform
+    /// strip is drawn from.
+    ///
+    /// Two more arrays anchored to content, shifted in the same four places
+    /// `columnRefs` is. They come *with* the columns rather than being looked
+    /// up afterwards, which is what makes them impossible to get out of step
+    /// with the picture.
+    private var columnLo = [Float]()
+    private var columnHi = [Float]()
 
     /// Which engine column each screen column was drawn from.
     ///
@@ -338,10 +349,38 @@ final class CochleagramView: NSView {
     /// Where the cochleagram itself goes. The view is y-up and unflipped, so
     /// the status strip occupies the bottom of the coordinate space and the
     /// picture sits above it.
+    /// Whether the waveform strip is drawn above the picture.
+    var showsWaveform = false { didSet { needsDisplay = true } }
+
+    /// The strip's share of the space it and the picture divide between them.
+    ///
+    /// One part strip to five parts picture, so the strip is a fifth of the
+    /// picture at any window size. Kept as a ratio rather than a number of
+    /// points so that resizing the window does not change the split -- and so
+    /// the delegate can work out how much taller the window has to become for
+    /// the picture to come out the size it already was.
+    static let waveformShare: CGFloat = 1.0 / 6.0
+
+    /// How tall the strip is, or zero when it is off.
+    private var waveformHeight: CGFloat {
+        guard showsWaveform else { return 0 }
+        let usable = max(1, bounds.height - statusHeight - plotTopInset)
+        return (usable * Self.waveformShare).rounded()
+    }
+
+    /// Where the waveform goes: directly above the picture, sharing its left
+    /// and right edges so a column is above the column it describes.
+    private var waveformRect: CGRect {
+        let p = plotRect
+        return CGRect(x: p.minX, y: p.maxY, width: p.width,
+                      height: waveformHeight)
+    }
+
     private var plotRect: CGRect {
         CGRect(x: gutter, y: statusHeight,
                width: max(1, bounds.width - gutter),
-               height: max(1, bounds.height - statusHeight - plotTopInset))
+               height: max(1, bounds.height - statusHeight - plotTopInset
+                              - waveformHeight))
     }
 
     /// How many columns are on screen, so the caller can say how much time
@@ -392,6 +431,8 @@ final class CochleagramView: NSView {
             pixels = []
             levels = []
             columnRefs = []
+            columnLo = []
+            columnHi = []
             columnFine = []
             marks.removeAll()
             return
@@ -437,6 +478,8 @@ final class CochleagramView: NSView {
         var nextLevels = [Float](repeating: kSilentDB, count: w * height)
         var nextCoh = [Float](repeating: kNoCoherence, count: w * height)
         var nextRefs = [Float](repeating: 0, count: w)
+        var nextLo = [Float](repeating: 0, count: w)
+        var nextHi = [Float](repeating: 0, count: w)
         // -1 for "no engine column was ever drawn here", which is what the
         // freshly exposed columns of a widened window are. Distinct from 0,
         // which is a real column: the first one after a wipe.
@@ -492,6 +535,24 @@ final class CochleagramView: NSView {
                     }
                 }
             }
+            if columnLo.count == width, columnHi.count == width {
+                nextLo.withUnsafeMutableBufferPointer { d in
+                    columnLo.withUnsafeBufferPointer { sp in
+                        guard let dp = d.baseAddress, let s0 = sp.baseAddress
+                        else { return }
+                        memcpy(dp + (w - keep), s0 + (width - keep),
+                               keep * MemoryLayout<Float>.size)
+                    }
+                }
+                nextHi.withUnsafeMutableBufferPointer { d in
+                    columnHi.withUnsafeBufferPointer { sp in
+                        guard let dp = d.baseAddress, let s0 = sp.baseAddress
+                        else { return }
+                        memcpy(dp + (w - keep), s0 + (width - keep),
+                               keep * MemoryLayout<Float>.size)
+                    }
+                }
+            }
             if columnFine.count == width {
                 nextFine.withUnsafeMutableBufferPointer { d in
                     columnFine.withUnsafeBufferPointer { sp in
@@ -536,6 +597,8 @@ final class CochleagramView: NSView {
         levels = nextLevels
         coherence = nextCoh
         columnRefs = nextRefs
+        columnLo = nextLo
+        columnHi = nextHi
         columnFine = nextFine
         width = w
         // Whatever was just *allocated* has to be rendered, not assumed: the
@@ -580,6 +643,8 @@ final class CochleagramView: NSView {
         levels = [Float](repeating: kSilentDB, count: width * height)
         coherence = [Float](repeating: kNoCoherence, count: width * height)
         columnRefs = [Float](repeating: 0, count: width)
+        columnLo = [Float](repeating: 0, count: width)
+        columnHi = [Float](repeating: 0, count: width)
         columnFine = [Int64](repeating: -1, count: width)
         renderColumns(from: 0, count: width)
         marks.removeAll()
@@ -621,7 +686,7 @@ final class CochleagramView: NSView {
         guard width > 0 else { return }
         if isPaused {
             // Keep the queue from overflowing while frozen on live input.
-            if discardWhilePaused { c.drainColumns { _, _, _, _ in } }
+            if discardWhilePaused { c.drainColumns { _, _, _, _, _, _ in } }
             return
         }
         // Columns the engine had to throw away because nobody was draining.
@@ -638,9 +703,9 @@ final class CochleagramView: NSView {
         }
 
         var pending = 0
-        c.drainColumns { lv, co, rf, n in
+        c.drainColumns { lv, co, rf, lo, hi, n in
             pending += n
-            self.append(lv, co, rf, columns: n)
+            self.append(lv, co, rf, lo, hi, columns: n)
         }
         if pending > 0 { needsDisplay = true }
         columnsSinceJoin += pending
@@ -912,7 +977,9 @@ final class CochleagramView: NSView {
 
     private func append(_ lv: UnsafeBufferPointer<Float>,
                         _ co: UnsafeBufferPointer<Float>,
-                        _ rf: UnsafeBufferPointer<Float>, columns n: Int) {
+                        _ rf: UnsafeBufferPointer<Float>,
+                        _ inLo: UnsafeBufferPointer<Float>,
+                        _ inHi: UnsafeBufferPointer<Float>, columns n: Int) {
         // `rf` -- the engine's own peak-following reference -- is deliberately
         // ignored. See `autoExpose`.
         guard let src = lv.baseAddress, let srcCoh = co.baseAddress,
@@ -925,6 +992,8 @@ final class CochleagramView: NSView {
         if columnFine.count != width {
             columnFine = [Int64](repeating: -1, count: width)
         }
+        if columnLo.count != width { columnLo = [Float](repeating: 0, count: width) }
+        if columnHi.count != width { columnHi = [Float](repeating: 0, count: width) }
 
         // Never more than half the window: the strip is now wide enough that
         // on a small window it could otherwise leave the ordinary picture a
@@ -955,11 +1024,17 @@ final class CochleagramView: NSView {
             if take < width {
                 columnRefs.removeFirst(take)
                 columnRefs.append(contentsOf: (0..<take).map { srcRef[skip + $0] })
+                columnLo.removeFirst(take)
+                columnLo.append(contentsOf: (0..<take).map { inLo[skip + $0] })
+                columnHi.removeFirst(take)
+                columnHi.append(contentsOf: (0..<take).map { inHi[skip + $0] })
                 columnFine.removeFirst(take)
                 columnFine.append(contentsOf:
                     (0..<take).map { firstIn + Int64(skip + $0) })
             } else {
                 columnRefs = (0..<take).map { srcRef[skip + $0] }
+                columnLo = (0..<take).map { inLo[skip + $0] }
+                columnHi = (0..<take).map { inHi[skip + $0] }
                 columnFine = (0..<take).map { firstIn + Int64(skip + $0) }
             }
             marks = marks.compactMap {
@@ -1025,6 +1100,8 @@ final class CochleagramView: NSView {
         var keepL = [Float](repeating: 0, count: m * height)
         var keepC = [Float](repeating: 0, count: m * height)
         var keepR = [Float](repeating: 0, count: m)
+        var keepLo = [Float](repeating: 0, count: m)
+        var keepHi = [Float](repeating: 0, count: m)
         if m > 0 {
             levels.withUnsafeBufferPointer { dl in
             coherence.withUnsafeBufferPointer { dc in
@@ -1053,6 +1130,57 @@ final class CochleagramView: NSView {
             }
         }
 
+        // The waveform's range is *summarised* over the columns a promoted
+        // column stands for, not sampled from the first of them like the level
+        // and the reference beside it.
+        //
+        // Those can be sampled because they are peak-followers with decay:
+        // every aggregate-th one is nearly the same picture. A raw min and max
+        // is not. `aggregate` reaches eighty at the finest close-up, so
+        // sampling would draw each main column from 0.05 ms out of every 4 --
+        // a sliver at an arbitrary phase, which below a few kHz is noise. The
+        // strip would then be solid to the right of the boundary and a picket
+        // fence to the left of it, at exactly the place the two are meant to be
+        // compared. The columns in between are all here; this reads them.
+        if m > 0, aggregate > 0 {
+            // How many of them can actually be read yet.
+            //
+            // A column is promoted when it *leaves* the strip, which is `near`
+            // columns after it entered -- so at that moment the engine has
+            // produced everything up to `g + near` and no further. When the
+            // close-up is set finer than the strip is wide, `aggregate` can
+            // exceed that, and the tail of the span simply does not exist when
+            // the column has to be written. Taking a window of the same size
+            // for every column keeps the strip uniform: the alternative is a
+            // full summary for most columns and a truncated one for the last of
+            // each batch, which reads as noise and is worse than a consistent
+            // under-sample. The common settings are unaffected -- `near` is
+            // larger than `aggregate` whenever the close-up's span is longer
+            // than one column of the main picture, which is nearly always.
+            let spanCols = max(1, min(aggregate, near + 1))
+            for (i, g) in promoteG.enumerated() {
+                var lo = Float.greatestFiniteMagnitude
+                var hi = -Float.greatestFiniteMagnitude
+                var any = false
+                for k in 0..<spanCols {
+                    let gk = g + k
+                    if gk >= first {
+                        let c = gk - first
+                        guard c < n else { break }     // not arrived yet
+                        lo = min(lo, inLo[c]); hi = max(hi, inHi[c])
+                        any = true
+                    } else {
+                        let x = mainHi + (gk - (first - near))
+                        guard x >= mainHi, x < width else { continue }
+                        lo = min(lo, columnLo[x]); hi = max(hi, columnHi[x])
+                        any = true
+                    }
+                }
+                keepLo[i] = any ? lo : 0
+                keepHi[i] = any ? hi : 0
+            }
+        }
+
         // Main region: scroll by however many were promoted, then write them.
         if m > 0 {
             let put = m
@@ -1077,13 +1205,24 @@ final class CochleagramView: NSView {
             shiftPixels(0, mainHi, put)
             if put < mainHi {
                 for x in 0..<(mainHi - put) { columnRefs[x] = columnRefs[x + put] }
+                for x in 0..<(mainHi - put) { columnLo[x] = columnLo[x + put] }
+                for x in 0..<(mainHi - put) { columnHi[x] = columnHi[x + put] }
                 for x in 0..<(mainHi - put) { columnFine[x] = columnFine[x + put] }
             }
             for i in 0..<put { columnRefs[mainHi - put + i] = keepR[m - put + i] }
-            // A promoted column keeps the engine index it entered the strip
-            // with -- `promoteG` is that index. So a column of the main picture
-            // names the first of the `aggregate` engine columns it stands for,
-            // which is where in the audio it begins.
+            // A promoted column reports the range of the *first* of the engine
+            // columns it stands for, exactly as it reports that column's index
+            // and reference. It is a sample of the stream, not a summary of it
+            // -- which is the same choice the picture makes by taking every
+            // aggregate-th column rather than averaging them.
+            for i in 0..<put { columnLo[mainHi - put + i] = keepLo[m - put + i] }
+            for i in 0..<put { columnHi[mainHi - put + i] = keepHi[m - put + i] }
+            // The index a promoted column keeps is the one it entered the strip
+            // with, so a column of the main picture *names* the first of the
+            // engine columns it stands for -- which is where in the audio it
+            // begins. Its waveform range, unlike its index, is summarised over
+            // the whole span rather than taken from that first column; see the
+            // loop above.
             for i in 0..<put {
                 columnFine[mainHi - put + i] = Int64(promoteG[m - put + i])
             }
@@ -1108,9 +1247,13 @@ final class CochleagramView: NSView {
         shiftPixels(mainHi, width, fill)
         if fill < near {
             for x in mainHi..<(width - fill) { columnRefs[x] = columnRefs[x + fill] }
+            for x in mainHi..<(width - fill) { columnLo[x] = columnLo[x + fill] }
+            for x in mainHi..<(width - fill) { columnHi[x] = columnHi[x + fill] }
             for x in mainHi..<(width - fill) { columnFine[x] = columnFine[x + fill] }
         }
         for c in 0..<fill { columnRefs[width - fill + c] = srcRef[skip + c] }
+        for c in 0..<fill { columnLo[width - fill + c] = inLo[skip + c] }
+        for c in 0..<fill { columnHi[width - fill + c] = inHi[skip + c] }
         // One engine column each, so the index is the stream's own.
         for c in 0..<fill {
             columnFine[width - fill + c] = Int64(first + skip + c)
@@ -1311,6 +1454,13 @@ final class CochleagramView: NSView {
         // as, or the margins disagree with the picture.
         ctx.setFillColor((exposure.inverted ? NSColor.black : .white).cgColor)
         ctx.fill(plot)
+        // The strip gets the same paper, and it has to. Its ink follows Invert
+        // -- black on white, white on black -- while the chrome follows the
+        // system appearance, so left on chrome the strip would be black on
+        // near-black in dark mode with Invert off, which is the state anyone
+        // pressing the button for the first time is in. It would have looked
+        // like a button that only resized the window.
+        if showsWaveform { ctx.fill(waveformRect) }
 
         if showGrid { drawFrequencyScale(plot) }
         if showDiagnostics { drawDiagnostics(plot) }
@@ -1343,7 +1493,7 @@ final class CochleagramView: NSView {
 
         // Where the time scale changes. Not a mark -- marks travel with the
         // picture and this is a property of the window -- and drawn in the
-        // ink colour rather than in a seam's blue for that reason: it is a
+        // ink colour rather than in a mark's colour for that reason: it is a
         // fixed edge of the instrument, not an event in the recording. Which
         // is why it follows Invert while the seams do not: the marks are
         // coloured to be found, this is meant to look like part of the frame.
@@ -1358,8 +1508,115 @@ final class CochleagramView: NSView {
                             height: plot.height))
         }
 
+        drawWaveform(ctx)
         drawMarks(ctx, plot)
         drawReadout(ctx, plot)
+    }
+
+    // MARK: - the waveform strip
+    //
+    // The sound the picture was made from, directly above it and sharing its
+    // columns: one screen column of strip stands over the same span of time as
+    // the column of picture beneath it, at whichever of the two time scales
+    // that column is drawn at.
+    //
+    // The numbers come from the engine, which delays them by the same amount
+    // de-skew holds the taps back -- so the two line up whatever de-skew is
+    // set to, and across a change of it, without anything here compensating.
+    // That also makes the display its own check: with de-skew on, a click's
+    // spike should sit directly above the vertical edge it draws; with it off,
+    // above the top of the slanted one.
+
+    /// Full scale. A waveform that rescaled itself would be easier to read and
+    /// would stop meaning anything between one screenful and the next.
+    private static let waveformFullScale: CGFloat = 1.0
+
+    private func drawWaveform(_ ctx: CGContext) {
+        guard showsWaveform, width > 0,
+              columnLo.count == width, columnHi.count == width else { return }
+        let r = waveformRect
+        guard r.height > 2, r.width > 0 else { return }
+
+        let mid = r.midY
+        let half = r.height / 2
+        let sx = r.width / CGFloat(width)
+        let ink = exposure.inverted ? NSColor.white : NSColor.black
+
+        ctx.saveGState()
+        // Not antialiased, and one column wide: this is the same unit the
+        // picture is built in, and a bar that straddled two device pixels would
+        // come out pale where the picture beneath it is solid.
+        ctx.setShouldAntialias(false)
+        ctx.setFillColor(ink.cgColor)
+
+        // The zero line first, so a silent stretch reads as silence rather than
+        // as nothing drawn.
+        // At least one point, as the close-up boundary does: a rect one device
+        // pixel tall at a fractional offset, with antialiasing off, can round
+        // away to nothing.
+        let hair = max(1, 1.0 / (window?.backingScaleFactor ?? 1))
+        ctx.fill(CGRect(x: r.minX, y: mid - hair / 2, width: r.width,
+                        height: hair))
+
+        for x in 0..<width {
+            let lo = CGFloat(columnLo[x]), hi = CGFloat(columnHi[x])
+            // Both exactly zero is a column that was never written -- the left
+            // of a freshly wiped picture. The zero line already stands for it.
+            if lo == 0 && hi == 0 { continue }
+            var yLo = mid + max(-1, lo / Self.waveformFullScale) * half
+            var yHi = mid + min(1, hi / Self.waveformFullScale) * half
+            if yHi < yLo { swap(&yLo, &yHi) }
+            let px = r.minX + CGFloat(x) * sx
+            // At least a hairline: a column whose excursion is smaller than one
+            // device pixel is quiet, not absent, and dropping it would make a
+            // faint passage look like a gap in the recording.
+            ctx.fill(CGRect(x: px, y: yLo, width: max(sx, hair),
+                            height: max(yHi - yLo, hair)))
+        }
+        ctx.restoreGState()
+    }
+
+    // MARK: - the spectrum
+    //
+    // The newest column, stood on its side. It is not drawn here: it lives in
+    // its own window, beyond the right-hand edge of this one, so that it has a
+    // background of its own rather than competing with the picture. Two inks
+    // were tried over the picture and neither read against it.
+    //
+    // What is here is the arithmetic, because it belongs with the numbers it
+    // reads and with the exposure it shares. See `SpectrumView`.
+
+    /// The plot, in this view's own coordinates. The spectrum window lines its
+    /// rows up with these, so the two share one frequency scale.
+    var plotFrame: CGRect { plotRect }
+
+    /// Normalised level per tap for the newest column, tap 0 first: 0 at the
+    /// exposure's white point, 1 at its black point.
+    ///
+    /// Exactly the mapping `renderColumns` uses, auto-gain reference included,
+    /// so a level drawn mid-grey in the rightmost column reads half scale here.
+    ///
+    /// Clamped below and deliberately *not* above. Below the white point there
+    /// is nothing to show and the trace lies on the zero line; above the black
+    /// point it keeps going, because black is a scale mark here rather than a
+    /// limit. The picture has nowhere to put a level past full ink. A trace has.
+    func spectrumTrace() -> [CGFloat]? {
+        guard width > 0, height > 1, levels.count == width * height
+        else { return nil }
+        let whiteDB = Float(exposure.whiteDB)
+        let span = Float(max(exposure.blackDB - exposure.whiteDB, 1e-6))
+        let ref = (exposure.autoGain && columnRefs.count == width)
+                ? columnRefs[width - 1] : 0
+        let base = (width - 1) * height
+        var out = [CGFloat](repeating: 0, count: height)
+        levels.withUnsafeBufferPointer { lv in
+            guard let l = lv.baseAddress else { return }
+            for y in 0..<height {
+                let u = (l[base + y] - ref - whiteDB) / span
+                out[y] = CGFloat(u < 0 ? 0 : u)
+            }
+        }
+        return out
     }
 
     private func drawMarks(_ ctx: CGContext, _ plot: CGRect) {
@@ -2060,5 +2317,135 @@ final class CochleagramView: NSView {
         return k >= 10 || k == k.rounded()
             ? "\(Int(k.rounded()))k"
             : String(format: "%.1fk", k)
+    }
+}
+
+/// The instantaneous spectrum, drawn outside the window.
+///
+/// A solid black region rather than a line: level runs rightward from the
+/// picture's right-hand edge, which is the zero point, against the same
+/// frequency scale and the same rows. The right edge is where the newest column
+/// is, so the shape extends from precisely the column it describes.
+///
+/// It lives in a transparent borderless window beyond the main one rather than
+/// on top of the picture, because the picture is a poor background for a line:
+/// cyan and red were both tried over it and neither read. Out here the backdrop
+/// is whatever happens to be behind the app, which is not controlled either --
+/// but it is usually quieter than a cochleagram, and the trace is not competing
+/// with the thing it is meant to be read against.
+final class SpectrumView: NSView {
+
+    /// What is drawn: the smoothed trace, tap 0 first. 1 is the exposure's
+    /// black point; values above it are not clipped -- see
+    /// `CochleagramView.spectrumTrace`.
+    private var trace: [CGFloat] = []
+
+    /// How long the smoothing takes to close the gap to 1/e of a step.
+    ///
+    /// A single column is one instant of a peak-following analysis, and sixty
+    /// of them a second is more movement than an eye can read -- the shape
+    /// boils. This is the only thing between the numbers and the drawing, and
+    /// it is a display convenience: the picture beside it is unsmoothed, and
+    /// remains the thing to measure from.
+    ///
+    /// Thirty milliseconds, arrived at by looking. Not a considered value.
+    var decaySeconds: Double = 0.030
+
+    /// State of the integrator, and when it last ran.
+    private var lastTick: CFTimeInterval = 0
+
+    /// Hand in a fresh trace, straight from `spectrumTrace()`. Smoothed here
+    /// rather than there: the picture's numbers are not smoothed and must not
+    /// be, and this is the only consumer that wants them slowed down.
+    func update(_ raw: [CGFloat]) {
+        let now = CACurrentMediaTime()
+        let dt = lastTick > 0 ? now - lastTick : 0
+        lastTick = now
+
+        guard !raw.isEmpty else {
+            if !trace.isEmpty { trace = []; needsDisplay = true }
+            return
+        }
+        // A change of tap count is a different instrument. Nothing to carry.
+        guard trace.count == raw.count else {
+            trace = raw
+            needsDisplay = true
+            return
+        }
+
+        // exp(-dt/tau), computed from however long this frame actually took
+        // rather than from an assumed sixty a second. A dropped frame then
+        // decays by exactly as much as the two frames it replaced, and the time
+        // constant means the same thing on a machine that cannot keep up. A
+        // long gap -- a minimised window -- gives a coefficient of about zero,
+        // so the trace snaps to the present rather than sliding to it.
+        let a = CGFloat(exp(-dt / max(decaySeconds, 1e-4)))
+        var moved: CGFloat = 0
+        for i in 0..<raw.count {
+            let next = raw[i] + (trace[i] - raw[i]) * a
+            let d = next - trace[i]
+            moved = max(moved, d < 0 ? -d : d)
+            trace[i] = next
+        }
+        // A converging exponential never quite arrives, so without a threshold
+        // a still picture would redraw for ever. A thousandth of full scale is
+        // a fraction of a point at any window size this can have.
+        if moved > 0.001 { needsDisplay = true }
+    }
+
+    /// Points from the zero line to the black point. Everything beyond that is
+    /// drawn until it runs out of window.
+    /// Compared before it dirties the view, and it has to be: this is assigned
+    /// on every frame, so without the comparison it would mark the view dirty
+    /// sixty times a second and the settling test in `update` would never get
+    /// the chance to stop anything.
+    var blackReach: CGFloat = 100 {
+        didSet { if blackReach != oldValue { needsDisplay = true } }
+    }
+
+    /// Transparent, so whatever is behind the app shows through.
+    override var isOpaque: Bool { false }
+
+    /// Nothing here is clickable and the window passes clicks through anyway;
+    /// this makes that true of the view as well.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let rows = trace.count
+        guard rows > 1, bounds.height > 0, blackReach > 0,
+              let ctx = NSGraphicsContext.current?.cgContext else { return }
+
+        // Solid: the region between the zero line and the trace, not the trace
+        // alone. The zero line is the window's own left edge, which is the
+        // picture's right edge, so the ink starts exactly where the column it
+        // describes ends -- no inset, because a filled shape at zero level has
+        // no width to lose rather than a stroke to clip.
+        let zeroX = bounds.minX
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: zeroX, y: bounds.maxY))
+
+        for i in 0..<rows {
+            // The same row-to-y as the picture: row 0 -- the highest best
+            // frequency -- at the top, and each row at the centre of its band.
+            let py = bounds.maxY
+                   - (CGFloat(i) + 0.5) / CGFloat(rows) * bounds.height
+            let px = zeroX + trace[i] * blackReach
+            // The first and last rows sit half a row in from the ends, so the
+            // shape is carried straight out to the top and bottom edges rather
+            // than leaving a sliver of unfilled window at each extreme.
+            if i == 0 { path.addLine(to: CGPoint(x: px, y: bounds.maxY)) }
+            path.addLine(to: CGPoint(x: px, y: py))
+            if i == rows - 1 { path.addLine(to: CGPoint(x: px, y: bounds.minY)) }
+        }
+
+        path.addLine(to: CGPoint(x: zeroX, y: bounds.minY))
+        path.closeSubpath()
+
+        ctx.saveGState()
+        ctx.setShouldAntialias(true)
+        ctx.addPath(path)
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fillPath()
+        ctx.restoreGState()
     }
 }

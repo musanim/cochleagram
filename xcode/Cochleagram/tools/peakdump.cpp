@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
         cochlea_process(e, in.data() + i, n);
         int got;
         while ((got = cochlea_pull_columns(e, pull.data(), nullptr, nullptr,
-                                           256)) > 0) {
+                                           nullptr, nullptr, 256)) > 0) {
             for (int c = 0; c < got; ++c, ++col) {
                 const double ms = col * 1000.0 / ifs - t0;
                 for (size_t k = 0; k < which.size(); ++k) {
@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
             cochlea_process(e, in.data() + i, n);
             int got;
             while ((got = cochlea_pull_columns(e, pull.data(), nullptr,
-                                               nullptr, 256)) > 0) {
+                                               nullptr, nullptr, nullptr, 256)) > 0) {
                 for (int c = 0; c < got; ++c, ++c2) {
                     const double ms = c2 * 1000.0 / ifs - t0;
                     if (ms < 0.0) continue;

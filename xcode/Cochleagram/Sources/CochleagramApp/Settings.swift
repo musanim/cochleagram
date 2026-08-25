@@ -86,6 +86,22 @@ struct Settings: Equatable {
     var sensDB:  Double = 95
     var rangeDB: Double = 170
 
+    /// Whether the spectrum trace is drawn over the picture.
+    ///
+    /// On by default. It is the newest column of the picture stood on its side
+    /// -- the same numbers, against the same frequency scale -- so it says
+    /// nothing the display is not already saying, and a stranger meeting it has
+    /// the picture beside it to read it against.
+    var showSpectrum: Bool = true
+
+    /// Whether the waveform strip is drawn above the picture.
+    ///
+    /// Off by default, unlike the spectrum, because switching it on makes the
+    /// window taller -- and a first launch that opened at an unexpected size,
+    /// or squeezed the picture to make room for something nobody asked for,
+    /// would be a worse introduction than an absent feature.
+    var showWaveform: Bool = false
+
     /// How loud Play Selection is, in dB relative to what the microphone heard.
     ///
     /// Zero by default -- unity -- so that what you hear is the recording, not
@@ -416,13 +432,15 @@ struct Settings: Equatable {
         static let closeUpW = "display.closeUpColumns"
         static let outDev   = "audio.outputDeviceUID"
         static let outPair  = "audio.outputChannelPair"
+        static let spectrum = "display.spectrum"
+        static let waveform = "display.waveform"
         static let replayDB = "audio.replayGainDB"
         static let logCon   = "diagnostics.console"
         static let logOS    = "diagnostics.logStream"
         static let readout  = "diagnostics.readout"
 
         static let all = [deskew, invert, autoGain, sens, range, column,
-                          erbScale, mode, closeUp, closeUpW,
+                          erbScale, mode, closeUp, closeUpW, spectrum, waveform,
                           outDev, outPair, replayDB, logCon, logOS, readout,
                           white, black, oldGain, oldLevel]
     }
@@ -481,6 +499,12 @@ struct Settings: Equatable {
         // plist survives min and max in Swift as it does in JavaScript, and a
         // NaN window renders an all-black picture that nothing but deleting
         // the defaults can undo.
+        if store.object(forKey: K.spectrum) != nil {
+            s.showSpectrum = store.bool(forKey: K.spectrum)
+        }
+        if store.object(forKey: K.waveform) != nil {
+            s.showWaveform = store.bool(forKey: K.waveform)
+        }
         if store.object(forKey: K.replayDB) != nil {
             s.replayGainDB = store.double(forKey: K.replayDB)
         }
@@ -539,6 +563,8 @@ struct Settings: Equatable {
         store.set(closeUpColumns, forKey: K.closeUpW)
         store.set(outputDeviceUID, forKey: K.outDev)
         store.set(outputChannelPair, forKey: K.outPair)
+        store.set(showSpectrum,   forKey: K.spectrum)
+        store.set(showWaveform,   forKey: K.waveform)
         store.set(replayGainDB,   forKey: K.replayDB)
         store.set(logToConsole,   forKey: K.logCon)
         store.set(logToLogStream, forKey: K.logOS)

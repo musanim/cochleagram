@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
     for (long i = 0; i < n; i += chunk) {
         cochlea_process(e, in.data() + i, int(std::min<long>(chunk, n - i)));
         int got;
-        while ((got = cochlea_pull_columns(e, nullptr, buf.data(), nullptr, 256)) > 0) {
+        while ((got = cochlea_pull_columns(e, nullptr, buf.data(), nullptr, nullptr, nullptr, 256)) > 0) {
             cols.insert(cols.end(), buf.begin(),
                         buf.begin() + size_t(got) * taps);
         }

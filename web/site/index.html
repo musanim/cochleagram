@@ -3,7 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cochleagram</title>
+<!-- The version in parentheses is stamped in by `serve.sh` on the way out and
+     by `publish.sh` on the way to the mirror, both reading
+     CFBundleShortVersionString from the Mac app's Info.plist. One number, in
+     one place: a copy written here by hand would be a second thing to bump,
+     and two versions of the same instrument quietly disagreeing about which
+     version they are is worse than neither saying. What is in the repository
+     says "dev", which is what an unstamped tree is. -->
+<title>Cochleagram (dev)</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -247,6 +254,12 @@ let colsSeen = 0, lastReport = performance.now();
 // worker, so the samples are already here and asking the engine for them again
 // would be a second recording in the WASM heap. That is the only difference.
 
+/// Round the way Swift's `Double.rounded()` does -- half away from zero, where
+/// `Math.round` takes half towards positive infinity. It is one sample at an
+/// exact half, and the two apps have to give the same answer or comparing them
+/// stops being the point.
+const rounded = x => (x < 0 ? -Math.round(-x) : Math.round(x));
+
 class ReplayRecorder {
     constructor() { this.reset(0); }
 
@@ -318,7 +331,7 @@ class ReplayRecorder {
         }
         if (i < 0) return null;
         const s = this.segments[i];
-        return s.sample + Math.round((g - s.column) * s.perColumn);
+        return s.sample + rounded((g - s.column) * s.perColumn);
     }
 
     /// The engine column a position in the recording belongs to.
@@ -344,12 +357,12 @@ class ReplayRecorder {
         while (i + 1 < this.segments.length) {
             const s = this.segments[i], next = this.segments[i + 1];
             const boundary = s.sample
-                + Math.round((next.column - s.column) * s.perColumn);
+                + rounded((next.column - s.column) * s.perColumn);
             if (at < boundary) break;
             i++;
         }
         const s = this.segments[i];
-        const g = s.column + Math.round((at - s.sample) / s.perColumn);
+        const g = s.column + rounded((at - s.sample) / s.perColumn);
         // The line only ever moves forward, and `from` alone does not ensure
         // it. Turning De-skew *off* is the mirror of turning it on: the audio
         // between the boundary and the new stretch's origin belongs to no
@@ -406,7 +419,7 @@ class ReplayRecorder {
             for (let k = this.segments.length - 1; k >= 0; k--) {
                 if (this.segments[k].column <= lo) { s = this.segments[k]; break; }
             }
-            if (s) b = a + Math.round((end - lo) * s.perColumn);
+            if (s) b = a + rounded((end - lo) * s.perColumn);
         }
         const from = Math.max(0, a - this.base);
         const to = Math.min(this.held, b - this.base);
@@ -431,7 +444,7 @@ let recordedEpoch = -1, recordedPerColumn = 0, recordedLag = -1;
 let replayFrom = 0, replayTo = 0, replayFromSample = 0;
 /// The playing graph, and when it started.
 let replaySource = null, replayGainNode = null;
-let replayStarted = 0, replaySeconds = 0;
+let replayStarted = 0, replayStartedMs = 0, replaySeconds = 0;
 /// Per-tap group delay in seconds, from the engine. What De-skew is made of.
 let engineDelays = null;
 
@@ -715,6 +728,29 @@ function startWorker() {
             // on these and on De-skew, and is nearly two hundred milliseconds
             // with De-skew on. See `displayLagMs`.
             engineDelays = m.delays;
+            // The recording starts again here, which is the one place that
+            // catches every engine reload -- the first open and every change of
+            // ERB. Opening an engine nulls the old one and then fetches a
+            // coefficient file and builds a cascade, and every block of audio
+            // arriving in that window is discarded by the worker while this
+            // thread goes on recording it. Left alone, `written` would advance
+            // by the whole reload with no columns to show for it, and every
+            // column after it would map to audio earlier than the truth -- by
+            // more each time ERB was touched. The Mac throws the recording away
+            // at the same point, for the same reason.
+            stopReplay();
+            recorder.reset(ctx ? ctx.sampleRate : 0);
+            recordedPerColumn = 0;
+            recordedLag = -1;
+            // After the reset, and not left to `syncRecorder`. The button's
+            // visibility depends on the recorder having something in it, and
+            // nothing else here would notice: `stopReplay` above ran while the
+            // recorder was still full, `applyCloseUp` only wipes when the fit
+            // actually changes, and with an unchanged epoch and rate
+            // `syncRecorder` never takes the branch that would have called
+            // this. Without it, changing ERB on a frozen picture leaves Play
+            // Selection sitting there over an empty recording.
+            showReplayControls();
             applyCloseUp();              // the width limit needs the geometry
         } else if (m.type === 'columns') {
             // Dropped rather than queued while frozen. Live input carries on
@@ -1307,9 +1343,24 @@ let shownSens = null;
 // question about how the two transports interact, because they never coexist.
 
 /// Whether the audio arriving now belongs to the picture.
-function capturing() { return !playingFile && !paused; }
+///
+/// The live source is asserted, not deduced from the absence of a file. There
+/// are windows where `playingFile` is already false and nothing has replaced it
+/// -- between a file's `onended` and `finishFile`, and across the awaits in
+/// `playFile` and `startMic` -- and in those, silence delivered by a
+/// disconnected node would go into the recording and put Play Selection on a
+/// frozen end-of-file picture, offering a few tens of milliseconds of nothing.
+/// The Mac cannot reach that state because there it is a flag, set only where a
+/// live input actually starts.
+function capturing() { return !!micSource && !playingFile && !paused; }
 
-const isReplaying = () => replaySource !== null;
+// A declaration, not `const isReplaying = () => ...`. `showTransport()` runs at
+// the top of the module, before this point, and reaches `showReplayControls`
+// and `stopReplay` -- both hoisted -- which ask this. As a `const` it would
+// still be in its temporal dead zone, and the ReferenceError would abort the
+// rest of the module: no handlers, no audio, a dead page with one warning in
+// the status line.
+function isReplaying() { return replaySource !== null; }
 
 /// How far behind the sound the picture is, in milliseconds.
 ///
@@ -1399,6 +1450,7 @@ function startReplay() {
     replayFromSample = Math.max(a === null ? recorder.oldestSample : a,
                                 recorder.oldestSample);
     replayStarted = ctx.currentTime;
+    replayStartedMs = performance.now();
     replaySeconds = frames.length / ctx.sampleRate;
     display.playhead = sel.lo;
     showReplayControls();
@@ -1443,6 +1495,20 @@ function replayTick() {
         if (display.playhead !== null) stopReplay();
         return;
     }
+    // Wall time first, and it is not a belt-and-braces duplicate of the line
+    // below. `ctx.currentTime` does not advance while the context is suspended,
+    // and RePlay lives on a frozen picture -- where `onstatechange`
+    // deliberately does *not* auto-resume, because that is how pausing a file
+    // is implemented. Background the tab mid-playback and the audio clock
+    // stops: nothing would ever end the playback, and a stationary violet line
+    // on a frozen picture is exactly what the design says must never happen.
+    // The Mac's `hasReplayFinished` uses `CACurrentMediaTime` for this reason.
+    if ((performance.now() - replayStartedMs) / 1000 > replaySeconds + 0.25) {
+        stopReplay();
+        return;
+    }
+    // The render clock for the position itself, which is what the Mac's
+    // `playerTime` is.
     const elapsed = ctx.currentTime - replayStarted;
     // Running out is one of the ways playback ends, and it ends the same way
     // the button does.

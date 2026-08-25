@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
         int n = (int)std::min((size_t)BLOCK, in.size() - i);
         cochlea_process(e, in.data() + i, n);
         int got;
-        while ((got = cochlea_pull_columns(e, lv.data(), nullptr, nullptr, 256)) > 0) {
+        while ((got = cochlea_pull_columns(e, lv.data(), nullptr, nullptr, nullptr, nullptr, 256)) > 0) {
             for (int c = 0; c < got; ++c)
                 for (int t = 0; t < taps; ++t)
                     hist[t].push_back(lv[c * taps + t]);

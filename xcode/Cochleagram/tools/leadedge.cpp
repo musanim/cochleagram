@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i + 128 <= N; i += 128) {
         cochlea_process(e, in.data() + i, 128);
         int got;
-        while ((got = cochlea_pull_columns(e, lv.data(), nullptr, rf.data(), 256)) > 0) {
+        while ((got = cochlea_pull_columns(e, lv.data(), nullptr, rf.data(), nullptr, nullptr, 256)) > 0) {
             for (int c = 0; c < got; ++c)
                 for (int t = 0; t < taps; ++t) hist[t].push_back(lv[c * taps + t]);
             col += got;

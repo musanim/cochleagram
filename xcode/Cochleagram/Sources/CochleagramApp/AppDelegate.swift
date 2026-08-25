@@ -63,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var erbPopup: NSPopUpButton!
     private var modePopup: NSPopUpButton!
     private var pauseButton: NSButton!
+    private var spectrumButton: NSButton!
+    private var waveformButton: NSButton!
 
     // ---- RePlay ---------------------------------------------------------
     //
@@ -184,6 +186,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // recording is as long as the picture is wide.
         if let drawn = view.drawnColumns { recorder.trim(olderThan: drawn.lo) }
         replayTick()
+        // Position and fill the spectrum window. Every frame rather than on a
+        // resize notification: the frame depends on the window's position, its
+        // size, the toolbar's height and which screen it is on, and one cheap
+        // recomputation is less to get wrong than four observers.
+        updateSpectrum()
         // The end of the file, as the audio defines it: the frame after the
         // last one was fed to the cascade. Noticed here rather than signalled
         // from the audio thread, which is not a place to be scheduling work.
@@ -284,6 +291,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopRedrawClock()
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
         audio.stop()
+        tearDownSpectrum()
+    }
+
+    /// Detach and hide the spectrum window. Idempotent: it runs from the main
+    /// window closing and again at termination, and either may come first.
+    private func tearDownSpectrum() {
+        guard let w = spectrumWindow else { return }
+        // Detached before it is hidden. A child window left attached to a
+        // window that is going away is the kind of thing AppKit tolerates until
+        // it does not, and this one is created behind the scenes -- so it is
+        // taken down the same way.
+        if w.parent != nil { window?.removeChildWindow(w) }
+        w.orderOut(nil)
+        spectrumWindow = nil
+        spectrumView = nil
     }
 
     // MARK: - keyboard
@@ -530,6 +552,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pauseButton = button("", #selector(pauseButtonPressed(_:)))
         pauseButton.imagePosition = .imageOnly
         topRow.addArrangedSubview(pauseButton)
+
+        topRow.addArrangedSubview(divider())
+
+        // The spectrum trace: the newest column of the picture stood on its
+        // side, in its own window beyond the right-hand edge of this one.
+        //
+        // A drawn icon rather than an SF Symbol. The symbol set has waveforms
+        // and none of them is a single clean cycle, and what this control turns
+        // on is a curve of amplitude against frequency rather than "audio" in
+        // general. Acknowledged as not right yet -- a sine says "one tone",
+        // where the trace is a whole spectrum -- but it is a shape, not a word,
+        // and it will do until there is a better one.
+        spectrumButton = button("", #selector(toggleSpectrum(_:)))
+        spectrumButton.setButtonType(.pushOnPushOff)
+        spectrumButton.image = Self.sineIcon()
+        spectrumButton.imagePosition = .imageOnly
+        spectrumButton.toolTip = "Draw the newest column as a solid shape, "
+                               + "level running right from the picture's edge "
+                               + "and outside the window. The same numbers the "
+                               + "picture is drawn from, and the same exposure "
+                               + "window, so it moves with Sensitivity and "
+                               + "Range. Nothing shows if the window is hard "
+                               + "against the right of the screen, or full "
+                               + "screen: there is nowhere for it to go."
+        topRow.addArrangedSubview(spectrumButton)
+
+        // And the waveform strip: the sound the picture was made from, above
+        // it and sharing its columns. Same icon as the spectrum for now, which
+        // is wrong in an obvious way and will be replaced.
+        waveformButton = button("", #selector(toggleWaveform(_:)))
+        waveformButton.setButtonType(.pushOnPushOff)
+        waveformButton.image = Self.sineIcon()
+        waveformButton.imagePosition = .imageOnly
+        waveformButton.toolTip = "Draw the waveform above the picture, sharing "
+                               + "its columns. Full scale, so quiet sounds are "
+                               + "small. Switching it on makes the window "
+                               + "taller rather than making the picture "
+                               + "shorter."
+        topRow.addArrangedSubview(waveformButton)
 
         topRow.addArrangedSubview(divider())
 
@@ -909,6 +970,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentMinSize = NSSize(width: 640, height: 360)
         window.title = "Cochleagram"
         window.contentView = root
+        // The spectrum window is a child of this one, and it has to be detached
+        // *before* AppKit decides whether the last window has closed --
+        // `applicationWillTerminate` runs after that decision, which is too
+        // late. A notification rather than becoming the window's delegate:
+        // nothing else here wants to be one, and a delegate is a bigger thing
+        // to own than a single observation.
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window,
+            queue: .main) { [weak self] _ in self?.tearDownSpectrum() }
         // Size and position are AppKit's own business once the frame has a
         // name: it saves on every move and resize. `contentMinSize` is set
         // above so an undersized saved frame is clamped on the way in, and
@@ -967,6 +1037,201 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let b = NSButton(title: title, target: self, action: sel)
         b.bezelStyle = .rounded
         return b
+    }
+
+    /// One cycle of a sine, as a template image.
+    ///
+    /// Drawn rather than fetched from SF Symbols, so it cannot come back nil on
+    /// a system that does not have the name -- every other icon here carries a
+    /// fallback for that reason, and a shape this simple is cheaper to draw
+    /// than to guard. A template image is alpha only: AppKit tints it for the
+    /// button's state, which is what makes the on/off state legible.
+    private static func sineIcon() -> NSImage {
+        let size = NSSize(width: 18, height: 14)
+        let image = NSImage(size: size, flipped: false) { rect in
+            let path = NSBezierPath()
+            let steps = 48
+            let amp = (rect.height - 4) / 2
+            let mid = rect.midY
+            for i in 0...steps {
+                let t = CGFloat(i) / CGFloat(steps)
+                let x = rect.minX + 1.5 + t * (rect.width - 3)
+                let y = mid + amp * sin(t * 2 * .pi)
+                if i == 0 {
+                    path.move(to: NSPoint(x: x, y: y))
+                } else {
+                    path.line(to: NSPoint(x: x, y: y))
+                }
+            }
+            path.lineWidth = 1.5
+            path.lineCapStyle = .round
+            path.lineJoinStyle = .round
+            NSColor.black.setStroke()
+            path.stroke()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    @objc private func toggleSpectrum(_ sender: NSButton) {
+        settings.showSpectrum = sender.state == .on
+        updateSpectrum()
+        save()
+    }
+
+    @objc private func toggleWaveform(_ sender: NSButton) {
+        setWaveform(sender.state == .on, growingWindow: true)
+        save()
+    }
+
+    /// Show or hide the waveform strip.
+    ///
+    /// `growingWindow` is the whole subtlety. The strip takes a sixth of the
+    /// space it shares with the picture, so switching it on would otherwise
+    /// shorten the picture -- and the picture's height is the frequency scale,
+    /// which is not a thing to shrink because a readout was added. So a *user*
+    /// switching it on makes the window taller by exactly the strip's height,
+    /// and the picture comes out where it was.
+    ///
+    /// Applying the stored setting at launch must not do that. The window's
+    /// frame is autosaved, so the saved height already includes the strip; the
+    /// two are consistent as long as the growing happens only when someone asks
+    /// for it. Every path that changes this from a person's action passes true,
+    /// and the one that restores what was already agreed passes false.
+    private func setWaveform(_ on: Bool, growingWindow: Bool) {
+        let was = view.showsWaveform
+        let changing = growingWindow && on != was
+        // Measured *before* the change, so it is the height the picture has
+        // now and therefore the height it should still have afterwards.
+        //
+        // The same expression serves both directions, which is not a
+        // coincidence: turning on, the strip to be added is a fifth of the
+        // picture; turning off, the strip to be removed is a sixth of what the
+        // two currently share, and a sixth of six parts is a fifth of five.
+        let share = CochleagramView.waveformShare
+        let delta = (view.plotFrame.height * share / (1 - share)).rounded()
+
+        settings.showWaveform = on
+        view.showsWaveform = on
+        waveformButton?.state = on ? .on : .off
+        guard changing, let w = window else { return }
+
+        var f = w.frame
+        // The top edge stays put and the bottom moves, so the toolbar and the
+        // picture stay where the eye left them.
+        let d = on ? delta : -delta
+        f.origin.y -= d
+        f.size.height += d
+        // Except when there is no room below. `constrainFrameRect` only keeps
+        // the title bar on screen, so a window already sitting on the bottom
+        // edge would have its status strip pushed off it -- and the frame is
+        // autosaved, so it would stay pushed off. Whatever will not fit
+        // downward is taken off the top instead; if it will not fit either way
+        // the window simply ends up as tall as the screen and the picture is
+        // shorter than it was, which is the honest outcome.
+        if let vis = w.screen?.visibleFrame {
+            if f.minY < vis.minY { f.origin.y = vis.minY }
+            if f.maxY > vis.maxY {
+                f.size.height -= f.maxY - vis.maxY
+            }
+        }
+        w.setFrame(f, display: true, animate: false)
+    }
+
+    // MARK: - the spectrum window
+    //
+    // The trace is drawn beyond the right-hand edge of the main window, in a
+    // transparent borderless window of its own, so that it has a background
+    // that is not the picture. Two inks were tried over the picture and neither
+    // read against it.
+    //
+    // A child window, so it travels with the parent: `addChildWindow` makes
+    // AppKit move it when the main window moves, order it with it, and take it
+    // away when the main window is minimised or closed. What that does *not* do
+    // is resize it, so the frame is recomputed on every frame tick -- cheap,
+    // and it means nothing has to listen for a resize, a toolbar reflow or a
+    // change of screen.
+    //
+    // Known costs, all accepted: it is clipped by the edge of the screen, so
+    // with the window hard right there is nowhere for it to go; it goes behind
+    // with the rest of the app when another app comes forward; and the backdrop
+    // is whatever happens to be there.
+
+    private var spectrumWindow: NSWindow?
+    private var spectrumView: SpectrumView?
+
+    /// How far the black point sits from the zero line, as a fraction of the
+    /// plot's width -- so the scale matches what it was when the trace was
+    /// drawn over the picture.
+    private let spectrumBlackFraction: CGFloat = 0.25
+    /// And how much window there is beyond that. Levels past the black point
+    /// are not clipped by the arithmetic, so they need somewhere to go; past
+    /// this they are clipped by the window, which cannot be helped.
+    private let spectrumHeadroom: CGFloat = 2.0
+
+    private func makeSpectrumWindow() -> NSWindow {
+        let v = SpectrumView(frame: NSRect(x: 0, y: 0, width: 200, height: 200))
+        let w = NSWindow(contentRect: v.frame, styleMask: .borderless,
+                         backing: .buffered, defer: false)
+        w.contentView = v
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        // Clicks belong to whatever is underneath. This window is a readout,
+        // not a control, and a transparent rectangle that swallowed clicks
+        // over another app would be indefensible.
+        w.ignoresMouseEvents = true
+        w.isReleasedWhenClosed = false
+        // Nothing here makes it refuse key or main -- being borderless already
+        // does, since `canBecomeKey` is false for such a window by default.
+        // This only says it should not vanish when another app comes forward,
+        // which is the default for a plain window and is stated because the
+        // obvious alternative, an NSPanel, does the opposite.
+        w.hidesOnDeactivate = false
+        spectrumView = v
+        return w
+    }
+
+    /// Show, hide, position and fill the spectrum window. Called every frame.
+    private func updateSpectrum() {
+        guard let main = window else { return }
+        guard settings.showSpectrum else {
+            // Guarded, because this runs sixty times a second for as long as
+            // the trace is switched off. Detaching an already-detached window
+            // and hiding an already-hidden one is cheap, but not free, and not
+            // something to do at frame rate for no reason.
+            if let w = spectrumWindow, w.parent != nil || w.isVisible {
+                main.removeChildWindow(w)
+                w.orderOut(nil)
+            }
+            return
+        }
+
+        let w = spectrumWindow ?? makeSpectrumWindow()
+        if spectrumWindow == nil { spectrumWindow = w }
+
+        // The plot's rectangle, in screen coordinates. Its right edge is the
+        // view's right edge and so the window's, which is where the trace
+        // starts; its top and bottom are the ends of the frequency scale, which
+        // the trace has to line up with exactly.
+        let plot = view.plotFrame
+        let inWindow = view.convert(plot, to: nil)
+        let onScreen = main.convertToScreen(inWindow)
+        let reach = max(1, onScreen.width * spectrumBlackFraction)
+        let frame = NSRect(x: onScreen.maxX, y: onScreen.minY,
+                           width: reach * spectrumHeadroom,
+                           height: max(1, onScreen.height))
+        if w.frame != frame { w.setFrame(frame, display: false) }
+
+        spectrumView?.blackReach = reach
+        spectrumView?.update(view.spectrumTrace() ?? [])
+
+        if w.parent == nil {
+            // Ordered above the parent, which is what keeps it visible over
+            // whatever the parent is sitting on.
+            main.addChildWindow(w, ordered: .above)
+        }
     }
 
     /// Add a device to a menu *without* `NSPopUpButton.addItem(withTitle:)`,
@@ -1402,6 +1667,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         paused = true
         view.discardWhilePaused = true
         view.isPaused = true
+        // The button has to say what the state is. This froze the display
+        // without telling it, so when this ran against a source it had no
+        // business running against the picture stopped while the button went on
+        // claiming to be running -- which made the underlying fault look like a
+        // button that needed pressing twice.
+        showPauseButton()
     }
 
     /// The file has been *heard* to its end: the output reports it has played
@@ -2174,6 +2445,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showSettingsInControls() {
         deskewBox.state = settings.deskew ? .on : .off
+        spectrumButton.state = settings.showSpectrum ? .on : .off
+        // The window is shown or hidden here as well as in the action, because
+        // this runs at launch and after Defaults, where no action fires.
+        updateSpectrum()
+        // Without growing the window: at launch the saved frame already
+        // accounts for the strip. `restoreDisplayDefaults` does its own resize
+        // afterwards, because that one *is* somebody asking.
+        setWaveform(settings.showWaveform, growingWindow: false)
         showCloseUpSpan()
         invertBox.state = settings.invert ? .on : .off
         autoBox.state = settings.autoGain ? .on : .off
@@ -2246,12 +2525,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settings.displayMode    = d.displayMode
         settings.closeUpSpanMS  = d.closeUpSpanMS
         settings.closeUpColumns = d.closeUpColumns
+        settings.showSpectrum   = d.showSpectrum
         // Volume is a display control in the sense that matters here: it is on
         // the toolbar and it is one of the values the two apps have to agree
         // on. Applied to any sound already running, so the button's effect is
         // audible rather than only stored.
         settings.replayGainDB   = d.replayGainDB
         audio.setReplayGain(settings.replayGainDB)
+
+        // The waveform is restored through its own path, because it is the one
+        // display setting whose change resizes the window -- and a press of
+        // Defaults is somebody asking, so the window should follow. Taken
+        // *before* `showSettingsInControls`, which applies the stored state
+        // without resizing and would otherwise leave the two disagreeing.
+        setWaveform(d.showWaveform, growingWindow: true)
 
         showSettingsInControls()
         applyToEngine()

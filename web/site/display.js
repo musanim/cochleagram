@@ -302,7 +302,7 @@ export class Display {
         this.clearMeasurement();
         this.closeUpColumns = c;
         this.aggregate = a;
-        if (retime) { this.fineIndex = 0; this.clear(); }
+        if (retime) this.clear();
     }
 
     /// Wipe the picture. The two regions are about to disagree about what a
@@ -312,6 +312,12 @@ export class Display {
         this.coherence.fill(NO_COHERENCE);
         this.refs.fill(0);
         this.fine.fill(-1);
+        // Here rather than in the caller, as `CochleagramView.clear` has it.
+        // With the close-up open, a wipe that left this large would have the
+        // next append promote columns straight out of the just-wiped strip into
+        // the main picture, stamping real engine indices onto columns holding
+        // nothing but silence.
+        this.fineIndex = 0;
         // A wipe ends the old numbering, so a recorder that missed it would go
         // on mapping columns to audio through an origin that no longer means
         // anything.
