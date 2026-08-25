@@ -29,6 +29,39 @@ function cString(M, s) {
     return p;
 }
 
+/// How many arguments each call into the engine expects, for the calls whose
+/// signature has changed since the first build.
+///
+/// A JavaScript call into WebAssembly with **more** arguments than the export
+/// declares silently drops the extras -- so a widened C interface against a
+/// stale `cochlea.wasm` does not fail. It shifts: the last argument the export
+/// does declare receives whatever JavaScript passed in that position, which
+/// here is a heap pointer arriving as `max_cols`. The pull is then effectively
+/// unbounded and writes past the buffer it was given, and the two arrays the
+/// old build knows nothing about are never written, so the waveform strip draws
+/// a flat line and the fault looks like a drawing bug.
+///
+/// `publish.sh` compares timestamps and refuses; `serve.sh` does not, and a
+/// timestamp cannot see a `git checkout` anyway. This asks the module itself.
+/// A WebAssembly export's `length` is its parameter count.
+const EXPECTED_ARITY = { _cochlea_pull_columns: 7 };
+
+function checkInterface(M) {
+    for (const [name, want] of Object.entries(EXPECTED_ARITY)) {
+        const fn = M[name];
+        if (typeof fn !== 'function') {
+            throw new Error(`cochlea.wasm has no ${name} -- run web/build.sh`);
+        }
+        // Zero means the build tool wrapped the export in a way that hides the
+        // count. Nothing to check, rather than a false alarm.
+        if (fn.length !== 0 && fn.length !== want) {
+            throw new Error(
+                `cochlea.wasm is stale: ${name} takes ${fn.length} arguments, `
+                + `this page passes ${want} -- run web/build.sh`);
+        }
+    }
+}
+
 export class Cochlea {
 
     /// Load a coefficient set and open an engine on it.
@@ -40,6 +73,7 @@ export class Cochlea {
     /// differ between platforms.
     static async create(coeffURL, inputRate) {
         const M = await loadModule();
+        checkInterface(M);
         const res = await fetch(coeffURL);
         if (!res.ok) throw new Error(`${coeffURL}: ${res.status}`);
         const bytes = new Uint8Array(await res.arrayBuffer());

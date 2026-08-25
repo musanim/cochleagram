@@ -49,7 +49,31 @@ class NoCache(http.server.SimpleHTTPRequestHandler):
         # time, and a development server that punishes you for forgetting is
         # not doing its job. `publish.sh` stamps the same pattern once, at
         # publish time; this stamps it on every request.
-        path = self.translate_path(self.path.split('?', 1)[0])
+        url = self.path.split('?', 1)[0]
+        path = self.translate_path(url)
+        # A request for a directory is a request for its index.html, and that
+        # is the file to rewrite.
+        #
+        # Without this, `http://localhost:8000/` -- which is what the line
+        # above prints and therefore what anybody actually types -- translated
+        # to the directory, `isfile` was false, and the request fell through to
+        # the plain handler untouched. So the entry page was the one file that
+        # got neither substitution: its title still said "(dev)", and its
+        # module imports still carried whatever `?v=` the source had, which is
+        # the same stamp every time and exactly what the rewrite exists to
+        # prevent. Asking for `/index.html` by name worked, which is why this
+        # looked like a caching problem rather than a serving one.
+        #
+        # Only when the URL ends in a slash. Without one the plain handler
+        # issues a redirect to add it, and answering here instead would leave
+        # every relative URL on the page resolving against the parent
+        # directory.
+        if url.endswith('/') and os.path.isdir(path):
+            for name in ('index.html', 'index.htm'):
+                candidate = os.path.join(path, name)
+                if os.path.isfile(candidate):
+                    path = candidate
+                    break
         if os.path.isfile(path) and path.endswith(('.html', '.js')):
             with open(path, 'rb') as f:
                 body = f.read()

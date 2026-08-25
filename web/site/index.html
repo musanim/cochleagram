@@ -56,7 +56,11 @@
      interpolation destroys exactly that. A window too short to show it all
      scrolls; it does not squeeze.
      616 = the 600 of picture plus the 8 above and 8 below that the display
-     reserves for the top label's overhang and the bottom edge. */
+     reserves for the top label's overhang and the bottom edge.
+     This value is what shows until display.js has run; from then on the
+     display owns the height, because the waveform strip adds to it rather
+     than taking from the picture. See PICTURE_HEIGHT there -- the arithmetic
+     is the same and the two have to agree. */
   #view { flex: 0 0 auto; width: 100%; height: 616px; display: block; }
   #view.drop { outline: 3px solid #0a68d0; outline-offset: -3px; }
 </style>
@@ -110,6 +114,12 @@
   <div class="bar">
     <label><input type="checkbox" id="invert"> Invert</label>
     <label><input type="checkbox" id="deskew"> De-skew</label>
+    <!-- The two readouts. Both are about the picture rather than about what
+         part of the sound it shows, so they belong in this first group. -->
+    <label><input type="checkbox" id="waveform"
+      title="The sound the picture was drawn from, above it and sharing its columns"> Waveform</label>
+    <label><input type="checkbox" id="spectrum"
+      title="The newest column stood on its side, to the right of the picture. Drag the line between them to change how much room it gets."> Spectrum</label>
     <div class="rule"></div>
     <label>Speed
       <!-- Filled from COLUMN_STEPS at startup, so the detents cannot drift
@@ -490,6 +500,14 @@ const defaults = {
     // written -100 to -40 -- is still the one the display is really read at,
     // once you can see where the signal is. That is what the sliders are for.
     invert: false, autoGain: false, sensDB: 95, rangeDB: 170,
+    // The two readouts, and how much width the spectrum gets.
+    //
+    // The Mac's defaults, so that the two apps opened side by side show the
+    // same thing. They cost differently, though: out there the spectrum is a
+    // window of its own beyond the app and takes nothing from the picture,
+    // while in here it can only be paid for in columns -- which is what the
+    // draggable boundary is for.
+    showWaveform: false, showSpectrum: true, spectrumShare: 0.24,
     // How much of the recent past the close-up strip shows, in milliseconds;
     // zero is off. The *span* is what is stored, not the width, because the
     // width that gives it depends on Speed -- and what you want when you come
@@ -526,7 +544,8 @@ const REPLAY_GAIN_RANGE = [-40, 12];
 /// copy of the values would only be a way for the two to drift apart. The Mac
 /// app's Defaults button omits the same two, for the same reason.
 const DISPLAY_KEYS = ['deskew', 'invert', 'autoGain', 'sensDB', 'rangeDB',
-                      'closeUpSpanMs', 'closeUpColumns', 'replayGainDb'];
+                      'closeUpSpanMs', 'closeUpColumns', 'replayGainDb',
+                      'showWaveform', 'showSpectrum', 'spectrumShare'];
 const displayDefaults =
     Object.fromEntries(DISPLAY_KEYS.map(k => [k, defaults[k]]));
 // The window is set by where its middle is and how wide it is, not by its two
@@ -630,6 +649,8 @@ function applySettings() {
     $('erb').value = S.erb;
     $('deskew').checked = S.deskew;
     $('invert').checked = S.invert;
+    $('waveform').checked = S.showWaveform;
+    $('spectrum').checked = S.showSpectrum;
     $('auto').checked = S.autoGain;
     $('sens').value = String(S.sensDB);
     $('rng').value  = String(S.rangeDB);
@@ -642,6 +663,15 @@ function applySettings() {
     display.exposure.autoGain = S.autoGain;
     Object.assign(display.exposure, windowFor(S.sensDB, S.rangeDB));
     display.columnMs = S.columnMs;
+    // Clamped on the way in, because it is read back from localStorage and a
+    // hand-edited or half-written value would otherwise size the picture.
+    display.spectrumShare = Number.isFinite(S.spectrumShare)
+        ? Math.min(0.5, Math.max(0.05, S.spectrumShare))
+        : defaults.spectrumShare;
+    // Last, so the resize it does uses the share just set. Changes the canvas's
+    // height and the column count, so anything that depends on the column count
+    // has to run after this -- which `applyCloseUp` does, being called below.
+    display.setReadouts({ waveform: S.showWaveform, spectrum: S.showSpectrum });
 }
 applySettings();
 
@@ -756,9 +786,12 @@ function startWorker() {
             // Dropped rather than queued while frozen. Live input carries on
             // whether we are looking or not, and a queue would replay the
             // waiting seconds at high speed the moment you resumed.
-            if (!paused) { display.append(m.levels, m.coherence, m.refs, m.columns); }
+            if (!paused) {
+                display.append(m.levels, m.coherence, m.refs,
+                               m.inLo, m.inHi, m.columns);
+            }
             colsSeen += m.columns;
-            } else if (m.type === 'flushed') {
+        } else if (m.type === 'flushed') {
             // Every column the file produced has now been appended.
             if (m.token === endToken) finishFile();
         } else if (m.type === 'error') {
@@ -1245,6 +1278,28 @@ $('invert').onchange = e => {
     S.invert = e.target.checked; save();
     display.exposure.inverted = S.invert;
     display.remapAll();
+};
+// Neither is marked. A mark says the picture stops meaning what it meant, and
+// nothing about the sound or its timing changes here -- the strip takes no
+// columns from the picture at all, and the spectrum takes the oldest of them
+// away exactly as dragging the window narrower does, which is not marked
+// either.
+$('waveform').onchange = e => {
+    S.showWaveform = e.target.checked; save();
+    display.setReadouts({ waveform: S.showWaveform });
+};
+$('spectrum').onchange = e => {
+    S.showSpectrum = e.target.checked; save();
+    display.setReadouts({ spectrum: S.showSpectrum });
+    // The column count has moved, and half the picture is the close-up strip's
+    // ceiling -- so the current strip may now be illegal. The ResizeObserver
+    // does this after a window resize; nothing observes a change of share.
+    refit();
+};
+display.onSpectrumShareChanged = share => {
+    S.spectrumShare = share;
+    refit();
+    save();
 };
 $('auto').onchange = e => {
     if (!e.target.checked) {

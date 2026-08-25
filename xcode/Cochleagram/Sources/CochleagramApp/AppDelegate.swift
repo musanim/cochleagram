@@ -565,9 +565,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // where the trace is a whole spectrum -- but it is a shape, not a word,
         // and it will do until there is a better one.
         spectrumButton = button("", #selector(toggleSpectrum(_:)))
-        spectrumButton.setButtonType(.pushOnPushOff)
-        spectrumButton.image = Self.sineIcon()
-        spectrumButton.imagePosition = .imageOnly
+        makeIconToggle(spectrumButton,
+                       off: Self.spectrumIcon(paper: nil),
+                       on: Self.spectrumIcon(paper: Self.iconPaperOn),
+                       #selector(toggleSpectrum(_:)))
         spectrumButton.toolTip = "Draw the newest column as a solid shape, "
                                + "level running right from the picture's edge "
                                + "and outside the window. The same numbers the "
@@ -586,11 +587,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         waveformButton.image = Self.sineIcon()
         waveformButton.imagePosition = .imageOnly
         waveformButton.toolTip = "Draw the waveform above the picture, sharing "
-                               + "its columns. Full scale, so quiet sounds are "
-                               + "small. Switching it on makes the window "
-                               + "taller rather than making the picture "
-                               + "shorter."
+                               + "its columns. Scaled by Sensitivity: a sound "
+                               + "loud enough to render solid black fills most "
+                               + "of the strip, and both saturate together. "
+                               + "Switching it on makes the window taller "
+                               + "rather than making the picture shorter."
         topRow.addArrangedSubview(waveformButton)
+
+        // Matched to the bezelled button beside it rather than to a number.
+        // Its own intrinsic size is its image, which is smaller, and AppKit's
+        // bezel metrics are not something to write down here and have go stale.
+        NSLayoutConstraint.activate([
+            spectrumButton.widthAnchor.constraint(
+                equalTo: waveformButton.widthAnchor),
+            spectrumButton.heightAnchor.constraint(
+                equalTo: waveformButton.heightAnchor),
+        ])
 
         topRow.addArrangedSubview(divider())
 
@@ -1072,6 +1084,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         image.isTemplate = true
         return image
+    }
+
+    /// A spectrum: bars of differing height on paper, in a rounded panel.
+    ///
+    /// Not a template image, and deliberately. A template is alpha only, so it
+    /// would come out as a solid tinted blob -- and what makes this read as a
+    /// spectrum is ink *against paper*, which is the same black-on-white the
+    /// picture itself uses. It therefore does not follow the system appearance:
+    /// it is a tiny display, and the display is paper whichever way the rest of
+    /// the window is set.
+    ///
+    /// Drawn rather than an asset, like the sine beside it: no file to add to
+    /// the project, nothing to come back nil, and it is right at any size.
+    /// The paper the bars sit on: white while the readout is off, blue while it
+    /// is on. The button is borderless, so this *is* the pressed state -- there
+    /// is no bezel left to show it.
+    ///
+    /// Fixed colours rather than `NSColor.systemBlue` or the accent colour: an
+    /// `NSImage` drawing handler is called once and cached, so a dynamic colour
+    /// here would freeze at whatever appearance happened to be current when the
+    /// button was first drawn, which is worse than not adapting at all.
+    private static let iconPaperOff = NSColor.white
+    private static let iconPaperOn = NSColor(srgbRed: 0.0, green: 0.48,
+                                             blue: 1.0, alpha: 1)
+
+    /// `paper` nil draws the bars alone, with nothing behind them, and marks
+    /// the result a template -- so the off state is just the spectrum, tinted
+    /// by AppKit for whichever appearance is in force. With paper it is a
+    /// coloured panel and not a template, because a template is alpha only and
+    /// would flatten the bars into the panel.
+    ///
+    /// No outline either way. It was there to keep white paper from vanishing
+    /// into a light toolbar; with the off state carrying no paper at all there
+    /// is nothing to lose an edge against.
+    private static func spectrumIcon(paper: NSColor?) -> NSImage {
+        let size = NSSize(width: 28, height: 20)
+        let image = NSImage(size: size, flipped: false) { rect in
+            if let paper {
+                paper.setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4).fill()
+            }
+
+            // A plausible spectrum rather than a measured one: a few strong
+            // partials, an envelope falling towards the top of the range.
+            let heights: [CGFloat] = [0.50, 1.00, 0.62, 0.85, 0.42, 0.55, 0.28]
+            let inner = rect.insetBy(dx: 3, dy: 3)
+            let gapRatio: CGFloat = 0.6
+            let n = CGFloat(heights.count)
+            let barW = inner.width / (n + (n - 1) * gapRatio)
+            NSColor.black.setFill()
+            for (i, h) in heights.enumerated() {
+                let x = inner.minX + CGFloat(i) * barW * (1 + gapRatio)
+                NSBezierPath(rect: NSRect(x: x, y: inner.minY, width: barW,
+                                          height: inner.height * h)).fill()
+            }
+            return true
+        }
+        image.isTemplate = (paper == nil)
+        return image
+    }
+
+    /// Make an icon fill its button.
+    ///
+    /// Borderless, so the drawn panel is the whole visible control rather than
+    /// a small picture inside AppKit's bezel -- the panel already has its own
+    /// rounded edge and outline, so a second one around it was two borders and
+    /// a lot of grey. `.toggle` is the button type that swaps to
+    /// `alternateImage` and stays there until pressed again, which is what
+    /// carries the on state now that there is no bezel to shade.
+    private func makeIconToggle(_ b: NSButton, off: NSImage, on: NSImage,
+                                _ sel: Selector) {
+        b.isBordered = false
+        b.setButtonType(.toggle)
+        b.image = off
+        b.alternateImage = on
+        b.imagePosition = .imageOnly
+        b.imageScaling = .scaleProportionallyUpOrDown
+        b.target = self
+        b.action = sel
+        // No size constraint here. A borderless button's intrinsic size is its
+        // image, which came out visibly smaller than the bezelled buttons
+        // beside it; the caller matches it to one of those instead, so the row
+        // stays even whatever AppKit's bezel metrics turn out to be.
     }
 
     @objc private func toggleSpectrum(_ sender: NSButton) {

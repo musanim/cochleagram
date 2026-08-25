@@ -708,6 +708,19 @@ final class CochleagramView: NSView {
             self.append(lv, co, rf, lo, hi, columns: n)
         }
         if pending > 0 { needsDisplay = true }
+        // After the columns, so the controller sees this frame's sound; and
+        // inside `tick`, which does not run while the picture is frozen.
+        //
+        // Run whether or not the strip is showing. The accumulators are filled
+        // either way, so skipping this would let them ratchet up to the loudest
+        // thing ever heard -- and switching the strip on would then start from
+        // that and spend a couple of seconds coming down. This way it is
+        // already settled when it appears.
+        // Only on a frame that actually drained something. A frame with no
+        // columns has measured nothing, and following it would read as
+        // "silence was heard": both trackers would decay, and once the ink hit
+        // its floor the shape already on screen would start growing.
+        if pending > 0 { updateWaveformGain() }
         columnsSinceJoin += pending
 
         // One line a second, so the log shows whether the display is keeping
@@ -955,12 +968,20 @@ final class CochleagramView: NSView {
         // that much harder the moment the strip was opened.
         let engineMS = mainColumnMS / Double(max(1, aggregate))
         let step = autoRateDB * Float(engineMS / 1000.0)
+        // The loudest tap in the batch, in dB, for the waveform's gain. Taken
+        // here because this is the one place that already visits every tap of
+        // every arriving column, so it costs a compare and no extra pass. The
+        // *level* rather than the ink: which reference applies depends on
+        // whether Auto gain is on, and that is not this function's business.
+        var peakDB = -Float.greatestFiniteMagnitude
         for j in 0..<n {
             let base = j * height
             let lo = white + autoRef
             var sum: Float = 0
             for y in 0..<height {
-                let t = (src[base + y] - lo) / span
+                let v = src[base + y]
+                if v > peakDB { peakDB = v }
+                let t = (v - lo) / span
                 sum += t < 0 ? 0 : (t > 1 ? 1 : t)
             }
             out[j] = autoRef
@@ -971,6 +992,9 @@ final class CochleagramView: NSView {
             // is, and those can be a hundred and fifty decibels apart -- a
             // MacBook and an iPad in one quiet room differ by about fifty.
             autoRef = min(250, max(-250, autoRef + step * err))
+        }
+        if peakDB > -Float.greatestFiniteMagnitude {
+            batchPeakDB = max(batchPeakDB, peakDB)
         }
         return out
     }
@@ -994,6 +1018,16 @@ final class CochleagramView: NSView {
         }
         if columnLo.count != width { columnLo = [Float](repeating: 0, count: width) }
         if columnHi.count != width { columnHi = [Float](repeating: 0, count: width) }
+
+        // The batch's largest excursion, for the waveform's gain. Taken from
+        // the whole batch rather than from the columns that survive on screen:
+        // the controller is following the sound, and a column dropped for want
+        // of room was still heard.
+        for c in 0..<n {
+            let a = abs(inLo[c]), b = abs(inHi[c])
+            let e = CGFloat(a > b ? a : b)
+            if e > batchExcursion { batchExcursion = e }
+        }
 
         // Never more than half the window: the strip is now wide enough that
         // on a small window it could otherwise leave the ordinary picture a
@@ -1527,9 +1561,152 @@ final class CochleagramView: NSView {
     // spike should sit directly above the vertical edge it draws; with it off,
     // above the top of the slanted one.
 
-    /// Full scale. A waveform that rescaled itself would be easier to read and
-    /// would stop meaning anything between one screenful and the next.
-    private static let waveformFullScale: CGFloat = 1.0
+    // ---- how tall the waveform is drawn ---------------------------------
+    //
+    // Not a fixed scale, and not a fixed factor against the exposure either.
+    // Both were tried, and the trouble with any constant is that the two scales
+    // are not commensurate and cannot be made so: the picture's decibels are a
+    // *tap's* held peak after filtering, the strip's are the input's raw
+    // excursion, and what lies between them depends on the signal. A pure tone
+    // puts nearly all of itself into one tap and reads high; speech, spread
+    // across hundreds of filters, reads about 28 dB below its own peak
+    // excursion -- the factor of twenty-five a fixed constant had to be trimmed
+    // by. Noise would want a third number and a narrower ERB a fourth.
+    //
+    // So the gain is taken from the picture, which already contains the answer.
+    // The rule is the one the eye wants: **a picture with solid black in it
+    // draws a full-range waveform; a white picture draws a flat line**, and
+    // everything between is proportional. Whatever the signal, and wherever
+    // Sensitivity, Range and ERB are set, the strip fills when the picture is
+    // dark -- because it is scaled by how dark the picture actually came out
+    // rather than by a prediction of how dark it ought to be.
+    //
+    // Which makes it an automatic gain control, and it behaves like one: quick
+    // to catch a loud moment, slow to let go of it, so the shape does not
+    // breathe on every syllable.
+
+    /// How quickly the scale is allowed to *grow* -- which shrinks the shape.
+    /// Quick, because that is the direction that prevents clipping: a sound
+    /// that has just got louder needs the room immediately.
+    private static let waveformScaleUp: Double = 0.05
+    /// And how slowly it may *shrink*, which enlarges the shape.
+    ///
+    /// The slow one, and this is the direction that matters. The cochlea's low
+    /// taps ring for a good fraction of a second after a burst has stopped, so
+    /// when the sound ends the excursion falls away at once while the ink does
+    /// not. The ratio between them therefore dives, the gain shoots up, and
+    /// whatever quiet material follows -- along with the loud part still on
+    /// screen -- is drawn far too large. Refusing to follow that quickly is the
+    /// whole of the fix.
+    private static let waveformScaleDown: Double = 3.0
+
+    /// Headroom. The rule says a black picture fills the strip; in use it
+    /// overflowed too often, because the darkest tap anywhere in a batch
+    /// reaches black long before the picture as a whole looks black.
+    ///
+    /// Two to begin with, then 1.6, then 1.28 -- two quarter-increases in gain,
+    /// both of which the strip turned out to have room for once the tracking
+    /// above stopped diving after every burst. The room had been there all
+    /// along, spent absorbing those dives rather than showing signal.
+    ///
+    /// At 1.28 a black-rendering sound draws at about four fifths of the strip.
+    /// One is the floor of this number, not a target: there a black-rendering
+    /// sound exactly fills the strip and anything darker clips, so the last
+    /// fifth is the whole of the remaining margin.
+    private static let waveformHeadroom: CGFloat = 1.28
+    /// A floor under the divisor, so the gain cannot run away on a picture with
+    /// no ink in it.
+    ///
+    /// It is *not* the "white picture draws a flat line" case, and the
+    /// difference is worth knowing before wondering why the strip never
+    /// flattens. On the default window -- white at -180 dB, black at -10 -- a
+    /// quiet room's taps sit around -80, which is more than half way up the
+    /// grey scale. A picture faint enough to reach this floor is one nothing
+    /// audible produces. So in practice the strip runs between roughly half
+    /// height and full, tracking how dark the picture is within that, and the
+    /// flat line is what silence gives by having no excursion rather than by
+    /// having no ink.
+    private static let waveformMinInk: CGFloat = 0.02
+
+    /// The darkest tap and the largest excursion since the last frame.
+    /// Accumulated rather than assigned: `append` can run more than once a
+    /// frame, and the controller wants the whole frame.
+    private var batchPeakDB = -Float.greatestFiniteMagnitude
+    private var batchExcursion: CGFloat = 0
+    /// What the controller is holding.
+    private var trackedInk: CGFloat = 0
+    private var trackedExcursion: CGFloat = 0
+    private var agcTick: CFTimeInterval = 0
+
+    /// Run the controller once for this frame.
+    ///
+    /// From `tick`, after the columns have been appended, and only while the
+    /// picture is moving -- so a frozen display holds the gain it froze at and
+    /// the shape on screen goes on meaning what it meant.
+    private func updateWaveformGain() {
+        let now = CACurrentMediaTime()
+        // Clamped, and that matters more than it looks. The display link stops
+        // while the picture is frozen, while the window is minimised, and
+        // across a change of source, so the next call can arrive seconds or
+        // minutes later -- and `exp(-dt/tau)` then underflows to zero, which
+        // replaces both trackers outright with one frame's values. That is the
+        // opposite of holding the gain the display froze at. A tenth of a
+        // second is several frames of catching up and no more.
+        let dt = agcTick > 0 ? min(max(now - agcTick, 0), 0.1) : 0
+        agcTick = now
+
+        // What the darkest tap of this batch is drawn at, under whichever
+        // reference the picture is using.
+        let white = Float(exposure.whiteDB)
+        let span = Float(max(exposure.blackDB - exposure.whiteDB, 1e-6))
+        let ref = exposure.autoGain ? autoRef : 0
+        var ink: CGFloat = 0
+        if batchPeakDB > -Float.greatestFiniteMagnitude {
+            let t = (batchPeakDB - ref - white) / span
+            ink = CGFloat(t < 0 ? 0 : (t > 1 ? 1 : t))
+        }
+
+        // One coefficient, decided by where the *gain* is going, and applied
+        // to both quantities.
+        //
+        // Following them independently was the first attempt and it pumps: ink
+        // attacks in fifty milliseconds while excursion is still holding a loud
+        // moment for two seconds, so a broadband passage followed by a quiet
+        // tone drops the scale by half in a single frame and everything still
+        // on screen jumps taller. With one coefficient the ratio moves
+        // monotonically towards its target and cannot overshoot, because a
+        // common rise or fall leaves it unchanged.
+        //
+        // Fast when the scale *grows*, which is when the sound got louder and
+        // the shape would otherwise clip; slow when it shrinks, because that is
+        // the direction the low taps' ringing pushes it after every burst.
+        let target = fullScale(excursion: batchExcursion, ink: ink)
+        let tau = target > waveformFullScale ? Self.waveformScaleUp
+                                             : Self.waveformScaleDown
+        let a = CGFloat(exp(-dt / tau))
+        trackedInk = ink + (trackedInk - ink) * a
+        trackedExcursion = batchExcursion + (trackedExcursion - batchExcursion) * a
+
+        batchPeakDB = -Float.greatestFiniteMagnitude
+        batchExcursion = 0
+    }
+
+    /// The input amplitude that reaches the top of the strip.
+    ///
+    /// The excursion belonging to the picture's darkest ink, divided by how
+    /// dark that ink is. At full black the two cancel and the strip is filled;
+    /// at half ink it reaches half height; as the picture whitens the divisor
+    /// floors while the excursion keeps falling, which is a flat line.
+    private var waveformFullScale: CGFloat {
+        fullScale(excursion: trackedExcursion, ink: trackedInk)
+    }
+
+    /// One expression, used for what is held and for what is aimed at -- or the
+    /// comparison that picks the coefficient would be against a different
+    /// quantity from the one it moves.
+    private func fullScale(excursion: CGFloat, ink: CGFloat) -> CGFloat {
+        excursion / max(ink, Self.waveformMinInk) * Self.waveformHeadroom
+    }
 
     private func drawWaveform(_ ctx: CGContext) {
         guard showsWaveform, width > 0,
@@ -1541,6 +1718,9 @@ final class CochleagramView: NSView {
         let half = r.height / 2
         let sx = r.width / CGFloat(width)
         let ink = exposure.inverted ? NSColor.white : NSColor.black
+        // Read once for the whole strip, not per column: one scale, or the
+        // shape would mean something different at each end of itself.
+        let full = waveformFullScale
 
         ctx.saveGState()
         // Not antialiased, and one column wide: this is the same unit the
@@ -1558,13 +1738,31 @@ final class CochleagramView: NSView {
         ctx.fill(CGRect(x: r.minX, y: mid - hair / 2, width: r.width,
                         height: hair))
 
+        // Nothing has been heard, so there is nothing to scale by and the zero
+        // line above is the whole picture.
+        //
+        // Guarded rather than left to the arithmetic. The divisor is floored,
+        // so this is a zero excursion over something positive: not a NaN but an
+        // exact zero, and dividing by it gives infinities. Swift's `max` and
+        // `min` are the plain `Comparable` ones, where every comparison against
+        // a non-finite operand is false -- so they hand back their other
+        // argument, the bar becomes the full height of the strip, and silence
+        // would draw as a solid block.
+        guard full > 0 else {
+            ctx.restoreGState()
+            return
+        }
+
         for x in 0..<width {
             let lo = CGFloat(columnLo[x]), hi = CGFloat(columnHi[x])
             // Both exactly zero is a column that was never written -- the left
             // of a freshly wiped picture. The zero line already stands for it.
             if lo == 0 && hi == 0 { continue }
-            var yLo = mid + max(-1, lo / Self.waveformFullScale) * half
-            var yHi = mid + min(1, hi / Self.waveformFullScale) * half
+            // Clamped at the edges, which is the strip's version of the
+            // picture going solid black: past the top there is nothing more to
+            // show, and both saturate at nearly the same level.
+            var yLo = mid + max(-1, lo / full) * half
+            var yHi = mid + min(1, hi / full) * half
             if yHi < yLo { swap(&yLo, &yHi) }
             let px = r.minX + CGFloat(x) * sx
             // At least a hairline: a column whose excursion is smaller than one
