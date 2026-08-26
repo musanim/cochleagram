@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<!-- SOURCE-NOTE
+  Everything between these two markers is stripped by `publish.sh` and does not
+  reach the live page. It is about this file rather than about the instrument,
+  and the rest of the comments here -- which do ship, as they always have -- are
+  about the page.
+
+  The page around the instrument, as published at musanim.com/Cochleagram/.
+
+  This file is the source. The published copy is generated from it by
+  `web/publish.sh` and must never be edited in place: an edit there survives
+  exactly until the next publish and leaves nothing behind to say what it was.
+  For three releases this page lived only on the mirror and was hand-edited
+  every time -- its title, its download link and its version line -- against
+  features that live in this repository. That is what this move ends.
+
+  @VERSION@, @ZIP@ and @SIZE@ are filled in at publish time from the Mac app's
+  Info.plist and from the release zip itself. They are deliberately obvious
+  rather than plausible-looking defaults: a substitution that failed shows
+  "@VERSION@" on the live page, where it will be noticed, instead of quietly
+  showing the previous release's number for ever. `publish.sh` checks for
+  survivors and refuses before it can get that far.
+
+  "Things worth trying" below is a list of features, and the features are in
+  this repository. Adding one to the instrument and not to the list is now a
+  thing a diff can show.
+SOURCE-NOTE -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cochleagram (@VERSION@)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+    margin: 1.5rem auto 5rem;
+    padding: 0 1.25rem;
+    /* No cap. The instrument is better the wider it is -- more of the picture
+       is more of the past -- so the page gives it the whole window and only
+       the prose below is held to a readable column. */
+  }
+  /* The header is kept small on purpose: every line of it is height the
+     instrument does not get. */
+  header { text-align: center; margin-bottom: 1rem; }
+  header img { width: 64px; height: 64px; }
+  h1 { font-size: 1.6rem; margin: 0.3rem 0 0.15rem; font-weight: 600; }
+  .tagline { margin: 0; opacity: 0.7; }
+  /* The instrument. Wider than the prose, and its own scroll-free box. */
+  .app {
+    margin: 0 0 0.6rem;
+    border: 1px solid #d4d4d8;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #f2f2f5;
+  }
+  /* The frame is exactly as tall as the instrument inside it, which is a
+     fixed 600 pixels of picture plus its toolbar. The number below is only a
+     fallback: the script at the foot of the page measures the real thing,
+     because the toolbar wraps onto a second or third row on a narrow window
+     and its height is not knowable from here. */
+  .app iframe { display: block; width: 100%; border: 0; height: 700px; }
+  .hint { text-align: center; font-size: 0.85rem; opacity: 0.6;
+          margin: 0 0 2.6rem; }
+  /* Its own window is the better way to use this -- the instrument gets the
+     whole screen instead of a frame on a page, and the keyboard reaches it
+     without the focus juggling the script below has to do. Offered rather
+     than imposed, since a popup that opened itself would be blocked. */
+  #popout { margin-top: 0.5rem; font: inherit; padding: 0.25rem 0.7rem;
+            cursor: pointer; }
+  header, .hint { max-width: 46em; margin-left: auto; margin-right: auto; }
+  /* The prose is narrower than the picture: a column you can read. */
+  main { max-width: 34em; margin: 0 auto; }
+  h2 { font-size: 1.05rem; margin: 2.2rem 0 0.4rem; font-weight: 600; }
+  ol { padding-left: 1.3rem; }
+  li { margin: 0.35rem 0; }
+  .download { margin: 1.2rem 0 0.4rem; }
+  .download a { font-weight: 600; }
+  .meta { font-size: 0.85rem; opacity: 0.6; margin: 0.3rem 0 0; }
+  footer { max-width: 34em; margin: 3rem auto 0;
+           font-size: 0.85rem; opacity: 0.65; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16181c; color: #e6e6e6; }
+    .app { border-color: #3f3f46; background: #1c1c1f; }
+  }
+
+</style>
+</head>
+<body>
+
+<header>
+  <img src="icon.png" alt="Cochleagram icon">
+  <h1>Cochleagram</h1>
+  <p class="tagline">Sound, seen the way the ear resolves it.</p>
+</header>
+
+<!-- `app/index.html`, not `app/`. A server resolves a directory to its index;
+     opening this page from the filesystem does not, and Chrome shows the
+     folder's contents inside the frame instead. The explicit name works
+     either way. (The app still needs a server to actually *run* -- ES
+     modules, the worker, the .wasm fetch and the microphone all require a
+     real origin -- but a listing looks like a broken page, and this at least
+     fails honestly.) -->
+<div class="app">
+  <iframe src="app/index.html" title="Cochleagram" allow="microphone"></iframe>
+</div>
+<p class="hint">Running here, in your browser. Allow the microphone and talk,
+whistle, or play something — or drop an audio file on the picture.<br>
+<button id="popout" type="button">Run Cochleagram in its own window</button></p>
+
+<main>
+
+<p>A cochleagram is a picture of sound over time, like a spectrogram — but
+drawn by a model of the inner ear rather than by a Fourier transform. Six
+hundred filters, sixty to the octave, tuned to the bandwidths human hearing
+actually uses.</p>
+
+<p>An FFT-based spectrogram picks one trade-off between time and frequency and
+applies it everywhere: a long window separates low harmonics and smears every
+attack, a short one does the reverse. The ear resolves frequency finely at the
+bottom and time finely at the top, so both are visible in one picture.</p>
+
+<h2>Things worth trying</h2>
+
+<ol>
+  <li><b>Speed</b> changes how much time is on screen. Moving fast, you can see
+      voiced speech as a series of separate pulses rather than a texture.</li>
+  <li><b>Pause</b>, then drag across the picture: a pair of lines appears with
+      the time between them. Hovering anywhere reads out the frequency of that
+      row.</li>
+  <li><b>Play Selection</b> appears once you have paused the microphone. It
+      plays the sound the frozen picture was drawn from — the whole width of
+      it, or just what lies between your two lines. Hearing a moment you have
+      just measured is the quickest way to learn to read the display.</li>
+  <li><b>Waveform</b> puts the sound itself in a strip above the picture,
+      column for column, so you can see which part of the waveform made which
+      mark.</li>
+  <li><b>Spectrum</b> stands the newest column on its side, to the right of
+      the picture: loudness against frequency, at this instant, on the same
+      rows. Drag the edge it shares with the picture to give it more room.</li>
+  <li><b>ERB</b> is how sharp the filters are. 1.0 matches human hearing;
+      lower is sharper than the ear and easier to read.</li>
+  <li><b>Close-up</b> gives the last fraction of a second its own strip down
+      the right-hand side, at much finer resolution, flowing into the main
+      picture. Drag the line down its left-hand side to change how much room
+      it gets.</li>
+  <li><b>De-skew</b> straightens a click. Sound takes time to travel down the
+      cochlea, so a click really does reach the low filters later — de-skew
+      compensates, at the cost of about 170 ms of lag.</li>
+</ol>
+
+<h2>The Mac app</h2>
+
+<p>The same engine, natively. It has one thing the browser version does not:
+an experimental <b>Coherence</b> display that colours the picture by the timing
+relationship between neighbouring filters rather than by loudness — red for
+transient, green for tone, blue for noise. It is an experiment rather than a
+finished feature, which is why it has not been carried across.</p>
+
+<p class="download"><a href="@ZIP@">Download for macOS</a></p>
+<p class="meta">Version @VERSION@ · @SIZE@ · macOS 12 or later · signed and
+notarized, so it opens without any Gatekeeper warnings.</p>
+
+<h2>Source</h2>
+
+<p>The source is on <a href="https://github.com/musanim/cochleagram">GitHub</a>
+under the MIT licence — take it and use it. Alongside the app is the Python
+prototype the real-time engine is checked against, which is the readable
+account of how the filterbank is designed and where the numbers come from.</p>
+
+</main>
+
+<footer>
+  <p>Reconstruction of a display designed by Lloyd Watts.  Implementation by Claude (Anthropic) under Stephen Malinowski's direction.</p>
+</footer>
+
+<script>
+// Give the instrument the keyboard as soon as it is there.
+//
+// The cochleagram is in a frame, and a key pressed before the frame has focus
+// goes to this document instead -- so the space bar scrolled the page rather
+// than pausing the display, and only started working after a click inside.
+// Same-origin, so we can simply hand it the focus.
+//
+// Also on pointerdown, because clicking a control inside the frame focuses the
+// frame but clicking the picture itself does not always, and because returning
+// from anywhere else on the page should not require an extra click.
+(function () {
+    const frame = document.querySelector('.app iframe');
+    const focus = () => { try { frame.contentWindow.focus(); } catch {} };
+
+    // Make the frame exactly as tall as what is inside it.
+    //
+    // The picture is a fixed height by design, but the toolbar above it wraps
+    // onto more rows as the window narrows, so the total is not something this
+    // page can compute -- it has to be measured. Same-origin, so it can be.
+    // Watching the inner document rather than only the window catches the
+    // wrap, which happens at widths this page has no list of.
+    const fit = () => {
+        const d = frame.contentDocument;
+        if (d && d.documentElement) {
+            frame.style.height = d.documentElement.scrollHeight + 'px';
+        }
+    };
+    frame.addEventListener('load', () => {
+        fit();
+        focus();
+        try {
+            new ResizeObserver(fit).observe(frame.contentDocument.documentElement);
+        } catch {}
+    });
+    window.addEventListener('resize', fit);
+    document.querySelector('.app').addEventListener('pointerdown', focus);
+
+    // A window of its own.
+    //
+    // Opened from a click, because a popup opened any other way is blocked.
+    // Sized to the instrument -- the picture is a fixed 600 px tall by design
+    // -- and named, so pressing the button twice raises the window that is
+    // already open instead of making a second one.
+    //
+    // `noopener` is deliberately *not* set: it would be the safer default for
+    // a link to somewhere else, but this is our own page, and without a
+    // handle there is no way to raise it.
+    document.getElementById('popout').addEventListener('click', () => {
+        const w = Math.min(1400, Math.max(900, screen.availWidth - 120));
+        const win = window.open(
+            'app/index.html', 'cochleagram',
+            `popup=yes,width=${w},height=760,` +
+            `left=${Math.max(0, (screen.availWidth - w) / 2 | 0)},top=60`);
+        if (win) win.focus();
+        else alert('Your browser blocked the new window. '
+                 + 'Allow popups for musanim.com, or open '
+                 + 'https://www.musanim.com/Cochleagram/app/ yourself.');
+    });
+})();
+</script>
+
+</body>
+</html>
