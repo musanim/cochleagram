@@ -170,15 +170,15 @@
 <div id="stage">
   <canvas id="view"></canvas>
   <!-- Only on a device that cannot keep up, and only once it has stayed behind
-       rather than merely stumbled. It says how far behind as well as what
-       pressing it does, so what a visitor can report is a number rather than an
-       impression.
+       rather than merely stumbled. It reads as a measurement rather than an
+       instruction -- see `updateCatchUp` -- which also means what a visitor can
+       report is a number rather than an impression.
        On the picture rather than in the bars above: on a phone those wrap to
        several rows and can be scrolled off entirely, and a warning nobody sees
        is the same as no warning. Its position comes from `placeCatchUp`. -->
   <button id="catchup"
-          title="The engine is behind the microphone by more than it can make up, and it will stay behind. Press to throw away the backlog and start again from now. What was missed is marked on the picture; the sound behind the picture starts again too."
-          hidden>Catch up</button>
+          title="How far the picture is behind the microphone. The engine cannot make this up on its own. Press to throw away the backlog and start again from now — what was missed is marked on the picture, and the sound behind the picture starts again too."
+          hidden>Latency</button>
 </div>
 
 <script type="module">
@@ -1991,7 +1991,14 @@ function updateCatchUp() {
     // position and then jumps -- which with the strip toggled between two
     // appearances would be a jump of a hundred and twenty pixels.
     if (behind) {
-        b.textContent = `Catch up — ${(lagMs / 1000).toFixed(1)} s behind`;
+        // The measurement, and not what pressing it does. Almost nobody will
+        // ever see this, and the few who do will be looking at a picture that
+        // is visibly trailing what they are doing -- a red thing saying how far
+        // behind explains itself in that situation, and the tooltip is there
+        // for the rest. Naming the remedy in the label made the button an
+        // instruction, which is a lot of insistence for a device fault most
+        // people never meet.
+        b.textContent = `Latency ${(lagMs / 1000).toFixed(1)} s`;
         if (!placeCatchUp(b)) behind = false;
     }
     b.hidden = !behind;
