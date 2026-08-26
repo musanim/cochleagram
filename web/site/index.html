@@ -39,6 +39,31 @@
   button { padding: 0.3rem 0.8rem; border-radius: 6px; }
   #status { margin-left: auto; color: var(--label);
             font-variant-numeric: tabular-nums; }
+  /* The button sits *on* the picture rather than in the control bars. On a
+     phone the bars wrap to several rows and the picture is what fills the
+     screen, so a control up there can be off-screen entirely -- and this is the
+     one control that is no use unless it is seen the moment it appears.
+     `#stage` exists only to give it something to be positioned against. */
+  #stage { position: relative; flex: 0 0 auto; }
+  /* Red, because it is the only control on the page that reports a fault
+     rather than offering a setting, and it is on screen only while that fault
+     is. Its own colours rather than the theme's: this one must read the same in
+     both, and a device that is failing to keep up is not the moment to be
+     subtle. Tabular figures so the seconds it shows do not jitter the width
+     while it sits there.
+     `left` and `top` are written by `placeCatchUp`, from the display's own
+     geometry: the left edge of the picture and the height of 500 Hz. The
+     translate takes the button's own height off, so what is aligned with that
+     frequency is its middle rather than its top.
+     The shadow is not decoration. The button lands on whatever the picture
+     happens to be showing, which at the black end is a solid dark field, and a
+     red rectangle on it needs an edge that is neither the picture's ink nor its
+     paper. */
+  #catchup { background: #e5484d; color: #fff; border: 1px solid #c62a2f;
+             font-variant-numeric: tabular-nums;
+             position: absolute; transform: translateY(-50%);
+             z-index: 2; white-space: nowrap;
+             box-shadow: 0 1px 6px rgba(0, 0, 0, 0.45); }
   #file { display: none; }
   /* The file's name reads as a caption, not a control. Plain end-truncation
      with the whole of it in the tooltip: `direction: rtl` would keep the more
@@ -142,7 +167,19 @@
   </div>
 </div>
 
-<canvas id="view"></canvas>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <!-- Only on a device that cannot keep up, and only once it has stayed behind
+       rather than merely stumbled. It says how far behind as well as what
+       pressing it does, so what a visitor can report is a number rather than an
+       impression.
+       On the picture rather than in the bars above: on a phone those wrap to
+       several rows and can be scrolled off entirely, and a warning nobody sees
+       is the same as no warning. Its position comes from `placeCatchUp`. -->
+  <button id="catchup"
+          title="The engine is behind the microphone by more than it can make up, and it will stay behind. Press to throw away the backlog and start again from now. What was missed is marked on the picture; the sound behind the picture starts again too."
+          hidden>Catch up</button>
+</div>
 
 <script type="module">
 import { Display } from './display.js?v=DEV';
@@ -158,7 +195,22 @@ const display = new Display(view);
 /// including the ones that said why nothing was working. A failure you have to
 /// catch in the act is a failure nobody reports properly.
 let stuck = null;
-const say = t => { if (!stuck) $('status').textContent = t; };
+/// Until when the line is spoken for. The same problem as `stuck` but for
+/// messages that are worth a moment rather than for ever: the periodic readout
+/// runs once a second, so a sentence written in answer to a button press is
+/// gone before it has been read. Anything that reports what a press *did* has
+/// to hold the line for longer than the interval that overwrites it.
+let sayHold = 0;
+const say = t => {
+    if (!stuck && performance.now() >= sayHold) $('status').textContent = t;
+};
+/// Say it, and keep it there for `ms`.
+const sayFor = (ms, t) => {
+    if (stuck) return;
+    sayHold = 0;                       // this one outranks whatever is holding
+    say(t);
+    sayHold = performance.now() + ms;
+};
 const fail = t => { stuck = t; $('status').textContent = '⚠ ' + t; };
 
 // Counters, so it is possible to say *where* the chain stops rather than only
@@ -192,6 +244,129 @@ let endToken = 0;
 /// Mac app put it. Counting samples puts the boundary where the audio does.
 let samplesSent = 0;
 let fileEndsAt = 0;
+
+// ---- falling behind -------------------------------------------------------
+//
+// The chain from microphone to picture has no back-pressure anywhere in it.
+// The capture worklet posts a block every few milliseconds because the audio
+// thread runs on the audio clock and cannot be asked to wait; the engine worker
+// takes them as fast as the machine allows. On a device that sustains the
+// cascade the difference is a block or two. On one that does not -- a 2020
+// phone that throttles after a few minutes of it -- the difference grows for as
+// long as the page is open, and it does not come back, because draining a
+// backlog needs the machine to run faster than real time and a machine that
+// could do that would not have built one. Reported at three seconds behind on a
+// Galaxy S20; other devices show nothing.
+//
+// So: measure it, say nothing while it is small or brief, and offer a way back
+// when it is neither.
+
+/// A backlog worth a button, in milliseconds.
+///
+/// This measures the queue and nothing else. The engine's own group delay --
+/// 186 ms at ERB 0.6 with De-skew on, see `displayLagMs` -- is deliberately not
+/// part of it: that is latency, not backlog, it is the same on every machine,
+/// it is what the picture is *for*, and RePlay already corrects for it. So the
+/// figure on the button understates the delay a person actually perceives, by
+/// that much plus the capture buffer, and understating is the right direction
+/// for a control that throws sound away. Do not be tempted to add
+/// `displayLagMs()` into it; that would move this threshold without moving the
+/// number, which is the sort of change that looks like an improvement.
+///
+/// 100 is close to the floor rather than clear of it, and that is deliberate.
+/// A machine that is keeping up sits at three to twenty milliseconds -- a block
+/// or so in flight, plus however many blocks were posted ahead of the columns
+/// message being read -- but a long task on either thread reaches fifty or a
+/// hundred by itself, and the reading is biased upward by roughly a frame's
+/// worth of blocks besides. So a hundred milliseconds is a level a healthy
+/// machine does touch, and this threshold on its own would be twitchy.
+///
+/// What makes it safe is that it is not on its own. `LAG_PERSIST_MS` below asks
+/// the backlog to still be there a second later, and the whole difference
+/// between a long task and a machine that cannot keep up is that the first one
+/// drains and the second cannot. Lowering this number moved work onto that
+/// test; it did not remove it. If this ever proves twitchy in the field, the
+/// knob to reach for is the persistence, not this -- a tenth of a second really
+/// is the point at which the picture stops being live, and the display should
+/// say so.
+const LAG_WARN_MS = 100;
+
+/// How long the backlog has to stay above that before it is worth saying.
+///
+/// This is the whole of the transient/permanent distinction, and it is a test
+/// on duration rather than on size for a reason: a garbage collection, a scroll
+/// or a long task all make a spike of several hundred milliseconds, and
+/// magnitude cannot tell one of those from a real backlog at the moment it
+/// happens. Whether it comes back down can, because draining needs the machine
+/// to run *faster* than real time. A machine that is keeping up has that in
+/// hand -- a desktop runs the cascade several times over -- and clears a
+/// half-second spike in a fraction of a second. A machine that is not never
+/// clears anything.
+///
+/// One second, not the five this began as. A tenth of a second of backlog is
+/// already worth acting on, and a test that took five seconds to say so was
+/// reporting the fault fifty times later than the fault itself. A second is
+/// still several times what a healthy machine needs to drain a spike.
+///
+/// With `LAG_WARN_MS` down at 100 this test is carrying most of the weight: it
+/// is now the only thing standing between a long task and a false alarm, where
+/// at 500 the level did much of that work by itself. That is the right place
+/// for the weight to sit -- "did it drain" is the question that actually
+/// distinguishes the two cases -- but it means this constant should be raised,
+/// not the other one lowered, if the button ever proves twitchy.
+const LAG_PERSIST_MS = 1000;
+
+/// How often the test above is applied.
+///
+/// Its own clock rather than the status line's once-a-second tick, which is
+/// where this used to live. The granularity of the report has to be small
+/// against what is being reported, and a tenth of a second is not small against
+/// one.
+const CATCHUP_CHECK_MS = 100;
+
+/// What share of real time to make the engine consume: `?slow=1.2` means it
+/// spends 1.2 seconds on every second of audio.
+///
+/// 1 is exactly real time, and the backlog then holds at whatever it is.
+/// Above 1 it grows, below 1 it drains. The number means the same thing on
+/// every machine -- see the worker, which measures from before the cascade
+/// rather than adding to it, so the real cost is inside the figure rather than
+/// underneath it.
+///
+/// Without this the feature cannot be tested on a machine that works, and the
+/// browser's own CPU throttling is no substitute: **it applies to the page's
+/// main thread and not to workers**, so it does nothing whatever to the
+/// cascade. That is not a subtlety to rediscover -- 6x, 4x and off all behave
+/// identically here, which reads as the throttle being broken.
+///
+/// A share F loses `(F-1)/F` of every second, so with the constants above 1.05
+/// gains 48 ms of backlog a second and puts the button up after about 3
+/// seconds, 1.1 gains 91 and takes about 2, and 1.5 gains 333 and takes a
+/// little over 1. Nothing can be faster than `LAG_PERSIST_MS`, which is the
+/// point of it. The phone's own deficit is a few per cent -- 1.02 or so, which
+/// takes a couple of minutes and is the honest reproduction if there is time
+/// for it.
+///
+/// Diagnostic, like `?test`: no control, no mention on the page, inert unless
+/// asked for.
+const SLOW_FACTOR = (() => {
+    const v = parseFloat(new URLSearchParams(location.search).get('slow'));
+    return Number.isFinite(v) && v > 0 ? Math.min(v, 10) : 0;
+})();
+
+/// The backlog, in milliseconds: audio handed to the worker that has not yet
+/// become columns. Updated whenever columns arrive, which is many times a
+/// second whether or not there is any sound.
+let lagMs = 0;
+/// When the backlog was last under `LAG_WARN_MS`. Every brief spike resets it,
+/// so the only thing that can age is a backlog that stayed.
+let lastCaughtUp = performance.now();
+/// Whether the button is up. Kept rather than recomputed at the point of use so
+/// that the one decision is made in one place, once a second.
+let behind = false;
+/// When the last catch-up was, so a second one soon after can say something
+/// more useful than the first.
+let lastCatchUpAt = -Infinity;
 
 /// Mark the end of the recording and stop, once the engine has caught up.
 ///
@@ -253,6 +428,9 @@ let playedThrough = false;
 
 let playingFile = false, paused = false, fileEnded = false;
 let colsSeen = 0, lastReport = performance.now();
+/// When the backlog test last ran. Separate from `lastReport` because the two
+/// run at different rates and for different reasons.
+let lastCatchUpCheck = 0;
 
 // ---- RePlay: the audio behind the picture ---------------------------------
 //
@@ -783,9 +961,32 @@ function startWorker() {
             showReplayControls();
             applyCloseUp();              // the width limit needs the geometry
         } else if (m.type === 'columns') {
-            // Dropped rather than queued while frozen. Live input carries on
-            // whether we are looking or not, and a queue would replay the
-            // waiting seconds at high speed the moment you resumed.
+            // What is still in the queue in front of the engine, as of now.
+            // Both counters are totals over the same stream of samples -- one
+            // kept where blocks are posted, one where they are taken -- so the
+            // difference is the queue's length and needs no clock.
+            //
+            // Read as the message lands rather than as it was sent, which
+            // overstates it: this message waited behind whatever blocks the
+            // worklet posted in the meantime, and each of those advanced
+            // `samplesSent`. A frame's worth is six blocks, so the overstatement
+            // is some sixteen milliseconds, and a long task makes it more. Two
+            // orders below the threshold either way, and in the safe direction.
+            if (ctx && ctx.sampleRate && m.consumed !== undefined) {
+                lagMs = Math.max(0, samplesSent - m.consumed)
+                      / ctx.sampleRate * 1000;
+                // Here, where every measurement is seen, rather than in the
+                // once-a-second tick that reads it. A machine that is keeping
+                // up is under the threshold nearly all the time and it would
+                // hardly matter -- but sampling a spiky quantity once a second
+                // can land on the spikes, and a test whose whole purpose is to
+                // ignore spikes must not be able to see only those.
+                if (lagMs < LAG_WARN_MS) lastCaughtUp = performance.now();
+            }
+            // Dropped rather than queued while frozen. Nothing new is fed to
+            // the engine while the picture is stopped, so what reaches here is
+            // the tail of what was already in flight -- but that tail is real
+            // and a queue of it would replay at high speed on resume.
             if (!paused) {
                 display.append(m.levels, m.coherence, m.refs,
                                m.inLo, m.inHi, m.columns);
@@ -801,12 +1002,22 @@ function startWorker() {
 }
 
 function openEngine() {
+    // No columns are produced while the cascade is being built, and an interval
+    // with no columns in it ages the watch exactly as an undrainable backlog
+    // does. A slow coefficient fetch on a live microphone would otherwise put
+    // the button up on the strength of the reload it caused.
+    resetLagWatch();
     worker.postMessage({
         type: 'open',
         coeff: `cochlea_88200_erb${S.erb}.coch`,
         rate: ctx.sampleRate,
         columnMs: S.columnMs / closeUpK,
         deskew: S.deskew ? 1 : 0,
+        // Carried in the message rather than in the worker's own URL, so the
+        // worker script has nothing to parse and the factor survives every
+        // reopen -- including the one a catch-up does, which is the case that
+        // has to keep working for the test to mean anything.
+        slow: SLOW_FACTOR,
     });
 }
 
@@ -822,7 +1033,40 @@ async function ensureAudio() {
         channelInterpretation: 'speakers',
     });
     capture.port.onmessage = ev => {
-        blocksIn++;
+        blocksIn++;                    // counted even when dropped: this says
+                                       // the microphone is alive, nothing more
+        // A frozen picture is not fed.
+        //
+        // The columns made from this audio would be thrown away on arrival --
+        // see the append below, which has always skipped them -- so running the
+        // cascade over it was work whose only effect was to fill the queue. On
+        // a machine with headroom that cost nothing visible. On one without,
+        // pausing for ten seconds bought ten seconds of backlog and handed it
+        // to you on resume: the picture came back further behind than it had
+        // been when you stopped it, which is the opposite of what stopping
+        // something is for.
+        //
+        // Nothing is lost that was not already being lost. Live input cannot be
+        // paused, only ignored; the recorder is already stopped here for the
+        // same reason (`capturing()` below), and the seam drawn on resume is
+        // already the statement that this interval is in neither the picture
+        // nor the recording. This makes the queue agree with them.
+        //
+        // `samplesSent` is not advanced either, or it would drift from the
+        // worker's `consumed` by the whole pause and read as permanent backlog.
+        //
+        // Live input only. A file is paused by suspending the context, so
+        // almost nothing arrives here on that path -- but `paused` is set
+        // before `suspend()`, which is asynchronous, and the blocks already
+        // posted by the worklet are still in this thread's queue behind the
+        // press. Dropping those loses them from `samplesSent`, and
+        // `samplesSent` is what the end of a file is counted in: the flush
+        // below would then fire that many samples into the silence after the
+        // file, or not at all before `onended` catches it. Which is exactly the
+        // fault the sample counting exists to remove, reintroduced, and it
+        // accumulates over every pause. There is nothing to gain there either:
+        // a suspended context is already not feeding the engine.
+        if (paused && !playingFile) return;
         // The raw input peak, taken here because the buffer is transferred on
         // the next line and is gone afterwards. This is the one number that
         // separates "the display is wrong" from "the signal is quiet", and
@@ -945,6 +1189,11 @@ function stopSources() {
     recorder.reset(ctx ? ctx.sampleRate : 0);
     recordedPerColumn = 0;
     recordedLag = -1;
+    // Every change of source funnels through here, and each one both stops the
+    // columns for a while and makes the button inapplicable. Retracting it now
+    // rather than at the next tick closes the second for which it would still
+    // be on screen, and clickable, over a source that no longer exists.
+    resetLagWatch();
 }
 
 // ---- sources -------------------------------------------------------------
@@ -1003,7 +1252,18 @@ const kGestures = ['pointerdown', 'touchend', 'click', 'keydown'];
 async function resumeAudio() {
     if (!ctx) return false;
     try { await ctx.resume(); } catch {}
-    if (ctx.state === 'running') return true;
+    if (ctx.state === 'running') {
+        // A suspension stops the blocks and therefore stops the columns, and
+        // the watch cannot tell an interval with no columns in it from a
+        // backlog that will not drain -- both leave `lastCaughtUp` where it
+        // was. Without this, a context suspended for two minutes by iOS taking
+        // the audio session comes back and puts the button up on its next tick,
+        // reading whatever the lag was before the suspension, which is usually
+        // "0.0 s behind". A red fault button showing zero is worse than either
+        // being right or saying nothing.
+        resetLagWatch();
+        return true;
+    }
     say('click anywhere to start');
     // Not `async`: everything up to the first `await` runs inside the gesture,
     // and on iOS that is the whole of the permission to start audio. An
@@ -1179,6 +1439,22 @@ function setPaused(on, mark = true) {
         // picture nor the recording, so the old terms will not describe what
         // arrives next.
         recordedPerColumn = 0;
+        // The queue was drained by the pause -- nothing was fed to the engine
+        // while the picture was frozen -- so there is genuinely no backlog to
+        // resume with, and the watch has to be told. Without this the button
+        // flashes red on every resume from a pause longer than
+        // `LAG_PERSIST_MS`, on every device: `lastCaughtUp` only moves when a
+        // measurement arrives, no measurements arrive once the queue is empty,
+        // so the age of the watch is the length of the pause. It reads
+        // "0.0 s behind", because that is what the last real measurement said,
+        // and it clears itself a tenth of a second later. A red fault button
+        // showing zero is the thing `resumeAudio` already refuses to do.
+        resetLagWatch();
+        // Stale otherwise, and now permanently so: nothing updates it while
+        // frozen and nothing reads or clears it either, so the first second
+        // after a resume would report the peak from just before the pause --
+        // "in -6 dBFS" over a silent room, ten minutes later.
+        inPeak = 0;
     }
     paused = on;
     // A measurement is anchored to a column of a frozen picture. Once the
@@ -1195,6 +1471,11 @@ function setPaused(on, mark = true) {
         display.mark('seam');
     }
     showTransport();
+    // Freezing makes the button inapplicable, and that belongs to the press
+    // rather than to the next tick a tenth of a second later. Resuming cannot
+    // put it back up -- `resetLagWatch` above has just cleared the watch -- but
+    // this is also the call that hides it on the way in.
+    updateCatchUp();
 }
 $('pause').onclick = togglePause;
 window.addEventListener('keydown', e => {
@@ -1610,6 +1891,15 @@ function frame(t) {
     } else {
         shownSens = null;
     }
+    // Ten times a second, on its own clock rather than folded into the status
+    // line's. A backlog of a tenth of a second is already worth acting on, so
+    // the interval between the fault being true and the button saying so should
+    // be small against the fault itself -- a second's granularity would have
+    // made the report ten times later than the thing it was reporting.
+    if (t - lastCatchUpCheck > CATCHUP_CHECK_MS) {
+        lastCatchUpCheck = t;
+        updateCatchUp();
+    }
     if (t - lastReport > 1000) {
         const rate = colsSeen * 1000 / (t - lastReport);
         if (ctx.state !== 'running') {
@@ -1630,6 +1920,213 @@ function frame(t) {
     }
     requestAnimationFrame(frame);
 }
+
+// ---- catching up ----------------------------------------------------------
+
+/// Whether catching up is a thing that makes sense right now.
+///
+/// Not while the picture is frozen. Pausing stops feeding the engine, so the
+/// queue drains on its own and there is nothing left to catch up with -- and an
+/// alarm offering to skip forward on a picture somebody deliberately stopped
+/// would be answering a question nobody asked. Resuming starts the watch again
+/// from nothing, since the queue really is empty by then; a device that cannot
+/// keep up re-earns its button in the `LAG_PERSIST_MS` after that, which on the
+/// phone this was written for is about a second.
+///
+/// A file is excluded for a stronger reason than noise: catching up throws
+/// audio away, and audio thrown away from a file is a piece of the file missing
+/// from the picture, which is not a trade anybody would want. A file also ends,
+/// so its backlog is bounded by construction. Live input is the only case where
+/// the backlog grows without limit and where the audio dropped was going to be
+/// gone in any case.
+///
+/// `stuck` is excluded because the page is already showing something more
+/// important, and restarting the engine would replace that message without
+/// fixing what it describes -- a stale `cochlea.wasm` comes straight back.
+function catchUpApplies() {
+    return !!ctx && ctx.state === 'running' && !paused
+        && !!micSource && !playingFile && !stuck;
+}
+
+/// Which frequency the button is centred on, and how far in from the picture's
+/// left edge it sits.
+///
+/// 500 Hz because it is the middle of the part of the picture anybody is
+/// looking at -- speech, and the first few harmonics of most things -- so the
+/// button lands where the eye already is. It is also one of the octave labels
+/// the frequency scale draws, so it sits on a line that is there rather than
+/// somewhere between two.
+///
+/// The inset is a comfortable gap rather than a flush edge: hard against the
+/// picture's left the button would read as part of the frequency gutter.
+const CATCHUP_HZ = 500;
+const CATCHUP_INSET = 16;
+
+/// Put the button where the picture is, in the page's own units.
+///
+/// Recomputed each time it is shown rather than once, because everything it
+/// depends on moves: turning the waveform strip on pushes the picture down by
+/// its whole height, a change of ERB changes which tap 500 Hz falls on, and a
+/// resize changes the canvas. None of those are events this could listen for
+/// without listening for all of them.
+/// False when the display cannot say where 500 Hz is, which is the state before
+/// the engine has reported its geometry. The caller keeps the button hidden
+/// rather than showing it somewhere arbitrary: with nothing written into `left`
+/// and `top` it would sit at the corner of the picture with half of it above
+/// the top edge, which reads as a rendering fault rather than as a warning.
+function placeCatchUp(b) {
+    const at = display.anchorFor(CATCHUP_HZ);
+    if (!at) return false;
+    b.style.left = `${Math.round(at.x + CATCHUP_INSET)}px`;
+    b.style.top  = `${Math.round(at.y)}px`;
+    return true;
+}
+
+/// Put the button up, or take it down, and keep the figure on it current.
+function updateCatchUp() {
+    behind = catchUpApplies()
+          && (performance.now() - lastCaughtUp) > LAG_PERSIST_MS;
+    const b = $('catchup');
+    // Written before it is unhidden, so it never appears at last time's
+    // position and then jumps -- which with the strip toggled between two
+    // appearances would be a jump of a hundred and twenty pixels.
+    if (behind) {
+        b.textContent = `Catch up — ${(lagMs / 1000).toFixed(1)} s behind`;
+        if (!placeCatchUp(b)) behind = false;
+    }
+    b.hidden = !behind;
+}
+
+/// Forget what has been measured so far.
+///
+/// Called wherever the stream of columns is about to be interrupted -- a change
+/// of source, a rebuild of the engine. `lastCaughtUp` only ever moves when a
+/// measurement arrives *under* the threshold, so an interval with no columns in
+/// it ages exactly like a backlog that will not drain: an ERB change on a slow
+/// connection, or a microphone that was never granted and is started minutes
+/// later, would otherwise put the button up on the strength of a gap.
+function resetLagWatch() {
+    lagMs = 0;
+    lastCaughtUp = performance.now();
+    behind = false;
+    $('catchup').hidden = true;
+}
+
+/// Throw the backlog away and start the engine again from now.
+///
+/// Terminating the worker is not heavy-handedness, it is the only mechanism
+/// there is. A message asking the worker to skip its backlog would be posted
+/// *behind* that backlog and read only after the work it was meant to cancel
+/// had already been done; `postMessage` is a queue and nothing jumps it. The
+/// alternatives are a SharedArrayBuffer, which needs cross-origin isolation the
+/// site does not have, or moving the queue onto this thread so it can be
+/// emptied -- a rewrite of the audio path to fix a fault that affects one
+/// device in ten. `terminate()` discards the queue with the thread that owns it.
+///
+/// Rebuilding costs a coefficient fetch, which is in the cache, and a cascade
+/// build, some two hundred milliseconds. Against three seconds of backlog that
+/// is not a cost worth avoiding.
+///
+/// The picture is kept: the geometry is unchanged, so `setGeometry` resizes to
+/// the same width and returns without touching it. The recording is not, and
+/// cannot be -- `written` has advanced across audio no column will ever stand
+/// for. The 'ready' handler already resets it, for exactly this reason, and
+/// `slice` already clamps to what is still held, so Play Selection over the
+/// older part of the picture plays what there is of it.
+function catchUp() {
+    // Asked again here, not taken from `behind`. The button's visibility is
+    // decided once a second, so for up to a second after opening a file,
+    // pressing Space or losing the microphone it is still on screen and still
+    // clickable -- and every one of those makes this the wrong thing to do.
+    // Zeroing `samplesSent` during a file is the worst of them: `fileEndsAt`
+    // was set from the old count, so the end of that file could never be
+    // reached by counting and the picture would lose the piece of the file that
+    // was in the queue. `updateCatchUp` is now also called at each of those
+    // transitions, so this is the second of two guards rather than the only
+    // one; it is the one that closes the window.
+    if (!worker || !ctx || !catchUpApplies()) {
+        // A press that does nothing has to say so. The button vanishing is
+        // some kind of answer, but not one that explains itself, and the whole
+        // of this feature's credibility is that it only ever appears when it
+        // means something.
+        updateCatchUp();
+        sayFor(3000, 'nothing to catch up');
+        return;
+    }
+    // Read before `resetLagWatch` clears it. This is the size of the hole about
+    // to be made, measured to the sample, and it is the only place that knows
+    // it -- the seam on the picture is one line wide whether it covers forty
+    // milliseconds or four seconds.
+    const droppedMs = lagMs;
+    // The new worker first, and the old one killed only once it exists. The
+    // other order has a failure with no way back: if `new Worker` throws --
+    // and it can, the page having been served from something that has since
+    // gone away -- the old worker is already dead, `postMessage` to a
+    // terminated worker is a silent no-op, and audio flows into nothing for the
+    // rest of the session behind an error message about something else.
+    const old = worker;
+    try {
+        startWorker();
+    } catch (e) {
+        fail(`worker: ${e.message || 'could not be started'}`);
+        return;
+    }
+    // Only now. Marked before the restart, a `new Worker` that threw would have
+    // left a red line across the picture claiming a discontinuity that never
+    // happened -- and left the button up, so the next press would draw another.
+    // The seam belongs to the last column drawn from the old audio, which is
+    // still the newest column: nothing has been appended since the check above.
+    // Live input cannot be paused, only abandoned; this is the same lie the
+    // pause seam exists to prevent, arrived at from the other direction.
+    display.mark('seam');
+    old.terminate();
+    // Both counters restart together or the difference between them stops
+    // meaning anything: the new worker's `consumed` begins at zero, and a
+    // `samplesSent` that did not would read the whole session as backlog and
+    // leave the button up for ever. Nothing can be posted between these lines
+    // -- a message handler cannot interleave with synchronous code -- so the
+    // two are zeroed as one.
+    samplesSent = 0;
+    // Not left to the 'ready' handler, which does it too but two hundred
+    // milliseconds from now. Until then `capturing()` is still true, so blocks
+    // arriving after the seam would be appended to the recording under the old
+    // segments' origins -- post-seam audio mapped through pre-seam arithmetic.
+    // Nothing lasting, since 'ready' wipes it, but it costs one line to not do.
+    recorder.reset(ctx.sampleRate);
+    recordedPerColumn = 0;
+    recordedLag = -1;
+    resetLagWatch();
+    openEngine();
+
+    // A device that cannot sustain the cascade will build the queue straight
+    // back, and this button is then a treadmill: press, twenty seconds, press.
+    // The second press inside a minute is the moment to stop describing the
+    // mechanism and name the things that would actually help -- all of which
+    // reduce the engine's work rather than the queue's length. The close-up is
+    // named first because it multiplies the engine's column rate by its own
+    // factor and is the largest of them by far.
+    const now = performance.now();
+    const again = now - lastCatchUpAt < 60000;
+    lastCatchUpAt = now;
+    sayFor(again ? 8000 : 4000, again
+        ? 'still behind — try turning the close-up off, or a slower Speed'
+        : `caught up — ${(droppedMs / 1000).toFixed(1)} s of sound discarded`);
+}
+
+$('catchup').onclick = catchUp;
+
+// Coming back to a page that was in the background is the one case the duration
+// test cannot absorb on its own. A backgrounded tab keeps capturing but gets a
+// throttled share of the processor, so even a fast machine builds a queue while
+// nobody is looking -- and it builds it during exactly the interval in which
+// `lastCaughtUp` is not being advanced, so the age carries across the return
+// and the button is up on the first tick. That queue drains in a second or two
+// on a machine that is fine. Giving the watch its window back costs a device
+// that genuinely cannot keep up nothing: it re-earns the button almost
+// immediately.
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) resetLagWatch();
+});
 
 /// Follow the element, not the window.
 ///

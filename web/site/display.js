@@ -750,6 +750,26 @@ export class Display {
         };
     }
 
+    /// Where a frequency sits on the canvas, in CSS pixels: the left edge of
+    /// the picture, and the centre of the tap nearest `f`.
+    ///
+    /// For putting a page element over the picture. Everything else that draws
+    /// on the picture does it in canvas coordinates and never needs this; a
+    /// `<button>` is not something a canvas can hold, and it has to be told
+    /// where to sit in the units the page lays out in. CSS pixels rather than
+    /// device pixels for that reason -- the two differ by `devicePixelRatio`,
+    /// which on the phones this exists for is three.
+    ///
+    /// Null before the geometry has arrived from the engine, which is the state
+    /// the page starts in and returns to on every reopen.
+    anchorFor(f) {
+        if (!this.frequencies || !this.frequencies.length || !this.taps) {
+            return null;
+        }
+        const p = this.plot;
+        return { x: p.x, y: this.yForRow(this.rowFor(f), p) };
+    }
+
     /// Where the strip goes: directly above the picture, sharing its left and
     /// right edges so a column is above the column it describes.
     get waveformRect() {
