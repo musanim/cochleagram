@@ -1230,8 +1230,11 @@ async function startMic({ quiet = false } = {}) {
     micSource = ctx.createMediaStreamSource(micStream);
     micSource.connect(capture);
     fileEnded = false;
+    // Resumes the context too: `setPaused(false)` on a live source calls
+    // `resumeAudio` itself. The explicit call that used to stand here was a
+    // second one, and on a context the browser would not start it armed a
+    // second one-shot gesture listener beside the first.
     setPaused(false);
-    await resumeAudio();
     return true;
 }
 
@@ -1467,8 +1470,26 @@ function setPaused(on, mark = true) {
         // so there is no seam to mark and drawing one would be a lie in the
         // other direction.
         on ? ctx.suspend() : ctx.resume();
-    } else if (on && mark) {
-        display.mark('seam');
+    } else if (on) {
+        if (mark) display.mark('seam');
+    } else {
+        // Live pause leaves the context running -- the microphone stays
+        // connected and its blocks are dropped on arrival -- so there is
+        // usually nothing here to resume. Usually. If iOS took the audio
+        // session while the picture was frozen, `onstatechange` declined to
+        // resume it, because `paused` was true and that same guard is what
+        // implements a paused file. Nothing else was ever going to put it
+        // back: this branch was empty, so the press returned a running app
+        // with a stopped audio clock, and not even the one-shot gesture
+        // listener was armed -- leaving the status line advising a tap that
+        // nothing listens for.
+        //
+        // Not awaited, and not merely out of tidiness. `ctx.resume()` is the
+        // first thing `resumeAudio` does, before its first `await`, so it runs
+        // inside the click that got us here, which on iOS is the whole of the
+        // permission to start audio. Making this function async to await it
+        // would spend that gesture and delay the two calls below for nothing.
+        resumeAudio();
     }
     showTransport();
     // Freezing makes the button inapplicable, and that belongs to the press
@@ -1547,10 +1568,11 @@ $('deskew').onchange = e => {
     S.deskew = e.target.checked; save();
     // A seam, in the same red as every other break in time -- because that is
     // what this is. De-skew holds each tap back by its own travelling-wave
-    // delay, up to about 170 ms at the apex, so switching it slides the low
-    // rows against the high ones and the columns either side of the change
-    // were never adjacent. Without the line the picture would claim a
-    // continuity across the join that it does not have.
+    // delay, up to about 186 ms at the apex at ERB 0.6 -- and rather more if
+    // the filters are sharpened further -- so switching it slides the low rows
+    // against the high ones and the columns either side of the change were
+    // never adjacent. Without the line the picture would claim a continuity
+    // across the join that it does not have.
     display.mark('seam');
     worker?.postMessage({ type: 'deskew', value: S.deskew ? 1 : 0 });
     applyCloseUp();                     // the two cannot both be on
@@ -1902,11 +1924,16 @@ function frame(t) {
     }
     if (t - lastReport > 1000) {
         const rate = colsSeen * 1000 / (t - lastReport);
-        if (ctx.state !== 'running') {
+        if (ctx.state !== 'running' && !paused) {
             // Nothing will arrive until the browser lets the audio clock run,
             // and this line is the only place that can say so -- it used to
             // overwrite the "tap to start" message within the second, which
             // left a white picture, a zero, and no explanation.
+            //
+            // Not while paused, though. A paused file *is* a suspended
+            // context, by design, so without that test every pause of a file
+            // put "tap the picture to start" up within the second -- over a
+            // picture deliberately stopped, advising a tap that does nothing.
             say(`tap the picture to start — audio is ${ctx.state}`);
         } else if (!paused) {
             const dbfs = inPeak > 0

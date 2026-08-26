@@ -2322,9 +2322,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if settings.deskew { settings.closeUpSpanMS = 0 }
         // A seam, before the engine is told: the columns either side of this
         // were never adjacent. De-skew holds each tap back by its own
-        // travelling-wave delay -- up to about 170 ms at the apex, nothing at
-        // the base -- so switching it slides the bottom of the picture against
-        // the top. Marking it costs one line and stops the picture claiming a
+        // travelling-wave delay -- up to about 186 ms at the apex at ERB 0.6,
+        // rather more if the filters are sharpened further, nothing at the
+        // base -- so switching it slides the bottom of the picture against the
+        // top. Marking it costs one line and stops the picture claiming a
         // continuity across the join that it does not have.
         view.markSeam()
         cochlea?.deskew = settings.deskew
