@@ -1621,9 +1621,33 @@ export class Display {
         if (!this.showsSpectrum) return;
         this.updateTrace(this.spectrumTrace());
         const rows = this.trace.length, reach = this.spectrumReach;
-        if (rows < 2 || reach <= 0 || plot.h <= 0) return;
 
         const ctx = this.ctx;
+        // The zero line: the level every value in the trace is measured from,
+        // so this plot's axis rather than a rule between two panels. Drawn in
+        // the ink colour, and a fixed edge of the instrument rather than an
+        // event in the recording, for the same reasons the close-up boundary
+        // is -- see `render`, whose line this copies.
+        //
+        // It is also the only thing marking a boundary the pointer can grab.
+        // `onSpectrumEdge` takes a grab within four pixels and the cursor
+        // changes there, over a line drawn nowhere until now: the filled trace
+        // starts *at* zero and extends right, so in silence it had no width
+        // and there was nothing on screen at all.
+        //
+        // Hence above the guard below rather than after it. Silence and
+        // startup are what that guard catches, and they are exactly when this
+        // is the only thing there. In a loud passage a dark picture swallows
+        // it, which needs no answer: with signal, the trace is the boundary.
+        //
+        // Rightward from the edge rather than centred on it, or half of it
+        // falls on the picture's last column and is lost in the ink there.
+        const dpr = window.devicePixelRatio || 1;
+        ctx.fillStyle = this.exposure.inverted ? '#fff' : '#000';
+        ctx.fillRect(Math.round((plot.x + plot.w) * dpr) / dpr,
+                     plot.y, 1 / dpr, plot.h);
+
+        if (rows < 2 || reach <= 0 || plot.h <= 0) return;
         // Solid: the region between the zero line and the trace, not the trace
         // alone. The zero line is the picture's right edge, so the ink starts
         // exactly where the column it describes ends.
