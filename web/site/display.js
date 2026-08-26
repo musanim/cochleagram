@@ -1523,17 +1523,16 @@ export class Display {
             // to show. Canvas y runs down, so the input's maximum is the
             // smaller y.
             //
-            // **Both** ends, which is where this parts company with the Mac.
-            // There the two clamps are one-sided -- `max(-1, lo/full)` and
-            // `min(1, hi/full)` -- which bounds a column that straddles zero
-            // but not one lying entirely to one side of it. That is not the
-            // exotic case it sounds: the gain is deliberately slow, so on the
-            // first frames of a low-frequency onset `full` is still well below
-            // the excursion, and at 4 ms a column can sit inside a single
+            // **Both** ends of **each** bound, and the Mac now does the same.
+            // It used to clamp only the far end of each -- `max(-1, lo/full)`
+            // and `min(1, hi/full)` -- which bounds a column that straddles
+            // zero but not one lying entirely to one side of it. That is not
+            // the exotic case it sounds: the gain is deliberately slow, so on
+            // the first frames of a low-frequency onset `full` is still well
+            // below the excursion, and at 4 ms a column can sit inside a single
             // half-cycle of a hundred-hertz tone. Its near bound then exceeds
-            // full scale, the bar reaches past the end of the strip, and there
-            // is no clip to stop it -- so it is drawn over the picture. The
-            // Mac wants the same two characters; see the handoff.
+            // full scale, the bar reaches past the end of the strip, and
+            // neither side clips -- so it is drawn over the picture.
             //
             // With both ends clamped the order cannot invert, `lo <= hi` being
             // guaranteed by the engine, so no swap is needed here.
@@ -1901,7 +1900,7 @@ export class Display {
 /// so it is the one seen. The order is by how much the mark says: `seam` only
 /// claims that time jumps, which is implied by all the others.
 const MARK_RANK = {
-    seam: 0, scaleChange: 1, tuningChange: 2, fileEnd: 3,
+    seam: 0, scaleChange: 1, tuningChange: 2, fileEnd: 3, dropout: 4,
 };
 
 const MARK_COLOURS = {
@@ -1909,6 +1908,12 @@ const MARK_COLOURS = {
     scaleChange: '#0a68d0',    // milliseconds per column changed
     tuningChange: '#8e4ec6',   // filter bandwidths changed
     fileEnd: '#30a46c',        // the recording ended
+    // Audio that never reached the engine. Nothing here places one yet -- the
+    // Mac finds these from the device's own sample clock, which the Web Audio
+    // capture path does not expose -- but the two tables have to stay the same
+    // table, and the fallbacks below would otherwise render a dropout as a
+    // rank-0 red seam, which is the one thing the colour exists to prevent.
+    dropout: '#f76b15',        // audio never arrived
 };
 
 const CHIP_FONT = '500 11px ui-monospace, SFMono-Regular, Menlo, monospace';

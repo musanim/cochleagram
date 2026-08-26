@@ -180,6 +180,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func frameTick() {
         captureTick()
+        // Before the columns land, so that a hole whose turn has come is
+        // marked on the column at the edge now rather than behind the batch
+        // about to arrive. Unlike `view.tick`'s own dropped-column seam, this
+        // one waits for the cascade to catch up first; see `markInputDropouts`.
+        markInputDropouts()
         view.tick()
         // What has scrolled off the left of the picture is audio nobody can
         // select any more, and this is the whole of the memory policy: the
@@ -264,6 +269,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             perSec, rate, ratio, buffers, m.lastFrames, msPerBuffer, load,
             ratio < 0.95 ? "  *** DEVICE NOT KEEPING UP ***" : "",
             load > 0.9 ? "  *** NOT REAL TIME ***" : ""))
+
+        // The tail of a burst of dropouts, if one stopped inside this second.
+        flushDropLog()
 
         // Greater than, not different from: the count goes back to zero when
         // the input unit is replaced, and "0 errors" is not news.
@@ -1612,6 +1620,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // rate need have moved -- an ERB change is exactly that.
                 self.seenDroppedColumns = self.cochlea?.droppedColumns ?? 0
                 self.seenDroppedInput = self.cochlea?.droppedInput ?? 0
+                // And the input unit's own counter, for the same reason: a
+                // new unit starts at zero, and whatever the last one lost is
+                // not news about this one. Any hole still waiting for the
+                // cascade belonged to the source that has just been replaced.
+                self.seenDroppedInputFrames = self.audio.droppedInputFrames
+                self.seenInputDropouts = self.audio.inputDropouts
+                self.forgetDropouts()
                 self.cochlea?.capturing = true
                 self.showCurrentDevice()
                 // The file is gone, but it is still what Replay would play,
@@ -2213,6 +2228,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Drops seen so far, so a gap in either stream can be noticed.
     private var seenDroppedColumns: UInt64 = 0
     private var seenDroppedInput: UInt64 = 0
+    /// The third kind of loss, and the only one that happens before the
+    /// cascade: audio the device never delivered at all. See
+    /// `markInputDropouts`.
+    private var seenDroppedInputFrames: UInt64 = 0
+    /// Where a hole already noticed will reach the right-hand edge, as an
+    /// engine column, with the epoch that number belongs to. Nil when nothing
+    /// is waiting.
+    private var pendingDropout: (column: Int64, epoch: Int)?
+    /// The engine column the last dropout line was drawn on, so the next one
+    /// can be kept away from it. Nil when none has been drawn.
+    private var lastDropoutColumn: Int64?
+    private var seenInputDropouts: UInt64 = 0
+    private var dropLogFrames: UInt64 = 0
+    private var dropLogHoles: UInt64 = 0
+    private var lastDropLog = Date.distantPast
+
+    /// Mark audio the device never delivered, where it went missing.
+    ///
+    /// The one-second meter in `reportAudioMeters` can say the last second was
+    /// thin; it cannot say when, and a horizontal scale that quietly
+    /// compresses time is the one lie this display must not tell.
+    ///
+    /// Two halves, because the news and the place it belongs arrive at
+    /// different times. The render callback finds a hole the moment it opens,
+    /// but the audio on either side of it has only just been handed to the
+    /// cascade and will not reach the right-hand edge for another
+    /// `displayLagMS` -- 186 ms with De-skew on, more than forty columns at 4
+    /// ms each. Marking on notice would draw the line that far to the left of
+    /// the join it names. `markFileEndOnce` exists because an error of
+    /// thirty-five milliseconds of exactly this kind was not acceptable, and
+    /// this is the same standard.
+    ///
+    /// RePlay is deliberately not re-anchored here, unlike the two losses
+    /// `captureTick` handles. Those desynchronise the picture from the
+    /// recording -- one drops columns, the other drops captured audio. This
+    /// one happens upstream of both, in `feedMono`'s caller, so the missing
+    /// frames are absent from the picture and the recording in equal measure
+    /// and the correspondence between them survives intact. That stops being
+    /// true the moment columns are *inserted* to span the gap, which is the
+    /// next step: `recordedPerColumn = 0` at the join is what it will want.
+    private func markInputDropouts() {
+        noticeInputDrops()
+        placeDropoutIfDue()
+    }
+
+    private func noticeInputDrops() {
+        let frames = audio.droppedInputFrames
+        // Greater than, not different from -- the same rule `reportAudioMeters`
+        // states for render errors. The count goes back to zero when the input
+        // unit is replaced, and opening a file replaces it with nothing. A
+        // counter starting again is not a hole; and anything still waiting for
+        // the cascade belonged to the source that has just gone, so it must go
+        // too, or it would be drawn on the file that replaced it.
+        guard frames > seenDroppedInputFrames else {
+            if frames < seenDroppedInputFrames { forgetDropouts() }
+            seenDroppedInputFrames = frames
+            seenInputDropouts = audio.inputDropouts
+            return
+        }
+        dropLogFrames &+= frames - seenDroppedInputFrames
+        seenDroppedInputFrames = frames
+        // Holes, not ticks. A failing device opens one per callback -- 172 a
+        // second at 256 frames -- while this runs at the display rate, so
+        // counting arrivals here would report sixty of a hundred and seventy.
+        let holes = audio.inputDropouts
+        if holes > seenInputDropouts { dropLogHoles &+= holes - seenInputDropouts }
+        seenInputDropouts = holes
+        flushDropLog()
+        // Nothing is scrolling and nothing is being kept: the columns made
+        // while the picture is frozen are discarded, so a hole among them has
+        // no consequence the picture could show, and the seam the pause leaves
+        // already says that time jumps here. The counters are read either way,
+        // so the hole cannot surface later against an unrelated column.
+        guard !paused, let c = cochlea, c.columnMilliseconds > 0 else { return }
+        // Finite and bounded before it becomes an `Int64`: the delays come
+        // straight from the engine with no finiteness check of their own, and
+        // `Int64(Double.nan)` traps.
+        let lagColumns = c.displayLagMS / c.columnMilliseconds
+        guard lagColumns.isFinite else { return }
+        let due = view.nextEngineColumn
+                + Int64(min(max(lagColumns, 0), 1e6).rounded())
+        // One pending line at a time, and the earliest join wins.
+        if let p = pendingDropout, p.epoch == view.contentEpoch,
+           p.column <= due { return }
+        // And no closer than a quarter of a second to the last line drawn.
+        // Coalescing alone is not enough: with De-skew off the wait above is a
+        // fraction of a column, so a continuously failing device would arm and
+        // place on the same tick, every tick, and the picture would become an
+        // orange field saying no more than one line and a count do.
+        let spacing = Int64((250 / c.columnMilliseconds).rounded())
+        if let last = lastDropoutColumn, due < last + spacing { return }
+        pendingDropout = (due, view.contentEpoch)
+    }
+
+    private func placeDropoutIfDue() {
+        guard let p = pendingDropout else { return }
+        // A wipe renumbers the columns, so a target from before one names
+        // audio that no longer exists.
+        guard p.epoch == view.contentEpoch else { pendingDropout = nil; return }
+        // Freezing strands it. The column numbering stops where it is while
+        // the picture is paused and the hole's own columns are discarded, so
+        // on the resume this target would name audio arriving afterwards --
+        // and the seam the pause leaves has already said that time jumps.
+        guard !paused else { pendingDropout = nil; return }
+        guard view.nextEngineColumn >= p.column else { return }
+        pendingDropout = nil
+        lastDropoutColumn = p.column
+        view.markDropout()
+    }
+
+    /// Drop anything waiting, and the spacing it was measured against.
+    /// The column numbers on both sides belong to a source or a picture that
+    /// is being replaced.
+    private func forgetDropouts() {
+        pendingDropout = nil
+        lastDropoutColumn = nil
+    }
+
+    /// At most one line a second, like every other repeating line in this
+    /// file. Called from the meter report as well, so that the last hole of a
+    /// burst is not left sitting in the accumulator unreported.
+    private func flushDropLog() {
+        guard dropLogHoles > 0 else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastDropLog) >= 1 else { return }
+        lastDropLog = now
+        let ms = Double(dropLogFrames) * 1000 / max(audio.sampleRate, 1)
+        Log.say("INPUT DROPPED \(dropLogFrames) frames "
+                + String(format: "(%.1f ms)", ms)
+                + " in \(dropLogHoles) hole(s); "
+                + "\(audio.inputDropouts) hole(s) since launch")
+        dropLogFrames = 0
+        dropLogHoles = 0
+    }
 
     /// Take what the engine captured, and let go of what has scrolled off.
     ///
@@ -2328,6 +2477,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // top. Marking it costs one line and stops the picture claiming a
         // continuity across the join that it does not have.
         view.markSeam()
+        // A dropout still waiting for the cascade was given its column under
+        // the old lag, and this changes that lag by nearly two hundred
+        // milliseconds -- forty columns and more. It would be drawn that far
+        // from the join it names, so it is dropped rather than moved: the seam
+        // just placed already says time is not continuous here.
+        forgetDropouts()
         cochlea?.deskew = settings.deskew
         applyCloseUp()
         showSettingsInControls()

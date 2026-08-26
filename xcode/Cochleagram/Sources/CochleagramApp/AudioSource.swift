@@ -112,6 +112,12 @@ final class AudioSource {
     /// Renders the input unit could not complete. Should stay at zero.
     var renderErrors: UInt64 { input?.renderErrors ?? 0 }
 
+    /// Live input that never arrived, in frames, and the number of holes it is
+    /// missing from. See `InputUnit.droppedFrames`; read by comparison rather
+    /// than subtraction, because a replaced unit counts from zero again.
+    var droppedInputFrames: UInt64 { input?.droppedFrames ?? 0 }
+    var inputDropouts: UInt64 { input?.dropouts ?? 0 }
+
     /// Called when a file finishes playing.
     var onFinish: (() -> Void)?
 

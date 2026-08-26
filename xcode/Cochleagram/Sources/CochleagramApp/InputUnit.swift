@@ -51,6 +51,32 @@ final class InputUnit {
     /// Render failures, for the log. Should stay at zero.
     private(set) var renderErrors: UInt64 = 0
 
+    /// Audio that never arrived: how many frames are missing, and how many
+    /// separate holes they are missing from.
+    ///
+    /// Not the same fault as slow delivery, and not measurable the same way.
+    /// `Meters.samples` falling short of the sample rate says the last second
+    /// was thin and cannot say when; this is found at the join itself, which
+    /// is the only form of the news the picture can act on.
+    ///
+    /// Monotonic, and meant to be read by comparison rather than subtraction:
+    /// a replaced unit starts again at zero, so a remembered value can be
+    /// larger than the current one.
+    private(set) var droppedFrames: UInt64 = 0
+    private(set) var dropouts: UInt64 = 0
+
+    /// Where the next buffer should begin on the device's own sample clock.
+    ///
+    /// NaN when there is no expectation to hold the next buffer to: before the
+    /// first buffer of a run, and after any buffer that arrived without a
+    /// valid sample time. A sentinel rather than a negative number because a
+    /// sample clock is not required to start at zero, and "no run yet" and
+    /// "the clock is below zero" are different claims.
+    ///
+    /// Written on the audio thread, and on the main thread only in `start`,
+    /// where the IO thread is not yet running.
+    private var expectedSampleTime: Double = .nan
+
     deinit { close() }
 
     // MARK: - setup
@@ -179,6 +205,10 @@ final class InputUnit {
         guard let au = unit else {
             throw AudioUnitError("Start before open.", noErr)
         }
+        // A stopped unit's clock is not the running one's, so the first buffer
+        // after a start begins a run rather than continuing the last. Safe to
+        // write here: the IO thread is not running until the line below.
+        expectedSampleTime = .nan
         try check(AudioOutputUnitStart(au), "start the unit")
         Log.say("AUHAL started")
     }
@@ -237,14 +267,61 @@ final class InputUnit {
 
     // MARK: - audio thread
 
+    /// Audio thread. Plain increments, for the reason `AudioSource.Meters`
+    /// gives at length: naturally aligned words, read on the main thread for a
+    /// log line and a mark on the picture, and a lock here would be a real bug
+    /// bought with a cosmetic one.
+    private func noteDrop(_ frames: UInt64) {
+        guard frames > 0 else { return }
+        droppedFrames &+= frames
+        dropouts &+= 1
+    }
+
     fileprivate func render(_ flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
                             _ timeStamp: UnsafePointer<AudioTimeStamp>,
                             _ bus: UInt32,
                             _ frames: UInt32) -> OSStatus {
         guard let au = unit, let list = bufferList, let mono else { return noErr }
         let n = Int(frames)
+
+        // Audio that never arrived, found by asking the device's own clock
+        // whether this buffer continues the last one. A few comparisons and a
+        // store, which is what this thread can afford, and the only witness
+        // there is: samples lost before the callback are not thin, they are
+        // absent, and nothing downstream will ever see them.
+        let ts = timeStamp.pointee
+        if ts.mFlags.contains(.sampleTimeValid) {
+            if !expectedSampleTime.isNaN {
+                let gap = ts.mSampleTime - expectedSampleTime
+                // Forwards, at least a whole frame, and bounded. Sample times
+                // are integral on a HAL device, so a whole frame is the
+                // smallest step there is; the floor absorbs sub-frame creep on
+                // a clock that is not integral, and a clock that stepped
+                // backwards is not reporting a hole.
+                //
+                // The ceiling is not fussiness. `mSampleTime` is a Float64
+                // from a driver, and a driver that re-bases its clock hands
+                // back a difference that is not a hole but a number -- and a
+                // Double past `UInt64.max` traps the conversion, which on this
+                // thread is an abort. 1e12 frames is about 250 days of audio.
+                if gap >= 1, gap < 1e12 { noteDrop(UInt64(gap)) }
+            }
+            expectedSampleTime = ts.mSampleTime + Double(n)
+        } else {
+            // No clock, no expectation. Left as it was, the next buffer that
+            // does carry a timestamp would show a gap the width of everything
+            // skipped here and report audio that in fact arrived.
+            expectedSampleTime = .nan
+        }
+
         guard n > 0, n <= listCapacityFrames else {
             renderErrors &+= 1
+            // A buffer bigger than the one allocated for it is audio lost as
+            // surely as a hole in the device's clock, and this is the only
+            // place it can be counted: the expectation above has already been
+            // advanced past these frames, or invalidated, so no later buffer
+            // will report them.
+            noteDrop(UInt64(n))
             return noErr
         }
 
@@ -258,6 +335,7 @@ final class InputUnit {
                                   list.unsafeMutablePointer)
         guard err == noErr else {
             renderErrors &+= 1
+            noteDrop(UInt64(n))
             return err
         }
 

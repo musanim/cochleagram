@@ -66,6 +66,13 @@ final class CochleagramView: NSView {
         /// the boundary of the recording, and worth telling apart from
         /// whatever arrives next.
         case fileEnd
+        /// Audio never reached the engine here. The device could not deliver
+        /// it, or the audio thread could not keep up and the buffer was lost.
+        /// A jump in time like a seam, but not one anybody asked for, and the
+        /// difference matters: a seam is where you stopped looking, and this
+        /// is where the machine stopped listening. The sound either side of it
+        /// no longer exists anywhere to be recovered.
+        case dropout
 
         /// Which mark wins when two land on the same column. Higher is drawn
         /// later, so it is the one seen. The order is by how much the mark
@@ -77,6 +84,11 @@ final class CochleagramView: NSView {
             case .scaleChange:  return 1
             case .tuningChange: return 2
             case .fileEnd:      return 3
+            // Last, so that if one ever shared a column with another it would
+            // be the one seen. It cannot today -- `mark` keeps the first claim
+            // on a column -- but this table is the drawing order, and a fault
+            // is the thing to draw on top.
+            case .dropout:      return 4
             }
         }
 
@@ -94,6 +106,10 @@ final class CochleagramView: NSView {
             case .scaleChange:  return .systemBlue
             case .tuningChange: return .systemPurple
             case .fileEnd:      return .systemGreen
+            // Orange rather than red. As a hairline a dropout is otherwise
+            // indistinguishable from the seam a pause leaves, and telling
+            // those two apart is the whole reason for having the mark.
+            case .dropout:      return .systemOrange
             }
         }
     }
@@ -663,6 +679,9 @@ final class CochleagramView: NSView {
     /// Record the end of a file at the newest column.
     func markFileEnd() { mark(.fileEnd) }
 
+    /// Record audio that never arrived, at the newest column.
+    func markDropout() { mark(.dropout) }
+
     private func mark(_ kind: MarkKind) {
         syncSize()
         guard width > 0 else { return }
@@ -672,6 +691,13 @@ final class CochleagramView: NSView {
         // between, because the display is paused -- and the green line is the
         // more specific statement of the two, so the seam that would otherwise
         // paint over it is dropped.
+        //
+        // Resolving this by `rank` instead was tried and reverted. It reads as
+        // the obvious generalisation, and it is wrong: pause live input and
+        // then change Speed and the blue scale-change line, which outranks the
+        // red seam, would replace it -- and the picture would stop saying that
+        // time jumps there, which is the one thing it must not stop saying.
+        // Rank orders what is *drawn*; it is not a table of what matters most.
         guard !marks.contains(where: { $0.column == x }) else { return }
         marks.append(Mark(column: x, kind: kind))
         Log.say("MARK \(kind) at column \(x) of \(width); "
@@ -1758,11 +1784,33 @@ final class CochleagramView: NSView {
             // Both exactly zero is a column that was never written -- the left
             // of a freshly wiped picture. The zero line already stands for it.
             if lo == 0 && hi == 0 { continue }
-            // Clamped at the edges, which is the strip's version of the
-            // picture going solid black: past the top there is nothing more to
-            // show, and both saturate at nearly the same level.
-            var yLo = mid + max(-1, lo / full) * half
-            var yHi = mid + min(1, hi / full) * half
+            // Clamped at both edges, which is the strip's version of the
+            // picture going solid black: past either end there is nothing more
+            // to show.
+            //
+            // **Both** ends of **each** bound. Clamping only the far end of
+            // each -- `max(-1, lo / full)` and `min(1, hi / full)` -- bounds a
+            // column that straddles zero but not one lying entirely to one side
+            // of it, whose near bound is then left free. That is not the exotic
+            // case it sounds: the gain is deliberately slow, so on the first
+            // frames of a low-frequency onset `full` is still well below the
+            // excursion, and at 4 ms a column can sit inside a single
+            // half-cycle of a hundred-hertz tone. The bar then reaches past the
+            // end of the strip, and nothing clips it, so it is drawn over the
+            // picture.
+            //
+            // A NaN bound is bounded here too. The guard above does not cover
+            // this: it guards the divisor, and a NaN arriving in `columnLo` or
+            // `columnHi` passes the zero test just above. `max` and `min` are
+            // the plain `Comparable` ones, every comparison against NaN is
+            // false, so a NaN falls through the inner `max` to -1 rather than
+            // out of the strip.
+            var yLo = mid + min(1, max(-1, lo / full)) * half
+            var yHi = mid + min(1, max(-1, hi / full)) * half
+            // Unreachable for finite bounds -- `lo <= hi` comes from the
+            // engine and the clamp is monotone -- but not for a NaN one, which
+            // clamps to -1 whichever end it came from and can therefore land
+            // below its partner. Kept for that, and it costs nothing.
             if yHi < yLo { swap(&yLo, &yHi) }
             let px = r.minX + CGFloat(x) * sx
             // At least a hairline: a column whose excursion is smaller than one
