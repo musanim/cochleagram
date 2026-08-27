@@ -1957,6 +1957,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeSettingsWindow() -> NSWindow {
+        // Every menu in here was filled by `buildWindow` at launch --
+        // `refreshOutputList` populates the channel menu in turn. That is what
+        // the measured widths below depend on, since an empty popup measures
+        // as an empty popup. `showSettings` refreshes the contents again, but
+        // only after this function has returned, so it cannot help here.
         let label = NSTextField(labelWithString: "Input device")
         deviceSummary.font = .monospacedDigitSystemFont(ofSize: 10,
                                                         weight: .regular)
@@ -1964,31 +1969,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         deviceSummary.usesSingleLineMode = true
         (deviceSummary.cell as? NSTextFieldCell)?.lineBreakMode = .byTruncatingTail
 
-        let row = NSStackView(views: [label, devicePopup])
-        row.orientation = .horizontal
-        row.spacing = 8
+        let margin: CGFloat = 20
+        let gap: CGFloat = 8
+        // A cap on the output menu, so a long device name truncates inside its
+        // own popup rather than widening the row that holds it. The row was
+        // over-wide before this, and an over-wide row is not held to the
+        // leading margin: it ends up centred, spilling past both edges of the
+        // dialog -- which is what put "Play files through" left of every other
+        // line and the channel menu hard against the right edge.
+        let popupCap: CGFloat = 240
+        outputPopup.widthAnchor.constraint(
+            lessThanOrEqualToConstant: popupCap).isActive = true
+
+        // The channel menu is measured rather than capped by choice, and then
+        // pinned to what it measured. Its widest entry is "All channels",
+        // which `refreshChannelList` always puts first, so the measurement is
+        // stable across device changes -- and if that ever stops being true,
+        // the cap makes the new entry truncate instead of overflowing a window
+        // that was sized before it existed.
+        let channelWidth = channelPopup.intrinsicContentSize.width
+        channelPopup.widthAnchor.constraint(
+            lessThanOrEqualToConstant: channelWidth).isActive = true
 
         let outLabel = NSTextField(labelWithString: "Play files through")
-        outputPopup.widthAnchor.constraint(
-            lessThanOrEqualToConstant: 240).isActive = true
         let outRow = NSStackView(views: [outLabel, outputPopup, channelPopup])
         outRow.orientation = .horizontal
-        outRow.spacing = 8
+        outRow.spacing = gap
+
+        // The one width everything in the dialog is laid out to, and from
+        // which the window's own width follows -- so the two margins are the
+        // stack's insets by construction rather than by choosing numbers.
+        // Floored at the 380 the separators and the status line used to be
+        // hard-coded to, and rounded up with a point or two to spare, since a
+        // row that fits its container exactly is a rounding error away from
+        // not fitting it at all.
+        //
+        // The output row is measured at the widest it can ever be, with its
+        // device menu at the cap, rather than at whatever is selected now: the
+        // window is built once and kept, and a dialog sized around "System
+        // default" would be too narrow the moment a long device name was
+        // picked.
+        let outRowWidth = outLabel.intrinsicContentSize.width
+                        + gap + popupCap + gap + channelWidth
+        let contentWidth = max(380, ceil(outRowWidth) + 2)
+
+        // The input row gets whatever that leaves it, which is more than the
+        // output menu's cap: it is the shorter label of the two, and it has no
+        // channel menu beside it. Capped all the same, so a long name truncates
+        // rather than widening the dialog past the row it was sized for.
+        devicePopup.widthAnchor.constraint(
+            lessThanOrEqualToConstant:
+                contentWidth - label.intrinsicContentSize.width - gap
+            ).isActive = true
+        let row = NSStackView(views: [label, devicePopup])
+        row.orientation = .horizontal
+        row.spacing = gap
+
+        deviceSummary.widthAnchor.constraint(
+            lessThanOrEqualToConstant: contentWidth).isActive = true
 
         // The status line, which used to sit in the toolbar under a hard
         // width cap so a long message could not widen the window and shove
-        // the picture sideways. Here it can simply be as wide as it needs.
+        // the picture sideways. Here it takes the dialog's width, and wraps
+        // into the second line rather than widening anything.
         status.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         status.textColor = .secondaryLabelColor
         status.usesSingleLineMode = false
         status.maximumNumberOfLines = 2
         (status.cell as? NSTextFieldCell)?.lineBreakMode = .byWordWrapping
-        status.preferredMaxLayoutWidth = 380
-        status.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        status.preferredMaxLayoutWidth = contentWidth
+        status.widthAnchor.constraint(
+            equalToConstant: contentWidth).isActive = true
+
+        // The status line is the one thing in the dialog whose height varies:
+        // it shows nothing, one line, or two. The window's height is measured
+        // from the content below, so reserve the two-line height here --
+        // measured rather than computed from the font, and taken while the
+        // field holds text long enough to wrap. Otherwise the dialog would be
+        // built around an empty status line and the second line of a long
+        // message would have nowhere to go.
+        // The explicit invalidations are not ceremony: assigning `stringValue`
+        // only marks the intrinsic size stale, and a view that is not yet in a
+        // window can otherwise be measured against the size cached for the
+        // string before it.
+        let savedStatus = status.stringValue
+        status.stringValue = String(repeating: "status ", count: 60)
+        status.invalidateIntrinsicContentSize()
+        let statusHeight = ceil(status.fittingSize.height)
+        status.stringValue = savedStatus
+        status.invalidateIntrinsicContentSize()
+        status.heightAnchor.constraint(
+            equalToConstant: statusHeight).isActive = true
 
         let separator = NSBox()
         separator.boxType = .separator
-        separator.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        separator.widthAnchor.constraint(
+            equalToConstant: contentWidth).isActive = true
 
         // Diagnostics. Three destinations rather than one switch, because
         // they are useful in different situations and none of them should be
@@ -2017,7 +2093,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let separator2 = NSBox()
         separator2.boxType = .separator
-        separator2.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        separator2.widthAnchor.constraint(
+            equalToConstant: contentWidth).isActive = true
 
         let reset = NSButton(title: "Reset Settings…", target: self,
                              action: #selector(resetSettings(_:)))
@@ -2029,24 +2106,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 18, right: 20)
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: margin,
+                                        bottom: 18, right: margin)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 340),
+        let root = NSView()
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: root.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            // Equality across, not `lessThanOrEqualTo`: the stack is exactly
+            // as wide as the content view, so the insets are the two margins.
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            // Down the page it stays an inequality, so that rounding the
+            // measured height up leaves a fraction of a point spare rather
+            // than stretching the stack.
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor),
+        ])
+
+        // The height follows the content the way the width does, rather than
+        // being a number chosen to look about right. Everything in the stack
+        // now has a settled height -- the status line was the last thing that
+        // did not -- so this is simply the height the content asks for. The
+        // window must be built with it: this one is not resizable.
+        let contentHeight = ceil(root.fittingSize.height)
+
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0,
+                                             width: contentWidth + 2 * margin,
+                                             height: contentHeight),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = "Settings"
         // Closing a window releases it by default, and this one is kept in a
         // property and reopened -- which would be a use-after-free.
         w.isReleasedWhenClosed = false
-        let root = NSView()
-        root.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: root.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: root.trailingAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor),
-        ])
         w.contentView = root
         return w
     }
