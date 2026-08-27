@@ -242,6 +242,46 @@ verified; the Swift layer is not. See `xcode/README.md` for the likely snags.
 
 ---
 
+## Closed, and not to be reopened
+
+Things that were looked at properly, decided against, and should not come back
+unless something outside the project pushes them. The measurements are here so
+that nobody has to make them twice.
+
+**The coherence calibration's front end.** *Closed 2026aug26, Stephen's call.*
+`calibrateCoherence` generates its white noise at the internal rate and hands
+it straight to `runCascade`, so the noise is white to 44 kHz where real audio,
+arriving through the half-band upsampler, stops at 22. It is the same class of
+error `calibrateDelays` had and had fixed -- a measurement harness that does
+not go through the path it measures -- and it is genuinely there.
+
+It is also nearly inconsequential. Built as a patch and compared: averaged over
+ten seconds, fixed and unfixed baselines differ by **0.001 cycles rms**, against
+a display full scale of ±0.05. Two percent of one colour channel.
+
+Two things found on the way that are worth keeping:
+
+* **One second is not enough averaging at the apex.** Each version's
+  one-second answer against its own ten-second answer: 0.003 cycles rms
+  overall, but 0.015 at 50 Hz -- thirty percent of full scale. Low taps peak
+  rarely and the apex takes 186 ms to respond before any observation counts.
+  This, not the front end, is the larger error in the coherence baseline.
+* **The coherence pass is now the whole engine build.** With the delays baked,
+  a version-2 file builds in 237 ms with the pass and **6 ms** without it.
+
+Which points at baking the coherence baseline into the coefficient file the
+way the delays were -- version 3, one more vector, averaging as long as you
+like because it is paid once, engine build down to about 6 ms. That is the
+option that was declined: coherence is a test rather than a shipped feature,
+and the cost is a file-format change touching the loader, `bakedelays.py`,
+`bakeall.sh` and `release.sh` together.
+
+**If this is ever reopened**, the trigger would be mode colouring becoming a
+real feature rather than an experiment, or engine-build latency mattering more
+than it does -- most likely on a phone, where the 237 ms is worse.
+
+---
+
 ## Legal
 
 **Before any commercial approach**, an hour with a patent attorney on:

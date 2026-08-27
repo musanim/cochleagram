@@ -2680,16 +2680,23 @@ final class SpectrumView: NSView {
         // so the trace snaps to the present rather than sliding to it.
         let a = CGFloat(exp(-dt / max(decaySeconds, 1e-4)))
         var moved: CGFloat = 0
+        // Crossing the black point adds or removes a mark in `draw`, and that
+        // is a visible change however small the step that caused it. A trace
+        // settling onto the black point from a hair away moves by far less
+        // than the threshold below, so without this the mark would wait for
+        // some unrelated tap to move enough to trigger a frame.
+        var crossed = false
         for i in 0..<raw.count {
             let next = raw[i] + (trace[i] - raw[i]) * a
             let d = next - trace[i]
             moved = max(moved, d < 0 ? -d : d)
+            if (trace[i] > 1) != (next > 1) { crossed = true }
             trace[i] = next
         }
         // A converging exponential never quite arrives, so without a threshold
         // a still picture would redraw for ever. A thousandth of full scale is
         // a fraction of a point at any window size this can have.
-        if moved > 0.001 { needsDisplay = true }
+        if moved > 0.001 || crossed { needsDisplay = true }
     }
 
     /// Points from the zero line to the black point. Everything beyond that is
@@ -2745,6 +2752,79 @@ final class SpectrumView: NSView {
         ctx.addPath(path)
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fillPath()
+        ctx.restoreGState()
+
+        // Where the black point falls, marked on the taps that have gone past
+        // it and nowhere else.
+        //
+        // The trace is deliberately not clipped at the black point -- see
+        // `CochleagramView.spectrumTrace` -- so a loud tap simply reaches
+        // further right. That is the useful behaviour and it stays; what was
+        // missing is any way to see *where* full ink was, so a trace running
+        // out into the headroom said how loud without saying how far past.
+        //
+        // Only on the taps that exceed it. On a tap short of the black point
+        // the mark would be a white dot floating in an empty transparent
+        // window over whatever is behind the app, which says nothing and
+        // reads as dirt.
+        //
+        // One mark per tap, because the taps are what it is about -- but at
+        // 599 taps in a window a few hundred points tall that is well under a
+        // point each, so what it actually draws is a white line, broken where
+        // the sound is not over. Runs of neighbouring taps are coalesced into
+        // one rectangle rather than drawn a tap at a time: at that density
+        // separate rects share edges, and shared edges are where a filled
+        // shape shows seams.
+        //
+        // A run ends where the *ink* ends, which is not where the taps end.
+        //
+        // The black boundary is a polyline through row centres, so between an
+        // over-black tap and a quieter neighbour it crosses `blackReach`
+        // somewhere in between. Taking the run out to the band edge instead
+        // puts half a band of white over transparent window at each end of
+        // every run -- worst on an isolated tap only just over, where half the
+        // mark hangs outside the shape it is supposed to be marking. So each
+        // end is interpolated to the crossing, exactly as the fill is.
+        //
+        // Both denominators are safe: a run only starts where `trace[i] > 1`
+        // and only ends where the next value is not, so the two differ.
+        let markW: CGFloat = 1
+        // Read out of `bounds` before the closure rather than inside it:
+        // `bounds` is a property, so using it in there captures `self`.
+        let top = bounds.maxY, span = bounds.height
+        let rowY = { (i: Int) -> CGFloat in
+            top - (CGFloat(i) + 0.5) / CGFloat(rows) * span
+        }
+        ctx.saveGState()
+        ctx.setShouldAntialias(false)
+        ctx.setFillColor(NSColor.white.cgColor)
+        var runStart = -1
+        for i in 0...rows {
+            let over = i < rows && trace[i] > 1
+            if over && runStart < 0 { runStart = i }
+            guard !over, runStart >= 0 else { continue }
+            // The first and last rows carry to the window edge, because the
+            // fill does: there is no neighbour to cross between.
+            let yTop: CGFloat
+            if runStart == 0 {
+                yTop = bounds.maxY
+            } else {
+                let f = (1 - trace[runStart - 1])
+                      / (trace[runStart] - trace[runStart - 1])
+                yTop = rowY(runStart - 1) + f * (rowY(runStart) - rowY(runStart - 1))
+            }
+            let last = i - 1
+            let yBot: CGFloat
+            if i == rows {
+                yBot = bounds.minY
+            } else {
+                let f = (trace[last] - 1) / (trace[last] - trace[i])
+                yBot = rowY(last) + f * (rowY(i) - rowY(last))
+            }
+            ctx.fill(CGRect(x: zeroX + blackReach - markW, y: yBot,
+                            width: markW, height: yTop - yBot))
+            runStart = -1
+        }
         ctx.restoreGState()
     }
 }

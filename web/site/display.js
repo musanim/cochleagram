@@ -1673,6 +1673,58 @@ export class Display {
         // edge clips them, which cannot be helped.
         ctx.fillStyle = this.exposure.inverted ? '#fff' : '#000';
         ctx.fill();
+
+        // Where the black point falls, marked on the taps that have gone past
+        // it and nowhere else. `SpectrumView.draw` in the Mac app does the
+        // same thing, and the two have to agree.
+        //
+        // The line above is why this is needed: levels past the black point
+        // run out into the headroom, which says how loud without saying how
+        // far past full ink -- because nothing marks where full ink was.
+        //
+        // Only on the taps that exceed it. Elsewhere the mark would sit on
+        // bare paper beyond the end of the trace, saying nothing and reading
+        // as dirt.
+        //
+        // In paper rather than in white, unlike the Mac's, which is always
+        // white because that panel is a transparent child window and does not
+        // invert with the picture. Here the trace does invert, so the mark
+        // follows it and stays the colour the ink is not.
+        //
+        // A run ends where the *ink* ends, not where the taps end: the
+        // boundary is a polyline through row centres, so between an over-black
+        // tap and a quieter neighbour it crosses `reach` somewhere in between.
+        // Taking a run out to the band edge instead would hang half a band of
+        // mark past the shape it is marking, worst on an isolated tap only
+        // just over. Both denominators are safe -- a run starts only where the
+        // trace is over 1 and ends only where the next value is not.
+        //
+        // Snapped and one device pixel, leftward from `reach` so the mark
+        // falls inside the ink rather than straddling its edge. The zero line
+        // above goes rightward from its edge for the mirror-image reason.
+        const markW = 1 / dpr;
+        const markX = Math.round((zeroX + reach) * dpr) / dpr - markW;
+        const rowY = (i) => plot.y + (i + 0.5) / rows * plot.h;
+        ctx.fillStyle = this.exposure.inverted ? '#000' : '#fff';
+        let runStart = -1;
+        for (let i = 0; i <= rows; i++) {
+            const over = i < rows && this.trace[i] > 1;
+            if (over && runStart < 0) runStart = i;
+            if (over || runStart < 0) continue;
+            // The first and last rows carry to the edge, because the fill
+            // does: there is no neighbour to cross between.
+            const a = runStart, b = i - 1;
+            const yTop = a === 0 ? plot.y
+                : rowY(a - 1) + (1 - this.trace[a - 1])
+                  / (this.trace[a] - this.trace[a - 1])
+                  * (rowY(a) - rowY(a - 1));
+            const yBot = i === rows ? plot.y + plot.h
+                : rowY(b) + (this.trace[b] - 1)
+                  / (this.trace[b] - this.trace[i])
+                  * (rowY(i) - rowY(b));
+            ctx.fillRect(markX, yTop, markW, yBot - yTop);
+            runStart = -1;
+        }
     }
 
     // MARK: drawing the readout
