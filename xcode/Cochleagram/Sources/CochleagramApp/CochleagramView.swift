@@ -442,15 +442,27 @@ final class CochleagramView: NSView {
         columnsSinceJoin = 0
         let taps = cochlea?.tapCount ?? 0
         guard taps > 0 else {
+            // Unreachable as things stand, though not by anything Swift
+            // enforces: `adopt` is only ever handed an engine that loaded,
+            // and no engine loads with zero taps because the C loader
+            // requires `n_lead < n_ch`. `Cochlea.init?` itself does not check
+            // -- it tolerates a zero count rather than refusing one. So this
+            // branch stands on the file format, one layer down. Kept, and
+            // kept correct on its own terms.
             height = 0
             width = 0
             pixels = []
             levels = []
+            // Was left at its old size while `levels` was emptied, which is
+            // only harmless because everything that reads it guards on
+            // `height > 0`. Two arrays of the same shape should not disagree
+            // about whether they exist.
+            coherence = []
             columnRefs = []
             columnLo = []
             columnHi = []
             columnFine = []
-            marks.removeAll()
+            invalidateContent()
             return
         }
         if taps == height, width > 0, !pixels.isEmpty {
@@ -464,7 +476,7 @@ final class CochleagramView: NSView {
         // taps-per-octave or the frequency range would.
         Log.say("COCHLEA \(height) -> \(taps) taps — wiping the picture")
         height = taps
-        marks.removeAll()
+        invalidateContent()
         width = 0                       // force syncSize to allocate
         syncSize()
     }
@@ -601,8 +613,10 @@ final class CochleagramView: NSView {
                     ? m : nil
             }
         } else {
-            marks.removeAll()
-            measurement = nil
+            // Nothing was kept, so this reallocation is a wipe like any other.
+            // Reached only from `adoptCochlea`, which zeroes the width to
+            // force an allocation -- including the first one, at startup.
+            invalidateContent()
         }
         resizeCount += 1
         lastResize = "\(width)->\(w)"
@@ -643,17 +657,45 @@ final class CochleagramView: NSView {
         syncSize()
     }
 
+    /// Everything that stops being true the moment the picture stops holding
+    /// the audio it held. Call it from every path that wipes.
+    ///
+    /// It exists because the epoch bump used to live in `clear()` alone, while
+    /// two things read it -- `syncRecorder`'s anchor and the dropout code's
+    /// target column -- and three other paths wiped without bumping it.
+    ///
+    /// None of the three showed. `adopt` is only ever handed an engine that
+    /// loaded, so `adoptCochlea`'s zero-tap branch is unreachable; its
+    /// geometry branch fires once, at startup, where `recordedEpoch` still
+    /// holds its initial -1 and so differs from the epoch whatever the epoch
+    /// is; and `syncSize`'s no-content branch is only reached from those two.
+    /// A coefficient file with a different tap count would make all of it live
+    /// at once, and silently, which is the case worth defending against.
+    ///
+    /// Two of the four call sites overlap -- `adoptCochlea`'s geometry branch
+    /// invalidates and then zeroes the width, which sends `syncSize` down the
+    /// branch that invalidates again. That is deliberate: each is correct on
+    /// its own, neither has to know what the other does, and consumers test
+    /// the epoch for inequality rather than for distance, so bumping it twice
+    /// says exactly what bumping it once says.
+    private func invalidateContent() {
+        contentEpoch &+= 1
+        playhead = nil
+        clearMeasurement()
+        // A mark is a column index wearing a hat. The columns it indexes are
+        // the ones being thrown away.
+        marks.removeAll()
+    }
+
     /// Wipe the image. Used when the source changes and when settings are
     /// reset -- not when the time scale changes, where keeping what is already
     /// drawn is worth more than the mixed scale costs.
     func clear() {
-        clearMeasurement()
         // Before the guard, not after: a wipe that found nothing to wipe has
         // still ended the old numbering, and a recorder that missed the bump
         // would go on mapping columns to audio through an anchor that no longer
         // means anything.
-        contentEpoch &+= 1
-        playhead = nil
+        invalidateContent()
         guard height > 0, width > 0 else { return }
         fineIndex = 0
         levels = [Float](repeating: kSilentDB, count: width * height)
@@ -663,7 +705,6 @@ final class CochleagramView: NSView {
         columnHi = [Float](repeating: 0, count: width)
         columnFine = [Int64](repeating: -1, count: width)
         renderColumns(from: 0, count: width)
-        marks.removeAll()
         needsDisplay = true
     }
 
@@ -2070,9 +2111,21 @@ final class CochleagramView: NSView {
     // at once, and when a change of Speed leaves the older half of the picture
     // at a scale the newer half is not. See REPLAY-DESIGN.md.
 
-    /// Bumped whenever the engine-column numbering starts again -- which is
-    /// whenever the picture is wiped. Anything still holding a column index
-    /// from before the bump is holding a number that now names other audio.
+    /// Bumped whenever the picture is wiped, which is to say whenever a column
+    /// index from before the bump stops naming what is on screen. Anything
+    /// still holding one is holding a number about audio the picture no longer
+    /// has.
+    ///
+    /// Not quite the same as "the numbering starts again", which is what this
+    /// used to say. `clear()` mostly does restart it -- `fineIndex` goes back
+    /// to zero, though not on its early return -- while the wipe in
+    /// `adoptCochlea` leaves the count running, so an index from before it is
+    /// stale without being ambiguous. Every consumer wants the weaker
+    /// statement anyway: they are asking whether what they held is still on
+    /// the screen, not whether the number could be handed out twice.
+    ///
+    /// Bumped only by `invalidateContent()`. Adding a new way to wipe means
+    /// calling that, not repeating this.
     private(set) var contentEpoch = 0
 
     /// The index the next engine column to arrive will have. What a recorder
