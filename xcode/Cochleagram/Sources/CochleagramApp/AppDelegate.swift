@@ -1718,6 +1718,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             report("Playing \(url.lastPathComponent)")
         } catch {
             audio.onFinish = nil
+            // The transport was last drawn for whatever was playing before
+            // this attempt, and `startFile` has stopped that whether it got
+            // as far as starting the new file or not. So `isFilePlayback` has
+            // just gone false and the buttons still say otherwise.
+            //
+            // The finished-file flags are left alone, which is right for the
+            // failure that actually happens -- a file that will not open
+            // throws before anything else has moved, and the flags still
+            // describe the picture that is still on the screen.
+            //
+            // It is not right for a failure inside `startFile` *after*
+            // `makeCochlea` has run, because that closure is not a factory:
+            // it adopts the new engine into the view, which wipes the picture.
+            // A file that fails to start then leaves the flags describing a
+            // picture that has gone. Not repaired here, because the repair
+            // belongs where the side effect is. See OPEN-QUESTIONS.md.
+            //
+            // Note also that space is only a way out of this when we arrived
+            // from `replayFile`, where `fileFinished` is true. From `openFile`
+            // or an ERB change it is false, and the way back to live input is
+            // the device menu.
+            showTransport()
             report(error.localizedDescription, isProblem: true)
         }
     }

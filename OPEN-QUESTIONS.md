@@ -180,6 +180,29 @@ settled instantly by a screenshot from the real application.
 
 ---
 
+## Sources
+
+**`makeCochlea` is not a factory, and a failed `startFile` shows it.**
+*Found 2026aug26.* `play(_:)` hands `startFile` a closure that looks like a
+factory and is not: AppDelegate's implementation also assigns `cochlea`,
+re-adopts the engine into the view -- which wipes the picture and bumps the
+epoch -- and calls `applyToEngine()`. `startFile` calls it partway through
+building the graph, so a throw from `try e.start()` leaves the picture wiped
+for a file that never played, with `fileFinished`, `lastFileURL` and the
+transport all still describing the file that was there before.
+
+`startFile`'s own half-built state is now cleaned up on the way out, and a
+file that simply will not open throws before any of this, which is the failure
+that actually happens. What is left is the narrow case where the file opens
+and the engine will not start.
+
+The repair belongs at the side effect rather than in the catch: either the
+closure becomes what its name says and the adopting moves to `play(_:)` after
+`startFile` returns, or it gains a matching undo. The first is cleaner and
+touches `startInput` too, which passes the same closure. Not attempted yet.
+
+---
+
 ## Mode colouring
 
 Parked while the greyscale display is settled. Where it stands:

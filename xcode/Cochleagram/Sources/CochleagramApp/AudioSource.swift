@@ -121,6 +121,29 @@ final class AudioSource {
     /// Called when a file finishes playing.
     var onFinish: (() -> Void)?
 
+    /// Which file a pending `scheduleFile` completion belongs to.
+    ///
+    /// `AVAudioPlayerNode` delivers outstanding completions when the player is
+    /// *stopped*, and `startFile` begins by stopping the old one. The callback
+    /// reaches the main thread asynchronously, by which time the next source is
+    /// already running -- so without this an interrupted file's completion runs
+    /// against its successor: a green line at the new file's start, the picture
+    /// frozen, "Finished" reported, and a graph that has only just started torn
+    /// down. Opening a file, replaying, or going back to live input part-way
+    /// through a playback all reach it.
+    ///
+    /// Bumped wherever the file graph comes down: `stop`, which is also
+    /// `startFile`'s own first line, and `finishedPlayingFile`. Read and
+    /// written on the main thread only, so the completion hops there before it
+    /// looks -- which is also why the bump cannot lose a race with a delivery:
+    /// the completion body does nothing but enqueue, and what it enqueues
+    /// cannot run until the teardown that bumped has returned.
+    ///
+    /// The browser's `endToken` is the same device for the same reason. Note
+    /// that `startReplay` deliberately polls instead of relying on a
+    /// completion, which is why RePlay needs nothing here.
+    private var fileGen: UInt64 = 0
+
     // MARK: - live input
 
     func startInput(deviceID: AudioDeviceID? = nil,
@@ -280,6 +303,19 @@ final class AudioSource {
 
     func startFile(url: URL, makeCochlea: (Double) -> Cochlea?) throws {
         stop()
+        // Half a file graph is worse than none. Everything below assigns as it
+        // goes -- `cochlea`, `engine`, `player`, `tappedNode`, and a tap
+        // installed on the player -- and `try e.start()` is downstream of all
+        // of it. Throwing there used to leave the lot in place with
+        // `isRunning` false, so `isFilePlayback` (which is `player != nil`)
+        // answered yes over a graph that was never started, and the app showed
+        // file transport over nothing until the next source change.
+        //
+        // A flag and a `defer` rather than a catch, so that a throw added
+        // anywhere below is covered without anyone remembering to. `stop()` is
+        // idempotent and safe on a graph that never ran.
+        var started = false
+        defer { if !started { stop() } }
         let file = try AVAudioFile(forReading: url)
         let format = file.processingFormat
         sampleRate = format.sampleRate
@@ -330,13 +366,23 @@ final class AudioSource {
         // a short file is almost immediately and always well before the last
         // sample is heard -- so "Finished" arrived while the picture still had
         // most of the file to draw.
+        // Captured after `stop()` at the top of this method has bumped it, so
+        // this is the new file's number and not the one it replaced.
+        let gen = fileGen
         node.scheduleFile(file, at: nil,
                           completionCallbackType: .dataPlayedBack) {
             [weak self] _ in
-            DispatchQueue.main.async { self?.onFinish?() }
+            DispatchQueue.main.async {
+                // Checked on the main thread, after the hop, because that is
+                // where `fileGen` is written and where the source this would
+                // act on is decided.
+                guard let self, self.fileGen == gen else { return }
+                self.onFinish?()
+            }
         }
         node.play()
         isRunning = true
+        started = true
     }
 
     /// The `unowned self` in the input unit's callback is only sound because
@@ -349,6 +395,11 @@ final class AudioSource {
         // over a source change would be audible over a picture it no longer
         // belongs to.
         stopReplay()
+        // Before the player is stopped, which is what makes it deliver any
+        // completion still outstanding. The file being taken down here is no
+        // longer the one the app is about to be looking at, so its completion
+        // must not be allowed to speak for whatever replaces it. See `fileGen`.
+        fileGen &+= 1
         // The file being taken down has no samples still to end, and the flag
         // belongs to it. Cleared here because it was only ever cleared when the
         // *next file* started, so going back to live input left it standing --
@@ -384,6 +435,14 @@ final class AudioSource {
     /// is handed to another queue. The captured nodes keep themselves alive
     /// until it has finished with them.
     func finishedPlayingFile() {
+        // The other door the file graph comes down through, and it hands
+        // `node.stop()` to a utility queue -- which is the call that flushes
+        // any completion still outstanding. Nothing is outstanding by the time
+        // this runs today: it is reachable only after `fileDidFinish`, which
+        // only `onFinish` reaches, and `scheduleFile` fires once. Bumped
+        // anyway, because that is a two-step argument standing between a
+        // future edit and the bug this token exists to close. See `fileGen`.
+        fileGen &+= 1
         let node = player, engineToStop = engine
         // The tap comes off *here*, synchronously, and not with the rest.
         //
