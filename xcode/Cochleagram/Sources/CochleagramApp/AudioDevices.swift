@@ -1,4 +1,5 @@
 import CoreAudio
+import Dispatch
 
 /// Enumerating CoreAudio devices, for capture and for playback.
 ///
@@ -99,6 +100,40 @@ enum AudioDevices {
     static var defaultInputID: AudioDeviceID? {
         uint32Value(AudioObjectID(kAudioObjectSystemObject),
                     address(kAudioHardwarePropertyDefaultInputDevice))
+    }
+
+    /// The name of whichever device is the system default input at this
+    /// moment, or nil when there is none.
+    ///
+    /// Asked of the device directly rather than by searching `inputs()`: this
+    /// is wanted every time the default changes, and enumerating every device
+    /// on the machine -- with a stream configuration and two properties read
+    /// per device -- to answer a question about one of them is work a menu
+    /// title does not need.
+    static var defaultInputName: String? {
+        guard let id = defaultInputID else { return nil }
+        return string(id, kAudioObjectPropertyName)
+    }
+
+    /// Call `handler` on the main queue whenever the system default input
+    /// device changes -- another microphone chosen in Sound settings, or the
+    /// current one unplugged.
+    ///
+    /// Never removed, and deliberately: the one caller is the app delegate,
+    /// which lives as long as the app does. A listener that outlives what it
+    /// calls into is the way this goes wrong, and there is no such moment
+    /// here.
+    ///
+    /// Returns false if CoreAudio would not take the listener, so a caller can
+    /// say so rather than quietly showing something that will never update.
+    @discardableResult
+    static func whenDefaultInputChanges(_ handler: @escaping () -> Void)
+    -> Bool {
+        var addr = address(kAudioHardwarePropertyDefaultInputDevice)
+        let err = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &addr,
+            DispatchQueue.main) { _, _ in handler() }
+        return err == noErr
     }
 
     static var defaultOutputID: AudioDeviceID? {

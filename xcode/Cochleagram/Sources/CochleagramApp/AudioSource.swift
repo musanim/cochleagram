@@ -15,6 +15,14 @@ import CoreAudio
 /// Both converge on `feedMono`, which is where the metering lives.
 final class AudioSource {
 
+    /// The code on the error thrown when the coefficients will not load.
+    ///
+    /// Named because a caller has to be able to tell it apart from a device
+    /// that will not open: it is the same failure whatever device was asked
+    /// for, so retrying on another one only fails again, more slowly and with
+    /// a message blaming the wrong thing.
+    static let coefficientsFailed = 2
+
     // MARK: - live input
 
     private var input: InputUnit?
@@ -169,7 +177,8 @@ final class AudioSource {
 
         guard let c = makeCochlea(unit.sampleRate) else {
             unit.close()
-            throw NSError(domain: "Cochleagram", code: 2, userInfo: [
+            throw NSError(domain: "Cochleagram",
+                          code: AudioSource.coefficientsFailed, userInfo: [
                 NSLocalizedDescriptionKey:
                     "Could not load the cochlea coefficients."])
         }
@@ -320,7 +329,8 @@ final class AudioSource {
         let format = file.processingFormat
         sampleRate = format.sampleRate
         guard let c = makeCochlea(format.sampleRate) else {
-            throw NSError(domain: "Cochleagram", code: 2, userInfo: [
+            throw NSError(domain: "Cochleagram",
+                          code: AudioSource.coefficientsFailed, userInfo: [
                 NSLocalizedDescriptionKey:
                     "Could not load the cochlea coefficients."])
         }

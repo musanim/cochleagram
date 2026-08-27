@@ -181,13 +181,25 @@ struct Settings: Equatable {
     /// wider window or a different Speed cannot put it somewhere illegal.
     var closeUpColumns = 400
 
+    /// Which device live input is preferred from, by CoreAudio device UID.
+    /// Empty is the system default -- both the entry at the top of the menu
+    /// and the state of never having chosen, which is what the app did before
+    /// it remembered anything.
+    ///
+    /// A preference, not a record of what is running: when the chosen device
+    /// is not there the app falls back to the default and leaves this alone,
+    /// so plugging the device back in returns to it. Overwriting it with the
+    /// substitute would let an accidental unplug discard a deliberate choice.
+    var inputDeviceUID = ""
+
     /// Where file playback goes, by CoreAudio device UID. Empty is the system
     /// default, which is what almost everybody wants and what the app did
     /// before there was any choice.
     ///
-    /// The UID rather than the numeric device ID: an ID is handed out when a
-    /// device appears and is not the same number after a reboot or a replug,
-    /// so a stored one would eventually name whatever inherited it.
+    /// The UID rather than the numeric device ID -- for both of these: an ID
+    /// is handed out when a device appears and is not the same number after a
+    /// reboot or a replug, so a stored one would eventually name whatever
+    /// inherited it.
     var outputDeviceUID = ""
 
     /// Which of the output device's channels a played file goes to.
@@ -430,6 +442,7 @@ struct Settings: Equatable {
         static let mode     = "display.mode"
         static let closeUp  = "display.closeUpSpanMS"
         static let closeUpW = "display.closeUpColumns"
+        static let inDev    = "audio.inputDeviceUID"
         static let outDev   = "audio.outputDeviceUID"
         static let outPair  = "audio.outputChannelPair"
         static let spectrum = "display.spectrum"
@@ -441,7 +454,7 @@ struct Settings: Equatable {
 
         static let all = [deskew, invert, autoGain, sens, range, column,
                           erbScale, mode, closeUp, closeUpW, spectrum, waveform,
-                          outDev, outPair, replayDB, logCon, logOS, readout,
+                          inDev, outDev, outPair, replayDB, logCon, logOS, readout,
                           white, black, oldGain, oldLevel]
     }
 
@@ -523,6 +536,7 @@ struct Settings: Equatable {
         if store.object(forKey: K.closeUp) != nil {
             s.closeUpSpanMS = max(0, min(store.double(forKey: K.closeUp), 2000))
         }
+        if let uid = store.string(forKey: K.inDev)  { s.inputDeviceUID  = uid }
         if let uid = store.string(forKey: K.outDev) { s.outputDeviceUID = uid }
         if store.object(forKey: K.outPair) != nil {
             s.outputChannelPair = max(0, store.integer(forKey: K.outPair))
@@ -561,6 +575,7 @@ struct Settings: Equatable {
         store.set(Int(displayMode.rawValue), forKey: K.mode)
         store.set(closeUpSpanMS, forKey: K.closeUp)
         store.set(closeUpColumns, forKey: K.closeUpW)
+        store.set(inputDeviceUID,  forKey: K.inDev)
         store.set(outputDeviceUID, forKey: K.outDev)
         store.set(outputChannelPair, forKey: K.outPair)
         store.set(showSpectrum,   forKey: K.spectrum)

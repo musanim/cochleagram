@@ -141,8 +141,9 @@ launches. The pause state is not — it belongs to a particular sound, not to th
 way you like the display set up.
 
 **Settings** (⌘,, from the Cochleagram menu) holds what you set once and then
-leave alone: the input device and its format, the status line, and **Reset
-Settings**. The toolbar is for what you adjust while looking at a picture, and
+leave alone: the preferred input device and its format, where played files go
+and on which of that device's channels, the diagnostics switches, the status
+line, and **Reset Settings**. The toolbar is for what you adjust while looking at a picture, and
 it has to fit in a narrow window. That leaves the app menu with three items —
 Settings, Hide, Quit.
 
@@ -151,13 +152,25 @@ only appear when Settings is open. "Microphone access denied" is the one that
 matters, and it also raises an alert, so it is not lost — but transient
 feedback like "4.00 ms/column" is only there if you are looking.
 
-**There is no "Live Input" button.** The app starts listening to the system
-default at launch, and the device menu is the single control for live capture —
-choosing a device starts it, and choosing the device you were on before is how
-you come back from a file. There used to be a button as well, and the two
-disagreed: it ignored the menu and reopened the system default, so the menu
-went on displaying a device that was not the one being captured. One control
+**There is no "Live Input" button.** The device menu is the single control for
+live capture — choosing a device starts it, and choosing the device you were on
+before is how you come back from a file. There used to be a button as well, and
+the two disagreed: it ignored the menu and reopened the system default, so
+there was no way to tell which of them the picture was coming from. One control
 cannot contradict itself.
+
+**The input device is a preference, and it is remembered.** The menu's first
+entry is **System default**, followed in parentheses by the device that
+currently is — and rewritten when that changes, including while the menu is
+open. Choosing it follows the system default rather than pinning the device it
+happens to name. The rest of the menu is the devices themselves. Whichever you pick comes back at
+the next launch. If it is not there — unplugged, or switched off — the app
+falls back to the system default for that session without forgetting your
+choice, so plugging the device back in returns you to it. The menu shows what
+you asked for whenever that device is here, and the grey line beneath it says
+what is actually being captured. They differ when a chosen device is here but
+will not open — busy, or offering no input stream; an unplugged one simply
+drops the menu back to System default until it returns.
 
 **Play File pauses before it opens the panel.** A modal file panel runs its own
 event loop, so the display stops for as long as it is up whatever we do —

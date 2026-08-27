@@ -142,7 +142,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildWindow()
         startRedrawClock()
         installKeyMonitor()
-        startLiveInput(deviceID: nil)      // nil = whatever the system default is
+        // The input menu's first entry names the device the system default
+        // currently resolves to, so it has to be rewritten when that changes
+        // -- including while the Settings window is open and the menu is down,
+        // which is the case this is for. Registered after `buildWindow`, which
+        // is what makes the menu exist.
+        if !AudioDevices.whenDefaultInputChanges({ [weak self] in
+            self?.showDefaultInputName()
+        }) {
+            Log.say("DEVICES: no listener for the default input; the menu's "
+                    + "first entry will only be right when it is rebuilt")
+        }
+        // The device last chosen, if it is here; nil, meaning the system
+        // default, if it is not -- and the default again if it is here but
+        // will not open.
+        startLiveInput(deviceID: preferredInputDeviceID, orTheDefault: true)
     }
 
     /// Drive redraw from the screen's own refresh where that is available.
@@ -363,7 +377,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // device the menu is showing.
         if fileFinished {
             fileFinished = false
-            startLiveInput(deviceID: selectedDeviceID)
+            // `orTheDefault`, as on every rebuild of a standing preference:
+            // the menu's device is a choice made at some point in the past,
+            // and one that has since stopped opening should not leave the
+            // space bar doing nothing.
+            startLiveInput(deviceID: selectedDeviceID, orTheDefault: true)
             return
         }
         setPaused(!paused)
@@ -1341,22 +1359,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// which is documented to remove any existing item of the same title. Two
     /// identical interfaces, or two instances of the same DAC, would collapse
     /// into one entry -- and since both menus map position to index in the
-    /// device array, every entry after the collision would then name the wrong
-    /// device.
+    /// device array, one apart for the system-default entry each carries,
+    /// every entry after the collision would then name the wrong device.
+    ///
+    /// The default device used to be marked here with a ✓. Both menus now
+    /// carry an entry for following the default, and a mark that says which
+    /// device that currently is duplicates it -- one of the two is always the
+    /// stale one, since the mark is fixed when the list is built and the
+    /// system default can change while the window is open.
     private func addDevice(_ d: AudioDevice, to popup: NSPopUpButton) {
-        popup.menu?.addItem(withTitle: d.name + (d.isDefault ? " ✓" : ""),
-                            action: nil, keyEquivalent: "")
+        popup.menu?.addItem(withTitle: d.name, action: nil, keyEquivalent: "")
     }
 
+    /// What the input menu's first entry says: the choice, and in parentheses
+    /// the device it currently resolves to, because "System default" alone
+    /// does not tell you which microphone that is. Bare when there is no input
+    /// device at all, where the parentheses would have nothing to hold.
+    private var systemDefaultTitle: String {
+        guard let name = AudioDevices.defaultInputName else {
+            return "System default"
+        }
+        return "System default (\(name))"
+    }
+
+    /// Rewrite that entry, for when the system default changes underneath it.
+    /// Only the title: rebuilding the menu while it is down, which is exactly
+    /// when somebody is most likely to be looking at it, is not something to
+    /// do to a menu that is tracking.
+    private func showDefaultInputName() {
+        devicePopup?.menu?.item(at: 0)?.title = systemDefaultTitle
+        // The button draws the selected item's title, and it is the selected
+        // item that has just been renamed whenever the default is what the
+        // user is following. Cheap either way.
+        devicePopup?.synchronizeTitleAndSelectedItem()
+    }
+
+    /// The input list, with the system default first and named as such, for
+    /// the same reason the output list has one: following the default is a
+    /// choice in its own right, and until it was in the menu there was no way
+    /// to make it, or to see that it had been made.
     private func refreshDeviceList() {
         devices = AudioDevices.inputs()
         devicePopup.removeAllItems()
+        devicePopup.menu?.addItem(withTitle: systemDefaultTitle,
+                                  action: nil, keyEquivalent: "")
         for d in devices { addDevice(d, to: devicePopup) }
-        if let i = devices.firstIndex(where: { $0.isDefault }) {
-            devicePopup.selectItem(at: i)
+        // What the menu shows is the preference, not what is running -- the
+        // summary line below it says what is actually being captured, and the
+        // two differ only while a chosen device is missing or will not open. A
+        // missing device shows as the default without being forgotten: the
+        // stored choice outlives it and comes back when it does.
+        if !settings.inputDeviceUID.isEmpty,
+           let i = devices.firstIndex(where: { $0.uid == settings.inputDeviceUID }) {
+            devicePopup.selectItem(at: i + 1)
+        } else {
+            devicePopup.selectItem(at: 0)
         }
-        deviceSummary.stringValue =
-            devices.first { $0.id == audio.currentDeviceID }?.summary ?? ""
+        showCurrentDevice()
     }
 
     /// The output list, with the system default as the first entry rather than
@@ -1457,18 +1516,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func deviceChanged(_ sender: NSPopUpButton) {
         let i = sender.indexOfSelectedItem
-        guard i >= 0, i < devices.count else { return }
-        let d = devices[i]
+        // Item 0 is the system default and the devices follow it, so the menu
+        // index runs one ahead of the array. Nil is how the default is asked
+        // for everywhere downstream, and an empty UID is how it is stored.
+        guard i >= 0, i <= devices.count else { return }
+        let chosen = i > 0 ? devices[i - 1] : nil
+        // Chosen from the menu, so it is a preference and not merely what
+        // happens to be running -- recorded before the guard below, because
+        // choosing the device already being captured is precisely how you say
+        // "prefer this one" when the app fell back to it at launch.
+        settings.inputDeviceUID = chosen?.uid ?? ""
+        save()
         // A popup fires its action even when the selection did not change.
         // Restarting the unit for that is at best a glitch in the display and
-        // at worst leaves it stopped -- but only if that device is what we are
-        // already capturing. During file playback `currentDeviceID` is nil, so
-        // choosing the same device again is how you get back to live input.
-        guard d.id != audio.currentDeviceID else {
-            Log.say("DEVICE unchanged (\(d.name)); leaving the unit alone")
+        // at worst leaves it stopped -- but only if what was chosen is what we
+        // are already capturing. During file playback `currentDeviceID` is
+        // nil, so choosing the same device again is how you get back to live
+        // input. The default has no id of its own, so it counts as unchanged
+        // when the device it resolves to is the one already running.
+        // Written as "already capturing this" rather than as an equality
+        // between two optionals: with no input device at all both sides are
+        // nil, and treating that as unchanged would swallow the choice in
+        // silence where the attempt would have said what was wrong.
+        let chosenID = chosen?.id ?? AudioDevices.defaultInputID
+        if let current = audio.currentDeviceID, chosenID == current {
+            Log.say("DEVICE unchanged (\(chosen?.name ?? "system default")); "
+                    + "leaving the unit alone")
             return
         }
-        startLiveInput(deviceID: d.id)
+        startLiveInput(deviceID: chosen?.id)
     }
 
     // MARK: - coefficients
@@ -1573,15 +1649,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - actions
 
-    /// The only route to live input: used at launch with `nil`, meaning the
-    /// system default, and by the device menu with a specific device.
+    /// The only route to live input. Launch passes the preferred device, or
+    /// `nil` when there is no preference and the system default is wanted;
+    /// the device menu passes a specific device, or `nil` for its System
+    /// default entry; and the tuning change, Reset Settings and the space bar
+    /// after a file has run out pass whatever the menu is showing.
     ///
     /// The permission check lives here rather than at one call site, which is
     /// the bug that came with having two ways in -- the button asked and the
     /// menu did not, so switching device before the grant existed gave you a
     /// running unit delivering silence and nothing on screen to say why.
+    ///
+    /// - Parameters:
+    ///   - orTheDefault: when the device asked for will not open, start again
+    ///     on the system default instead of reporting the failure. Set
+    ///     wherever a standing preference is being acted on -- launch, the
+    ///     tuning change, Reset Settings, the space bar after a file has run
+    ///     out -- because a preference that has gone bad should not leave the
+    ///     app with nothing coming in. Not set for `deviceChanged`: a device
+    ///     chosen from the menu a moment ago is a question just asked, and
+    ///     silently substituting another one would be answering a different
+    ///     one.
+    ///   - preferredDeviceName: set on that second attempt, so that if the
+    ///     default will not open either, the message still names the device
+    ///     that was actually wanted.
     private func startLiveInput(deviceID: AudioDeviceID?,
-                                join: CochleagramView.MarkKind = .seam) {
+                                join: CochleagramView.MarkKind = .seam,
+                                orTheDefault: Bool = false,
+                                preferredDeviceName: String? = nil) {
         requestMicrophoneIfNeeded { [weak self] granted in
             guard let self else { return }
             guard granted else {
@@ -1638,20 +1733,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.report("\(name) at \(Int(self.audio.sampleRate)) Hz")
             } catch {
                 Log.say("LIVE INPUT failed: \(error.localizedDescription)")
-                self.report(error.localizedDescription, isProblem: true)
+                // The preferred device is here but will not open -- busy, or
+                // presenting no input stream. The default beats nothing at
+                // all: this is launch, and the alternative is an app with
+                // nothing coming in over a preference chosen weeks ago.
+                //
+                // Two failures are not worth a second attempt. Coefficients
+                // that will not load are not the device's doing and fail the
+                // same way on any of them, and a preferred device that *is*
+                // the system default would simply be opened again -- both
+                // would produce a message blaming two devices for one fault.
+                if orTheDefault, let id = deviceID,
+                   (error as NSError).code != AudioSource.coefficientsFailed,
+                   id != AudioDevices.defaultInputID {
+                    let wanted = self.devices.first { $0.id == id }?.name
+                                 ?? "The preferred input device"
+                    Log.say("LIVE INPUT: \(wanted) would not open; "
+                            + "trying the system default")
+                    self.startLiveInput(deviceID: nil, join: join,
+                                        preferredDeviceName: wanted)
+                    return
+                }
+                // Nothing is being captured now -- `startInput` stops before
+                // it tries -- so the summary line must stop naming the device
+                // that was.
+                self.showCurrentDevice()
+                // If the default will not open either, the message still says
+                // which device was wanted. The bare failure on its own gives
+                // no hint that a stored preference is the reason the app was
+                // not asking for the default to begin with.
+                if let wanted = preferredDeviceName {
+                    self.report("\(wanted) will not open, and neither will "
+                                + "the system default: "
+                                + error.localizedDescription, isProblem: true)
+                } else {
+                    self.report(error.localizedDescription, isProblem: true)
+                }
             }
         }
     }
 
-    /// Point the menu at whatever is actually being captured. At launch that
-    /// is the system default, which need not be what the menu happened to
-    /// select; leaving the two to disagree is exactly what removing the button
-    /// was meant to stop.
+    /// Say what is actually being captured, in the summary line under the
+    /// menu.
+    ///
+    /// It used to move the menu's own selection here as well, which cannot be
+    /// right now that "System default" is an entry: choosing it would have
+    /// been replaced by the name of whatever it resolved to, the moment the
+    /// unit started, and the two choices would have been indistinguishable
+    /// afterwards. So the menu shows what was asked for and this line shows
+    /// what came of it -- which is also the honest place for a preferred
+    /// device that turned out not to be available.
+    ///
+    /// Unconditional, so that it can also say *nothing* is being captured. It
+    /// used to return early when there was no device, which left a failed
+    /// change with the previous device's summary still under a menu now
+    /// showing the one that would not open.
     private func showCurrentDevice() {
-        guard let id = audio.currentDeviceID,
-              let i = devices.firstIndex(where: { $0.id == id }) else { return }
-        devicePopup.selectItem(at: i)
-        deviceSummary.stringValue = devices[i].summary
+        deviceSummary.stringValue = audio.currentDeviceID
+            .flatMap { id in devices.first { $0.id == id } }?.summary ?? ""
     }
 
     @objc private func openFile(_ sender: Any) {
@@ -1962,7 +2101,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the measured widths below depend on, since an empty popup measures
         // as an empty popup. `showSettings` refreshes the contents again, but
         // only after this function has returned, so it cannot help here.
-        let label = NSTextField(labelWithString: "Input device")
+        // "Preferred", because choosing here is not a switch that lasts until
+        // the app quits: it is remembered, and comes back at the next launch
+        // whenever the device does.
+        let label = NSTextField(labelWithString: "Preferred input device")
         deviceSummary.font = .monospacedDigitSystemFont(ofSize: 10,
                                                         weight: .regular)
         deviceSummary.textColor = .secondaryLabelColor
@@ -2572,10 +2714,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The device the menu is showing, which is the one the user last chose.
+    /// Nil for the first entry, the system default, which is what nil means to
+    /// `startLiveInput` -- so a rebuild follows the default rather than
+    /// pinning the device it happened to resolve to when the menu was built.
     private var selectedDeviceID: AudioDeviceID? {
         let i = devicePopup.indexOfSelectedItem
-        guard i >= 0, i < devices.count else { return nil }
-        return devices[i].id
+        guard i > 0, i - 1 < devices.count else { return nil }
+        return devices[i - 1].id
+    }
+
+    /// The device live input should start from at launch: the one last chosen
+    /// from the menu, when it is still here, and otherwise nil -- which is how
+    /// `startLiveInput` is told to take the system default.
+    ///
+    /// A device that is not here does not clear the stored choice; see
+    /// `Settings.inputDeviceUID`. Reading the list rather than asking
+    /// CoreAudio directly is deliberate: `buildWindow` has already enumerated
+    /// the inputs by the time this is wanted, and the menu should offer the
+    /// same devices this chooses between.
+    private var preferredInputDeviceID: AudioDeviceID? {
+        guard !settings.inputDeviceUID.isEmpty else { return nil }
+        return devices.first { $0.uid == settings.inputDeviceUID }?.id
     }
 
     @objc private func toggleDeskew(_ sender: NSButton) {
@@ -2764,7 +2923,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if audio.isFilePlayback, let url = lastFileURL {
             play(url, join: .tuningChange)   // from the top, new tuning
         } else {
-            startLiveInput(deviceID: selectedDeviceID, join: .tuningChange)
+            startLiveInput(deviceID: selectedDeviceID, join: .tuningChange,
+                           orTheDefault: true)
         }
         // Saved only now. Persisting before the rebuild meant a scale that
         // failed to load was still written, and came back at the next launch
@@ -2941,8 +3101,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func resetSettings(_ sender: Any?) {
         let alert = NSAlert()
         alert.messageText = "Reset settings to their defaults?"
-        alert.informativeText = "The display controls and the window size and "
-            + "position go back to how they started. Nothing else is affected."
+        alert.informativeText = "The display controls, the audio devices and "
+            + "the window size and position go back to how they started, and "
+            + "the diagnostics switches go off."
         alert.addButton(withTitle: "Reset")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -2951,6 +3112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hadScale = settings.erbScale
         settings = Settings()
         showSettingsInControls()
+        // Both device menus, not just the output one. The reset has cleared
+        // the input preference, and the input menu is not merely displaying
+        // it: `selectedDeviceID` reads the menu, and the rebuild below --
+        // along with the next ERB change -- would otherwise re-pin the very
+        // device the reset just forgot.
+        refreshDeviceList()
         refreshOutputList()
         applyToEngine()
         // `applyToEngine` pushes levels and de-skew, but the tuning lives in
@@ -2961,7 +3128,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if audio.isFilePlayback || fileFinished, let url = lastFileURL {
                 play(url, join: .tuningChange)
             } else {
-                startLiveInput(deviceID: selectedDeviceID, join: .tuningChange)
+                startLiveInput(deviceID: selectedDeviceID, join: .tuningChange,
+                               orTheDefault: true)
             }
         }
         // Wiped here, unlike an ordinary scale change: a reset is not an
