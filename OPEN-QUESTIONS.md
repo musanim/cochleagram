@@ -45,6 +45,67 @@ calibration claimed to be measuring. The two were responses to different
 inputs, compared as though they were the same. Worth remembering as a class of
 error: a measurement harness that does not go through the path it measures.
 
+**Every tuning's curve is baked into its coefficient file.** *2026aug26.* All
+nine files are version 2, so no machine measures its own de-skew curve any
+more: `calibrateDelays` does not run in the app at all. That removes about
+200 ms from an engine build -- 440 ms down to 235 -- which is paid at launch,
+on every ERB change, and on every device change.
+
+`tools/bakeall.sh` is the procedure, and must be run on the machine whose
+arithmetic is canonical: Stephen's arm64 Mac, at 44100 Hz. It runs
+`tools/measuredelays`, which loads a version-1 file so the engine calibrates
+itself and prints the curve it arrived at, and then `tools/bakedelays.py
+--curve`, which writes that curve into the file and stamps version 2. The
+measurement is the engine's own; nothing reimplements it, which was the reason
+not to do this in `export_coeffs.py` as originally proposed -- at the sharpest
+tunings the answer is settled in the last bits of the arithmetic, so a Python
+implementation would be a third answer rather than the canonical one. Each
+curve is left in `figures/caldump/baked_erb*.txt` as it is written, carrying
+the build fingerprint of what measured it -- on the baking machine only, since
+`figures/` is gitignored. The curve that ships is the copy inside the binary.
+
+**The bake names a sample rate**, because the curve depends on one: the impulse
+arrives through `feedInput`, and 44100 takes the exact half-band path while
+48000 falls back to fractional interpolation. Anchored on each curve's own
+maximum, so a constant cancels, the two rates agreed to 0.15 ms at ERB 0.8 and
+blunter; at 0.7 five taps near 1.7 kHz differed by 0.85 ms; at 0.6 the bulk of
+the curve differed by a uniform 0.37 ms and one tap at 447 Hz by 2.88 ms.
+
+Two different things, and baking treats them differently. The uniform part is a
+constant, and a constant is invisible in the picture -- not because de-skew
+cancels it, since `dmax` *is* the display latency and a constant moves it, but
+because 0.37 ms is smaller than half a column and `recomputeShifts` rounds the
+shifts to whole columns. The isolated taps are peak-index flips, and those are
+not made sub-column by baking: the 447 Hz tap is nearly six columns, and
+freezing 44100's answer pins it there for a machine running at 48 kHz too. That
+is the trade, stated plainly. It is worth taking because a flip is precisely
+where the measurement is unstable -- neither answer is the better one, and one
+answer everywhere is what the display needs.
+
+Checked, on the copy the procedure was exercised against: the curve the engine
+loads is identical tap for tap to the curve that was written, and the coherence
+baseline `dt_base` is bit-identical before and after on all eight tunings. That
+last one is not obvious -- `dt_base` is derived from the file's delays at load,
+so baking changes what it is derived *from* -- but `calibrateCoherence`
+overwrites it wholesale and falls back to the derived values only for taps with
+fewer than eight observations, and there are none.
+
+ERB 0.5 is untouched and keeps the curve described below. `bakeall.sh` does not
+have it in its loop and will not repair it if it is ever re-exported; that one
+goes back through the peak-list recipe, which is the only route that lets a
+human overrule the engine's choice of peak. To see what the current machine
+would measure for it instead, without writing anything: `tools/measuredelays
+<file> 44100 --force`.
+
+**The bake assumes the baking binary computes what the app's does.** Both come
+from clang at `-O2` with the default `-ffp-contract` -- `Package.swift` sets no
+`cxxSettings`, so the app gets the same defaults `bakeall.sh` compiles with --
+and that match is the whole premise, since contraction is what decides the
+answer. It is an assumption and not a guarantee. `tools/bakeall.sh --check`
+re-measures every baked file and reports how far this machine now disagrees
+with what was baked; it is what to run after changing toolchain, and it should
+report zero.
+
 **ERB 0.5's curve is baked into the coefficient file.** *2026aug14.* Its first
 peak sits 200 dB below its tap's own maximum, which is close enough to double
 precision's floor that *which* peak is found is settled in the last bits of the
@@ -72,9 +133,12 @@ an arm64 build, which is the Mac app's arithmetic.
 Consequences, all known and accepted:
 
 * It is right on the machine that measured it. An x86 build of the same source
-  will draw 0.5 wrongly, and **the browser almost certainly needs its own
-  curve** -- Emscripten does not contract multiply-adds the way clang does
-  natively, so the WASM engine probably computes no precursor at all.
+  will draw 0.5 wrongly. This now applies to every tuning rather than to 0.5
+  alone -- the browser included, since `web/build.sh` copies these same files
+  into `web/site/`. That is the intended trade: one curve everywhere, chosen
+  rather than emergent. It is only a real cost where the machines disagree,
+  which measurement put at one internal sample -- 0.0113 ms, 2% of a column --
+  from ERB 0.6 up, and at 0.5, which is why 0.5 was baked first.
 * It is calibrated for exposures where the precursor is below the white point:
   about 6 ms of spread at -140 dB, 14 at -100, 37 at the Defaults' -180, and
   worse at maximum sensitivity, where the display draws the precursor itself
@@ -85,10 +149,6 @@ Consequences, all known and accepted:
   other. The errors are not discontinuities -- both curves are smooth and
   monotone, they are just not the same curve -- so continuity has nothing to
   grip on.
-
-The general fix is to bake every tuning at design time, in
-`prototype/export_coeffs.py`, so no machine measures its own. That would also
-take about 220 ms off every engine build.
 
 What remains:
 
@@ -138,30 +198,6 @@ Parked while the greyscale display is settled. Where it stands:
 - The analysis window is measured in ERBs rather than octaves, which fixed
   resolved harmonics being misread as noise. Probably right, but untested
   against the original's behaviour.
-
----
-
-## Mac app
-
-**A stale `.dataPlayedBack` completion can be delivered against the next
-source.** *Found 2026aug14, not fixed.* `AVAudioPlayerNode` fires pending
-`scheduleFile` completions when the player is **stopped**, and `startFile`
-begins by stopping the old one. The completion reaches the main thread
-asynchronously, by which time the new file is already running -- so opening a
-file, replaying, or returning to live input mid-playback can run the *old*
-file's `fileDidFinish` against the *new* source: a green line at its start, the
-display frozen, "Finished" reported, and the graph that has just started torn
-down.
-
-The deferred teardown added the same day makes it less damaging -- a new file
-shorter than the 0.2 s wait reaches its own sample boundary first and the
-outcome is correct -- but the hole is still there, and it corrupts exactly the
-kind of comparison the two apps are being measured with.
-
-The fix is a generation token: bump a counter in `startFile`/`stop()`, capture
-it in the `scheduleFile` completion, and drop the callback if it no longer
-matches. The browser already does this for its flush replies (`endToken` in
-`web/site/index.html`), and for the same reason.
 
 ---
 

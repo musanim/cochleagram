@@ -749,8 +749,11 @@ struct CochleaEngine {
     /// middle ear in front of it.
     ///
     /// Half a second, because the apex's delay alone is about 180 ms and its
-    /// ringing outlasts that. Paid once, at startup, beside the coherence
-    /// calibration.
+    /// ringing outlasts that. About 200 ms of work, and it is what baking
+    /// exists to avoid paying: the shipped coefficient files carry the result
+    /// already, so in the app this does not run. `tools/measuredelays` calls
+    /// it -- by handing the engine a version-1 file -- to produce the curve
+    /// that gets baked in.
     void calibrateDelays() {
         const int n = n_taps;
         if (n < 1) return;
@@ -859,11 +862,18 @@ struct CochleaEngine {
          *  the machine with no precursors nothing exceeds 51 dB, so this never
          *  fires there.
          *
-         *  A kludge, and deliberately one. The principled fix is to stop
-         *  measuring this per machine at all -- bake the delays at design time
-         *  so every build loads the same numbers -- and until that happens
-         *  this makes the sharpest bake usable on the hardware it is used on.
-         *  See OPEN-QUESTIONS.md. */
+         *  A kludge, and deliberately one. The principled fix -- stop
+         *  measuring per machine, bake the delays so every build loads the
+         *  same numbers -- has since been done: see tools/bakeall.sh and the
+         *  note on the version check in `cochlea_create`. This rule now only
+         *  shapes a curve at the moment of baking, on the one machine that
+         *  bakes, instead of differing from machine to machine in the field.
+         *
+         *  It is not where ERB 0.5's shipped curve came from. That one was
+         *  chosen by hand through `peakdump --peak 2` and checked against the
+         *  picture, and stays that way. This rule is what the blunter tunings
+         *  were baked with, whether or not it found anything to step over on
+         *  the machine that baked them. */
         constexpr double kPrecursorJumpDB = 60.0;
 
         resetState();
@@ -1095,7 +1105,8 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
      *  it back the way it found it. */
     e->calibrateCoherence();
     /*  Version 2 carries a measured de-skew curve in `gdelay`, and the engine
-     *  uses it as it stands.
+     *  uses it as it stands. Every tuning that ships is version 2, so in the
+     *  app this branch is not taken and `calibrateDelays` does not run.
      *
      *  Measuring it here means every machine measures its own, and at the
      *  sharpest tunings they do not agree: the first peak of a narrow filter
@@ -1104,14 +1115,20 @@ CochleaEngine *cochlea_create(const char *coeff_path, double input_rate) {
      *  this file, clang on arm64 and gcc on x86, choose different peaks for a
      *  band of taps around 30 Hz at ERB 0.5 and draw a click 87 ms out of line
      *  from each other. A quantity that depends on the compiler is not a
-     *  property of the filterbank, and no threshold makes it one.
+     *  property of the filterbank, and no threshold makes it one. The curve
+     *  also depends on the input rate, since the impulse arrives through
+     *  `feedInput` and 44100 takes the half-band path while 48000 does not.
      *
-     *  So for that bake the curve is baked instead: measured once, written
-     *  into the file, loaded identically everywhere. See tools/bakedelays.py.
+     *  So the curve is baked: measured once on a nominated machine at 44100,
+     *  written into the file, loaded identically everywhere. See
+     *  tools/bakeall.sh, which is how the shipped files were made.
      *
-     *  Version 1 files still calibrate at load, which is every other tuning.
-     *  See OPEN-QUESTIONS.md for what it would take to bake them all -- it
-     *  would also take about 220 ms off every engine build. */
+     *  The version-1 path stays, and is not dead. It is what performs the
+     *  measurement that baking captures: `tools/measuredelays` loads a
+     *  freshly exported version-1 file precisely to make this run. It is also
+     *  the fallback for a file that predates the bake. Baking is worth about
+     *  200 ms of the 440 an engine build costs -- paid at launch, on every
+     *  ERB change and on every device change. */
     if (version < 2) {
         /*  After the coherence pass, and after the analytic dt_base above was
          *  derived from the file's delays: this overwrites gdelay with

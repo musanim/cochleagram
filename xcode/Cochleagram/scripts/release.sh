@@ -148,16 +148,41 @@ echo "  found ${FOUND#$APP/}"
 
 # All nine, not just the one the default tuning uses -- the ERB menu offers
 # every scale and a missing bake is a dead menu entry.
+#
+# And every one of them version 2, meaning its de-skew curve is baked in. A
+# version-1 file works, which is the problem: the engine quietly measures its
+# own curve instead, costing 200 ms on every engine build and giving a
+# different answer on different machines. Nothing downstream notices, so an
+# export that never got through tools/bakeall.sh would ship unremarked. This
+# is the one place that can say so.
 MISSING=""
+UNBAKED=""
 for scale in 050 060 070 080 090 100 110 120 130; do
     base="cochlea_88200_erb$scale.coch"
-    if ! { [ -f "$RES/$base" ] || [ -f "$SIDE/$base" ] \
-           || [ -f "$SIDE/Contents/Resources/$base" ]; }; then
+    found=""
+    for dir in "$RES" "$SIDE" "$SIDE/Contents/Resources"; do
+        [ -f "$dir/$base" ] && { found="$dir/$base"; break; }
+    done
+    if [ -z "$found" ]; then
         MISSING="$MISSING $scale"
+        continue
     fi
+    # The version is an int32 at offset 4, after the 'COCH' magic. `od -tu4`
+    # decodes in host order rather than the file's declared little-endian, so
+    # this is right on the machines that run it and would need a byte swap on
+    # a big-endian one, which macOS has not been since 2006.
+    #
+    # `|| true` because a failure here must reach the `die` below with a
+    # legible message, not exit the script silently through `pipefail`.
+    v=$(/bin/dd if="$found" bs=1 skip=4 count=4 2>/dev/null \
+        | /usr/bin/od -An -tu4 | /usr/bin/tr -d ' ' || true)
+    [ "$v" = "2" ] || UNBAKED="$UNBAKED $scale(v${v:-unreadable})"
 done
 [ -z "$MISSING" ] || die "ERB scales with no coefficient file:$MISSING"
-echo "  all nine ERB scales present"
+[ -z "$UNBAKED" ] || die "ERB scales whose de-skew curve is not baked in:$UNBAKED
+       Run xcode/Cochleagram/tools/bakeall.sh on this machine, rebuild, and
+       start again. See OPEN-QUESTIONS.md."
+echo "  all nine ERB scales present, all baked"
 
 # ----------------------------------------------------------------- notarize
 say "notarize"

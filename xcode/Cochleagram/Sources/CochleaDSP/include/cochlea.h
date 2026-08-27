@@ -56,9 +56,10 @@ void cochlea_set_auto_gain_halflife(CochleaEngine *e, double halflife_s);
 /*  Reference the engine is currently tracking, in dB.  For a readout.    */
 double cochlea_current_ref_db(const CochleaEngine *e);
 /*  Compensate the travelling-wave delay so a click stands vertical.  Costs
- *  the apex's group delay (about 170 ms) in display latency, because the
- *  correction can only be applied by holding the faster taps back.
- *  Non-zero = on, which is the default.                                   */
+ *  the apex's group delay in display latency, because the correction can only
+ *  be applied by holding the faster taps back.  That is about 186 ms at the
+ *  default ERB 0.6, and more the sharper the tuning: 240 ms at 0.5, 134 ms at
+ *  1.3.  Non-zero = on, which is the default.                             */
 void cochlea_set_deskew(CochleaEngine *e, int enabled);
 
 /*  Every column carries two quantities.

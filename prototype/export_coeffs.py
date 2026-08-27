@@ -7,6 +7,17 @@ as a resource.
 
     python3 export_coeffs.py --fs 88200 --out ../xcode/Cochleagram/Sources/CochleagramApp/Resources
 
+The files this writes are **version 1**, and are not finished.  The `gdelay`
+they carry is the analytic group delay -- what the poles say -- and the engine
+measures its own replacement at load, which costs about 200 ms per engine build
+and gives each machine a slightly different answer.  Follow every export with
+
+    xcode/Cochleagram/tools/bakeall.sh
+
+on the machine whose arithmetic should be canonical.  That runs the engine's
+measurement once and writes the result in, stamping version 2, after which no
+machine measures anything.  See OPEN-QUESTIONS.md.
+
 File layout (little-endian):
 
     char[4]   'COCH'
@@ -91,6 +102,13 @@ def main():
         name = f'cochlea_{int(args.fs)}_erb{round(scale * 100):03d}.coch'
         export(os.path.join(args.out, name), args.fs, args.f_lo, args.f_hi,
                args.taps, args.lead_octaves, scale)
+
+    # Said every time, because a version-1 file works -- it just measures its
+    # de-skew curve at every engine build, on every machine, which is the thing
+    # baking exists to stop. Nothing downstream complains, so the reminder has
+    # to be here.
+    print('\nThese are version 1. Run xcode/Cochleagram/tools/bakeall.sh on '
+          'the\ncanonical machine to bake the de-skew curves in.')
 
 
 if __name__ == '__main__':
