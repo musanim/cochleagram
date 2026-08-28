@@ -86,7 +86,16 @@
      display owns the height, because the waveform strip adds to it rather
      than taking from the picture. See PICTURE_HEIGHT there -- the arithmetic
      is the same and the two have to agree. */
-  #view { flex: 0 0 auto; width: 100%; height: 616px; display: block; }
+  /* `touch-action: none` because the picture is a drag surface, and on a
+     touch screen the browser's own gestures win by default: a drag with any
+     vertical component in it is a page pan, so the page moves -- and, worse,
+     the moment the browser claims the gesture it sends `pointercancel`, which
+     ends the drag. Selecting a region by dragging left and right was therefore
+     nearly impossible on an iPad, since no drag is exactly horizontal. This
+     says the canvas handles its own gestures. The cost is that pinch-zoom no
+     longer works over the picture; everywhere else on the page it still does. */
+  #view { flex: 0 0 auto; width: 100%; height: 616px; display: block;
+          touch-action: none; }
   #view.drop { outline: 3px solid #0a68d0; outline-offset: -3px; }
 </style>
 </head>
