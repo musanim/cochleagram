@@ -1,7 +1,7 @@
 import AppKit
 import AVFoundation
 import QuartzCore                // CADisplayLink, macOS 14+
-import UniformTypeIdentifiers  // NSOpenPanel.allowedContentTypes
+import UniformTypeIdentifiers  // the panels' allowedContentTypes
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -76,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// different enough that sharing a name would be a trap.
     private var selectionButton: NSButton!
     private var selectionSlider: NSSlider!
+    private var selectionSaveButton: NSButton!
     private var selectionDivider: NSView!
     /// The samples the picture was drawn from, and the arithmetic that turns a
     /// column back into a position in them.
@@ -668,9 +669,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ---- RePlay ------------------------------------------------------
         //
-        // A group of two between the display's controls and the file's, with a
-        // line on each side: the divider above is the left one, and the button
-        // and its volume belong together because neither is any use alone.
+        // A group of three between the display's controls and the file's, with
+        // a line on each side: the divider above is the left one, and the two
+        // buttons and the volume belong together because none of them is any
+        // use alone. They name the same stretch of sound -- one plays it, the
+        // other writes it out.
         //
         // Hidden rather than disabled when it does not apply. A disabled
         // control is an invitation with a reason to find; this one applies only
@@ -704,7 +707,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .isActive = true
         topRow.addArrangedSubview(selectionSlider)
 
-        // Held, because it is hidden and shown with the pair it closes.
+        // To the right of the volume, because it is the less-used of the two
+        // and because the volume belongs beside the button whose loudness it
+        // sets -- it has nothing to do with this one, which writes the
+        // recording out at the level it was recorded at.
+        // The ellipsis is the Mac's promise that a panel is coming, which is
+        // the one place this differs from the browser's button of the same
+        // name: there the file simply downloads.
+        selectionSaveButton = button("Save Selection…",
+                                     #selector(saveSelectionPressed(_:)))
+        selectionSaveButton.toolTip =
+            "Write the sound Play Selection plays to a WAV file, at the level "
+          + "it was recorded -- the volume slider is not applied."
+        topRow.addArrangedSubview(selectionSaveButton)
+
+        // Held, because it is hidden and shown with the group it closes.
         selectionDivider = divider()
         topRow.addArrangedSubview(selectionDivider)
 
@@ -713,6 +730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before the first frame tick.
         selectionButton.isHidden = true
         selectionSlider.isHidden = true
+        selectionSaveButton.isHidden = true
         selectionDivider.isHidden = true
 
         // No "Live Input" button. The device menu in Settings starts live
@@ -1003,8 +1021,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered, defer: false)
         // Pin the minimum so no control can grow the window out from under
         // the bitmap.
-        // The widest row is the lower one, at roughly 620 points. Splitting
-        // the controls in two is what makes this number smaller than 700.
+        // The lower row is about 620 points, and splitting the controls in two
+        // is what makes this number smaller than 700. The *upper* row is wider
+        // than that whenever the RePlay group is on screen -- two buttons and a
+        // slider that are hidden the rest of the time -- so at the minimum
+        // width freezing the picture pushes the file controls off the right-hand
+        // end until it is unfrozen. Known, and not worth a wider minimum for
+        // every window that never freezes.
         window.contentMinSize = NSSize(width: 640, height: 360)
         window.title = "Cochleagram"
         window.contentView = root
@@ -2356,6 +2379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !show { stopReplay() }
         selectionButton.isHidden = !show
         selectionSlider.isHidden = !show
+        selectionSaveButton.isHidden = !show
         selectionDivider.isHidden = !show
         selectionButton.title = audio.isReplaying ? "Stop" : replayIdleTitle
     }
@@ -2389,12 +2413,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // span, so a one-column selection is a column's worth of sound rather
         // than none. The samples are handed over where they lie and copied once,
         // into the playback buffer.
-        let started = recorder.withSamples(from: sel.lo, to: sel.end) { frames in
-            (frames.count,
-             audio.startReplay(frames, rate: c.inputRate,
-                               gainDB: settings.replayGainDB))
+        // The peak is taken first and named, rather than sitting in the tuple
+        // beside the call that starts the playback. Tuple elements evaluate
+        // left to right, so the order is defined -- but it would stop being
+        // obvious the day `startReplay` did anything to the samples but read
+        // them, and a peak measured after the fact would be wrong in silence.
+        let started = recorder.withSamples(from: sel.lo, to: sel.end) {
+            frames -> (Int, Double?, Bool) in
+            let peak = Self.peakDBFS(frames)
+            return (frames.count, peak,
+                    audio.startReplay(frames, rate: c.inputRate,
+                                      gainDB: settings.replayGainDB))
         }
-        guard let (count, ok) = started else {
+        guard let (count, peak, ok) = started else {
             report("That part of the picture is no longer in the recording.",
                    isProblem: true)
             return
@@ -2421,7 +2452,138 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.playhead = sel.lo
         showReplayControls()
         let ms = Double(count) / c.inputRate * 1000
-        report(String(format: "Playing %.0f mS of the picture.", ms))
+        report(String(format: "Playing %.0f mS of the picture — %@.",
+                      ms, Self.peakPhrase(peak)))
+    }
+
+    /// The loudest sample in a span, as dB relative to full scale, or nil for a
+    /// span with nothing but silence in it.
+    ///
+    /// Said out loud beside the duration because "as loud as it can be" is not
+    /// something anybody can judge by ear on a machine whose speakers are the
+    /// limit. A recording sitting thirty decibels below full scale is quiet for
+    /// a reason that has nothing to do with the volume slider, and there was no
+    /// way to tell that case from a device that will not go any louder.
+    private static func peakDBFS(_ frames: UnsafeBufferPointer<Float>) -> Double? {
+        var peak: Float = 0
+        for s in frames { peak = max(peak, abs(s)) }
+        return peak > 0 ? 20 * log10(Double(peak)) : nil
+    }
+
+    private static func peakPhrase(_ db: Double?) -> String {
+        guard let db else { return "silent" }
+        return String(format: "peak %.1f dBFS", db)
+    }
+
+    @objc private func saveSelectionPressed(_ sender: Any) { saveSelection() }
+
+    /// Write the sound Play Selection would play to a WAV file.
+    ///
+    /// The same span, from the same recorder as `startReplay` takes it -- the
+    /// two build that span separately, so keep them in step -- but at the level
+    /// it was recorded rather than the level it is heard at: the volume slider
+    /// belongs to the loudspeaker, and a file
+    /// whose level had been adjusted on the way out would answer a different
+    /// question from the one it exists to answer, which is how loud the
+    /// recording actually is.
+    private func saveSelection() {
+        guard let sel = view.selectionColumns, let c = cochlea else { return }
+        // Copied out of the recorder rather than written from inside
+        // `withSamples`: the panel below runs a modal loop, and neither a disk
+        // write nor a modal session belongs inside a closure that is holding
+        // the recorder's storage. One copy of a few seconds of audio is
+        // nothing; the alternative is a file panel opened underneath one.
+        let taken = recorder.withSamples(from: sel.lo, to: sel.end) { frames in
+            (Array(frames), Self.peakDBFS(frames))
+        }
+        guard let (samples, peak) = taken, !samples.isEmpty else {
+            report("That part of the picture is no longer in the recording.",
+                   isProblem: true)
+            return
+        }
+
+        // No `setPaused` around the panel, unlike Play File. The picture is
+        // already frozen -- these controls are on screen only while it is --
+        // so the modal loop stops nothing that was scrolling. A playback
+        // started before the press does keep going underneath it, playhead and
+        // all, which is harmless and better than a panel that silences the
+        // sound you were listening to when you decided to keep it.
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.wav]
+        panel.nameFieldStringValue = Self.selectionFileName()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try Self.writeWAV(samples, rate: c.inputRate, to: url)
+        } catch {
+            Log.say("SAVE failed: \(error.localizedDescription)")
+            report("Could not save: \(error.localizedDescription)",
+                   isProblem: true)
+            // And in an alert as well, unlike every other failure here. The
+            // status line lives in the Settings window, which is normally
+            // closed: a failed playback is at least audible as silence, but a
+            // file that was not written leaves nothing behind at all, and a
+            // button that appears to do nothing is worse than an error.
+            let alert = NSAlert(error: error)
+            alert.messageText = "Could not save the selection."
+            alert.runModal()
+            return
+        }
+        let ms = Double(samples.count) / c.inputRate * 1000
+        // The clipping note is not hypothetical padding: the recorder holds
+        // floats and the file holds sixteen-bit integers, so anything past full
+        // scale is flattened on the way out, and a peak the line reports as
+        // positive is a peak the file does not contain.
+        let clipped = (peak ?? 0) > 0 ? " Clipped in the file." : ""
+        report(String(format: "Saved %.0f mS to %@ — %@.%@", ms,
+                      url.lastPathComponent, Self.peakPhrase(peak), clipped))
+    }
+
+    /// Local time, so the name says when the sound was heard rather than what
+    /// UTC made of it. Fixed format rather than the user's: this is a filename.
+    private static func selectionFileName() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HHmmss"
+        return "Cochleagram \(f.string(from: Date())).wav"
+    }
+
+    /// Mono 16-bit PCM at the recording's own rate.
+    ///
+    /// Sixteen-bit rather than the float the recorder holds, and the same
+    /// choice the browser version makes: the file exists to be played and
+    /// measured somewhere else, and everything plays 16-bit PCM where float
+    /// WAVs are refused by a surprising number of players. The quantisation is
+    /// 96 dB down, far below anything this is used to measure. `AVAudioFile`
+    /// does the conversion and the header, so neither is ours to get wrong.
+    private static func writeWAV(_ samples: [Float], rate: Double,
+                                 to url: URL) throws {
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: rate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let file = try AVAudioFile(forWriting: url, settings: settings)
+        // `processingFormat` is what a buffer handed to `write(from:)` must be
+        // in -- deinterleaved float at the file's rate -- and is not the format
+        // written to disk, which is the 16-bit one above.
+        guard let buf = AVAudioPCMBuffer(
+                  pcmFormat: file.processingFormat,
+                  frameCapacity: AVAudioFrameCount(samples.count)),
+              let dst = buf.floatChannelData?[0] else {
+            throw NSError(domain: "Cochleagram", code: 4, userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Could not make a buffer to write from."])
+        }
+        samples.withUnsafeBufferPointer { src in
+            dst.update(from: src.baseAddress!, count: src.count)
+        }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        try file.write(from: buf)
     }
 
     /// Stop, not pause. Nothing remembers where the sound had got to, so the

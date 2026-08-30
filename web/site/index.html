@@ -44,7 +44,20 @@
      screen, so a control up there can be off-screen entirely -- and this is the
      one control that is no use unless it is seen the moment it appears.
      `#stage` exists only to give it something to be positioned against. */
-  #stage { position: relative; flex: 0 0 auto; }
+  /* `user-select: none` because a drag on the picture is a drag on the
+     picture, not the beginning of a text selection. iOS decides otherwise
+     often enough to be a nuisance: it takes the drag as a selection of the
+     surrounding content and floods the whole region with the system highlight
+     colour, which does not stop the measurement working but does hide what is
+     being measured, and stays there until you tap somewhere else.
+     `touch-action` above does not cover this -- that governs scrolling and
+     zooming, and selection is a separate gesture. `-webkit-touch-callout` goes
+     with it: a long press on the picture should not offer to copy an image of
+     it either. On `#stage` rather than on the whole page, so the status line
+     and the labels can still be selected and copied. */
+  #stage { position: relative; flex: 0 0 auto;
+           -webkit-user-select: none; user-select: none;
+           -webkit-touch-callout: none; }
   /* Red, because it is the only control on the page that reports a fault
      rather than offering a setting, and it is on screen only while that fault
      is. Its own colours rather than the theme's: this one must read the same in
@@ -132,8 +145,11 @@
             title="Play the sound the picture was drawn from. With no measurement lines this is the whole width of the display; with one line it starts there; with two it plays what is between them."
             hidden>Play Selection</button>
     <input type="range" id="vol" min="-40" max="12" step="1" value="0"
-           title="How loud. Unity — the level the microphone heard — is towards the right; the far left is silent."
+           title="How loud. Unity — the level it was recorded at — is towards the right; the far left is silent."
            hidden>
+    <button id="savesel"
+            title="Save the same sound Play Selection plays, as a WAV file, exactly at the level it was recorded."
+            hidden>Save Selection</button>
     <div class="rule" id="selrule" hidden></div>
     <button id="open">Play file…</button>
     <button id="replay" title="Play the same file again" hidden>&#8635;</button>
@@ -172,7 +188,16 @@
     <div class="rule"></div>
     <label>range <input type="range" id="rng" min="5" max="200" value="170"></label>
     <div class="rule"></div>
-    <button id="reset" title="Put the display controls back to their starting values. Speed and ERB are left as they are.">Defaults</button>
+    <!-- The one control here that is not about the picture. It is a
+         measurement of the microphone: how much this device's input has to be
+         multiplied by before it is worth looking at. Beside the exposure
+         controls because that is where its effect is seen, and left alone by
+         Defaults because it is not a preference. -->
+    <label>input <input type="number" id="ingain" min="-20" max="60" step="1"
+                        value="0" style="width: 4em"
+      title="Multiply the microphone by this much on the way in, before the picture, the recording, Play Selection and Save Selection. Some devices — iPads in particular — hand over a signal tens of decibels below what a laptop does for the same sound. Left where you put it, per device."> dB</label>
+    <div class="rule"></div>
+    <button id="reset" title="Put the display controls back to their starting values. Speed, ERB and the input gain are left as they are.">Defaults</button>
   </div>
 </div>
 
@@ -422,6 +447,12 @@ const TEST_MODE = new URLSearchParams(location.search).has('test');
 
 let ctx = null, capture = null, worker = null;
 let micStream = null, micSource = null, fileSource = null;
+/// Between the microphone and the capture worklet, so that everything
+/// downstream -- the picture, the recording, Play Selection, Save Selection --
+/// sees one signal and cannot disagree about how loud it was. Deliberately not
+/// in the file path: a file arrives at its own level, and lifting it here would
+/// put this app and the Mac 33 dB apart on identical audio.
+let micGain = null;
 /// The last file played, kept so it can be played again without a second trip
 /// through the picker -- the Mac app's Replay button, which the browser was
 /// missing along with the name of the file it is showing you.
@@ -704,7 +735,8 @@ const defaults = {
     // and a stranger meeting a display already divided into two regions
     // scrolling at different rates would reasonably conclude it was broken.
     closeUpSpanMs: 0, closeUpColumns: 400,
-    // How loud Play Selection is, in dB relative to what the microphone heard.
+    // How loud Play Selection is, in dB relative to the level it was recorded
+    // at -- which is what the microphone heard plus whatever `inputGainDb` is.
     // Zero -- unity -- so what you hear is the recording, not an opinion about
     // it. The travel runs above unity as well as below because a microphone
     // recording often sits well below full scale and nothing else here can lift
@@ -712,12 +744,34 @@ const defaults = {
     // right thing for an instrument to do. One of the values the two apps have
     // to agree on.
     replayGainDb: 0,
+    // What the microphone is multiplied by on the way in, in dB, before the
+    // picture, the recording, the playback or a saved file sees it. Zero, so
+    // nothing happens to anybody who does not need it.
+    //
+    // It exists because a microphone's own scaling is not something the browser
+    // will tell you about and not something the app can infer. The same tone at
+    // the same distance peaked at -33 dBFS on a MacBook and -66 on an iPad:
+    // the app is deliberately asking for the raw input -- `autoGainControl` off,
+    // because automatic gain would make a cochleagram lie -- and iOS then hands
+    // over a signal 33 dB quieter, having no gain of its own in front of the
+    // microphone. Below the picture's usable range, and far below anything the
+    // playback could lift on its own.
+    //
+    // A setting rather than a check for which device this is: one device has
+    // been measured, and one measurement is not a fact about a platform. It
+    // stays where it is put -- localStorage is per browser, which is per device,
+    // which is exactly the scope a microphone's sensitivity has.
+    inputGainDb: 0,
 };
 /// What the volume slider spans, in dB about unity. Matches
 /// `Settings.replayGainRange` in the Mac app.
 const REPLAY_GAIN_RANGE = [-40, 12];
+/// What the input gain accepts. Up to 60 because the gap measured on an iPad
+/// was 33 and there is no reason to think that is the largest one; down to -20
+/// because an input that is too hot is the same problem with the sign changed.
+const INPUT_GAIN_RANGE = [-20, 60];
 /// Which of the defaults the Defaults button restores: all of them except
-/// `columnMs` and `erb`.
+/// `columnMs`, `erb` and `inputGainDb`.
 ///
 /// Speed and ERB are left wherever they were, because those two say what the
 /// picture *is* rather than how it is exposed, and somebody who has chosen a
@@ -725,6 +779,11 @@ const REPLAY_GAIN_RANGE = [-40, 12];
 /// to be moved off them. Leaving them also means the engine does not have to
 /// be reopened, so the button can be pressed without destroying what is on
 /// screen.
+///
+/// Input gain is left for a different reason: it is a measurement of the
+/// microphone rather than a preference about the picture, and restoring it to
+/// zero would take 33 dB off an iPad's input as a side effect of asking for a
+/// legible grey scale -- which would then need the grey scale set again.
 ///
 /// Derived from `defaults` rather than written out again: the button restores
 /// a shorter *list* of settings, not a different set of values, and a second
@@ -800,6 +859,9 @@ S.rangeDB = clampRange(S.rangeDB);
 S.replayGainDb = Number.isFinite(S.replayGainDb)
     ? Math.min(REPLAY_GAIN_RANGE[1], Math.max(REPLAY_GAIN_RANGE[0], S.replayGainDb))
     : defaults.replayGainDb;
+S.inputGainDb = Number.isFinite(S.inputGainDb)
+    ? Math.min(INPUT_GAIN_RANGE[1], Math.max(INPUT_GAIN_RANGE[0], S.inputGainDb))
+    : defaults.inputGainDb;
 // The tuning has to survive the same treatment, and it is the one that cannot
 // be recovered from without knowing about localStorage. A value naming no
 // coefficient file leaves the ERB menu blank, asks the worker for a file that
@@ -842,6 +904,9 @@ function applySettings() {
     $('sens').value = String(S.sensDB);
     $('rng').value  = String(S.rangeDB);
     $('vol').value  = String(S.replayGainDb);
+    $('ingain').value = String(S.inputGainDb);
+    // Live, if there is a microphone open to apply it to.
+    if (micGain) micGain.gain.value = inputGainLinear(S.inputGainDb);
     // Auto gain owns sensitivity while it is on: the control reports what the
     // controller is doing rather than accepting instructions. Wanting it
     // somewhere else is what turning Auto gain off is for.
@@ -1076,10 +1141,13 @@ async function ensureAudio() {
         // accumulates over every pause. There is nothing to gain there either:
         // a suspended context is already not feeding the engine.
         if (paused && !playingFile) return;
-        // The raw input peak, taken here because the buffer is transferred on
+        // The input peak as the engine sees it -- after `micGain`, so with the
+        // input gain in it -- taken here because the buffer is transferred on
         // the next line and is gone afterwards. This is the one number that
         // separates "the display is wrong" from "the signal is quiet", and
-        // not having it has cost several rounds of reading pictures.
+        // not having it has cost several rounds of reading pictures. What the
+        // microphone itself delivered is this less `inputGainDb`, which is the
+        // arithmetic to do when calibrating a new device.
         const s = ev.data;
         for (let i = 0; i < s.length; ++i) {
             const a = s[i] < 0 ? -s[i] : s[i];
@@ -1190,6 +1258,7 @@ function stopSources() {
     endToken++;
     if (fileSource) { try { fileSource.stop(); } catch {} fileSource.disconnect(); fileSource = null; }
     if (micSource) { micSource.disconnect(); micSource = null; }
+    if (micGain) { micGain.disconnect(); micGain = null; }
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     playingFile = false;
     // Whatever comes next is a different recording. Restarted rather than
@@ -1237,7 +1306,9 @@ async function startMic({ quiet = false } = {}) {
         return false;
     }
     micSource = ctx.createMediaStreamSource(micStream);
-    micSource.connect(capture);
+    micGain = ctx.createGain();
+    micGain.gain.value = inputGainLinear(S.inputGainDb);
+    micSource.connect(micGain).connect(capture);
     fileEnded = false;
     // Resumes the context too: `setPaused(false)` on a live source calls
     // `resumeAudio` itself. The explicit call that used to stand here was a
@@ -1526,7 +1597,8 @@ window.addEventListener('keydown', e => {
         // sees the key.
         //
         // The exception is somewhere you might be typing, where a space is a
-        // space. There is nowhere in this page today, but there will be.
+        // space. The input gain's number field is the one such place, and this
+        // was written before it existed.
         const t = e.target;
         if (t && (t.isContentEditable ||
                   (t.tagName === 'INPUT' &&
@@ -1548,7 +1620,13 @@ window.addEventListener('keydown', e => {
 // keyboard, and someone navigating by Tab should keep the focus they are
 // using. Selects are let go on change instead, since blurring one mid-click
 // would shut the menu the click had just opened.
-for (const el of document.querySelectorAll('#bars button, #bars input')) {
+//
+// Not a field that is typed into, though: focus arrives on the press and this
+// would take it away again on the release, so the input gain could be reached
+// only by its spinner or by Tab. Everything else in these bars is a button, a
+// checkbox or a slider, none of which has anything to type.
+for (const el of document.querySelectorAll(
+         '#bars button, #bars input:not([type=number])')) {
     el.addEventListener('click', e => { if (e.detail > 0) el.blur(); });
 }
 for (const el of document.querySelectorAll('#bars select')) {
@@ -1779,21 +1857,55 @@ function syncRecorder() {
 function showReplayControls() {
     const show = !playingFile && paused && !recorder.isEmpty;
     if (!show) stopReplay();
-    for (const id of ['playsel', 'vol', 'selrule']) $(id).hidden = !show;
+    for (const id of ['playsel', 'vol', 'savesel', 'selrule']) {
+        $(id).hidden = !show;
+    }
     $('playsel').textContent = isReplaying() ? 'Stop' : 'Play Selection';
 }
 
-function startReplay() {
+/// The selection's loudest sample, as dB below full scale, or null for a
+/// selection with no sound in it at all.
+///
+/// Said out loud because "as loud as it can be" is not a thing anyone can
+/// judge by ear on a device whose speakers are the limit: a recording sitting
+/// thirty decibels below full scale is quiet for a reason that has nothing to
+/// do with the volume slider, and there was previously no way to tell that
+/// case from a device that will not go any louder.
+function peakDbfs(frames) {
+    let peak = 0;
+    for (let i = 0; i < frames.length; i++) {
+        const a = Math.abs(frames[i]);
+        if (a > peak) peak = a;
+    }
+    return peak > 0 ? 20 * Math.log10(peak) : null;
+}
+
+const peakText = db => db === null ? 'silent' : `peak ${db.toFixed(1)} dBFS`;
+
+/// The sound the current selection names, and the selection itself, or null
+/// having already said why not.
+///
+/// Shared by the two buttons so that the claim made for the file -- that it is
+/// the same sound Play Selection plays -- is structural rather than a pair of
+/// identical fragments that could drift.
+///
+/// `sel.end` is one past the last column, extended by that column's own span,
+/// so a one-column selection is a column's worth of sound rather than none.
+function selectionFrames() {
     const sel = display.selectionColumns;
-    if (!sel || !ctx) return;
-    // `sel.end` is one past the last column, extended by that column's own
-    // span, so a one-column selection is a column's worth of sound rather than
-    // none.
+    if (!sel || !ctx) return null;
     const frames = recorder.slice(sel.lo, sel.end);
     if (!frames || !frames.length) {
         say('that part of the picture is no longer in the recording');
-        return;
+        return null;
     }
+    return { sel, frames };
+}
+
+function startReplay() {
+    const got = selectionFrames();
+    if (!got) return;
+    const { sel, frames } = got;
     stopReplay();
     const buf = ctx.createBuffer(1, frames.length, ctx.sampleRate);
     buf.copyToChannel(frames, 0);
@@ -1821,7 +1933,87 @@ function startReplay() {
     replaySeconds = frames.length / ctx.sampleRate;
     display.playhead = sel.lo;
     showReplayControls();
-    say(`playing ${Math.round(replaySeconds * 1000)} mS of the picture`);
+    say(`playing ${Math.round(replaySeconds * 1000)} mS of the picture · `
+        + peakText(peakDbfs(frames)));
+}
+
+/// Save the same sound Play Selection plays, as a file.
+///
+/// Which is the point: both take their slice from `selectionFrames`, so what
+/// lands on disk is provably the sound that was heard -- at the level it was
+/// *recorded* at, since the volume slider moves what Play Selection sends to
+/// the speakers and is deliberately not applied here. Nothing is normalised
+/// either: a file whose level had been adjusted on the way out would answer a
+/// different question from the one it exists to answer, which is how loud the
+/// recording actually is.
+function saveSelection() {
+    const got = selectionFrames();
+    if (!got) return;
+    const frames = got.frames;
+    const url = URL.createObjectURL(wavBlob(frames, ctx.sampleRate));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Cochleagram ${fileStamp()}.wav`;
+    // In the document, because Firefox will not follow a click on a link that
+    // is not; harmless in the browsers that do not care.
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Not revoked immediately: the download is fetched from this URL after the
+    // click returns, and revoking first has produced empty files.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    const ms = Math.round(frames.length / ctx.sampleRate * 1000);
+    const db = peakDbfs(frames);
+    // `sayFor`, not `say`: this reports what a press did, and `say` is dropped
+    // while an earlier hold is outstanding -- a save inside one of those would
+    // otherwise say nothing at all, which for a button whose only other
+    // feedback is the browser's own download UI reads as a dead control.
+    sayFor(4000, `saved ${ms} mS · ${peakText(db)}`
+                 + (db !== null && db > 0 ? ' — clipped in the file' : ''));
+}
+
+/// Local time, so the name says when the sound was heard rather than what UTC
+/// made of it. The same shape the Mac app writes, so files from the two land
+/// in a folder together and sort by when they were recorded.
+function fileStamp() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+         + `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/// Mono 16-bit PCM in a WAV, at the rate the audio arrived at.
+///
+/// 16-bit rather than the float the recorder holds: the file exists to be
+/// played and measured somewhere else, and every player on every platform
+/// takes 16-bit PCM, where float WAVs are refused by a surprising number of
+/// them. The quantisation is 96 dB down, which is far below anything this is
+/// being used to measure.
+function wavBlob(frames, rate) {
+    const n = frames.length;
+    const hz = Math.round(rate);
+    const buf = new ArrayBuffer(44 + n * 2);
+    const v = new DataView(buf);
+    const tag = (at, s) => {
+        for (let i = 0; i < s.length; i++) v.setUint8(at + i, s.charCodeAt(i));
+    };
+    tag(0, 'RIFF');  v.setUint32(4, 36 + n * 2, true);
+    tag(8, 'WAVE');
+    tag(12, 'fmt '); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true);          // PCM, uncompressed
+    v.setUint16(22, 1, true);          // one channel
+    v.setUint32(24, hz, true);
+    v.setUint32(28, hz * 2, true);     // bytes per second
+    v.setUint16(32, 2, true);          // bytes per frame
+    v.setUint16(34, 16, true);         // bits per sample
+    tag(36, 'data'); v.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+        // Clamped: a sample past full scale would otherwise wrap to the
+        // opposite sign, turning a loud moment into a loud crack.
+        const s = Math.max(-1, Math.min(1, frames[i]));
+        v.setInt16(44 + i * 2, Math.round(s < 0 ? s * 0x8000 : s * 0x7fff), true);
+    }
+    return new Blob([buf], { type: 'audio/wav' });
 }
 
 /// Stop, not pause. Nothing remembers where the sound had got to, so the next
@@ -1850,6 +2042,16 @@ function stopReplay() {
 function replayGainLinear(db) {
     if (db <= REPLAY_GAIN_RANGE[0] + 0.001) return 0;
     return Math.pow(10, db / 20);
+}
+
+/// No silent end to this one, unlike the volume: the bottom of the input range
+/// is 20 dB of attenuation, not a way to turn the microphone off. Something
+/// that stops the picture being drawn should say so, and this control would
+/// not.
+function inputGainLinear(db) {
+    const clamped = Math.min(INPUT_GAIN_RANGE[1],
+                             Math.max(INPUT_GAIN_RANGE[0], db));
+    return Math.pow(10, clamped / 20);
 }
 
 /// Move the line, and notice the end of the sound.
@@ -1894,6 +2096,7 @@ function replayTick() {
 }
 
 $('playsel').onclick = () => { isReplaying() ? stopReplay() : startReplay(); };
+$('savesel').onclick = saveSelection;
 $('vol').oninput = e => {
     S.replayGainDb = Math.round(Number(e.target.value));
     // Live, unlike every other control's effect on a playback in progress. The
@@ -1903,6 +2106,36 @@ $('vol').oninput = e => {
         replayGainNode.gain.value = replayGainLinear(S.replayGainDb);
     }
     save();
+};
+/// `onchange`, not `oninput`: a number field is typed into, and reacting to
+/// every keystroke would put the microphone through 3 dB and then 33 on the way
+/// to 330 -- which the field will not accept, but the ear would have met on the
+/// way past.
+///
+/// An emptied field puts back what was there. `Number('')` is zero, not NaN,
+/// and a number input reports an unparseable entry as empty too -- so testing
+/// the number alone would read "cleared the field" as "asked for 0 dB" and
+/// throw away a calibration on the way past.
+$('ingain').onchange = e => {
+    const typed = e.target.value.trim();
+    const asked = typed === '' ? NaN : Math.round(Number(typed));
+    if (!Number.isFinite(asked)) { e.target.value = String(S.inputGainDb); return; }
+    S.inputGainDb = Math.min(INPUT_GAIN_RANGE[1],
+                             Math.max(INPUT_GAIN_RANGE[0], asked));
+    // Written back, so a value the field accepted but the range did not is
+    // corrected in front of the person who typed it rather than silently.
+    e.target.value = String(S.inputGainDb);
+    // Live, and without a ramp: this is a calibration being dialled in against
+    // the picture, and a value that arrived gradually would be read against a
+    // picture drawn partly at the old one.
+    if (micGain) micGain.gain.value = inputGainLinear(S.inputGainDb);
+    save();
+    // `sayFor`, like everything that reports what a press did: a plain `say` is
+    // dropped while a hold is outstanding, and the once-a-second readout would
+    // paint over it inside the second in any case.
+    sayFor(3000, S.inputGainDb === 0
+                 ? 'input gain off'
+                 : `input gain ${S.inputGainDb > 0 ? '+' : ''}${S.inputGainDb} dB`);
 };
 // A click on the picture, or a grab of the close-up boundary, chooses what to
 // play -- so neither can be ignored while something is playing.
