@@ -33,7 +33,23 @@
     padding: 0.45rem 0.75rem; flex: 0 0 auto; flex-wrap: wrap;
   }
   .bar + .bar { border-top: 1px solid var(--line); }
-  #bars { border-bottom: 1px solid var(--line); flex: 0 0 auto; }
+  /* Sticky, so the controls are on screen at any scroll position.
+     The picture now gives way rather than making the page scroll, so this
+     should never be needed -- it is what covers the case it cannot help with,
+     a window so short that even the shrunken picture does not fit, where the
+     page scrolls again and what goes off the top is the controls. On a touch device that is close to a trap: the
+     picture itself does not scroll the page (`touch-action: none` on the
+     canvas, which is what stops a drag across it being taken as a page pan),
+     so the only surface left to drag is whatever empty space happens to be
+     below the picture, which looks like nothing and invites nobody. Sticky
+     costs the top rows of the picture while you are scrolled down -- the
+     ordinary bargain with a header that stays -- and only on a window too
+     short to show everything at once.
+     `background` explicitly, or the bars are transparent and the picture
+     shows through them; `z-index`, or the canvas paints over them. */
+  #bars { border-bottom: 1px solid var(--line); flex: 0 0 auto;
+          position: sticky; top: var(--covered-top, 0px); z-index: 2;
+          background: var(--chrome); }
   .bar label { display: flex; align-items: center; gap: 0.35rem; }
   button, select { font: inherit; }
   button { padding: 0.3rem 0.8rem; border-radius: 6px; }
@@ -88,17 +104,16 @@
   #replay { font-size: 1.05em; line-height: 1; }
   input[type=range] { width: 8rem; }
   .rule { width: 1px; height: 18px; background: var(--line); }
-  /* The picture is a fixed 600 pixels tall, whatever the window does.
-     599 taps into 600 rows is one tap per pixel -- no vertical resampling,
-     which is the whole point: harmonics sit one or two taps apart and
-     interpolation destroys exactly that. A window too short to show it all
-     scrolls; it does not squeeze.
+  /* The picture wants to be 600 pixels tall. 599 taps into 600 rows is one tap
+     per pixel -- no vertical resampling, which is the point: harmonics sit one
+     or two taps apart and interpolation destroys exactly that.
      616 = the 600 of picture plus the 8 above and 8 below that the display
      reserves for the top label's overhang and the bottom edge.
      This value is what shows until display.js has run; from then on the
-     display owns the height, because the waveform strip adds to it rather
-     than taking from the picture. See PICTURE_HEIGHT there -- the arithmetic
-     is the same and the two have to agree. */
+     display owns the height. It grows for the waveform strip, and it shrinks
+     on a window too short to hold the picture and a wrapped toolbar at once --
+     see `fitToWindow` below and `cssHeight` in display.js, which is where the
+     arithmetic lives and where the reasons are. */
   /* `touch-action: none` because the picture is a drag surface, and on a
      touch screen the browser's own gestures win by default: a drag with any
      vertical component in it is a page pan, so the page moves -- and, worse,
@@ -154,7 +169,12 @@
     <button id="open">Play file…</button>
     <button id="replay" title="Play the same file again" hidden>&#8635;</button>
     <span id="fname" hidden></span>
-    <input type="file" id="file" accept="audio/*">
+    <!-- Extensions as well as the wildcard. `audio/*` alone steers iOS towards
+         the media libraries rather than the file system, and greys out files
+         in Browse whose type it has not mapped -- including a .wav this app
+         wrote a moment earlier. -->
+    <input type="file" id="file"
+           accept=".wav,.aif,.aiff,.mp3,.m4a,.aac,.flac,.ogg,.opus,audio/*">
     <span id="status">idle</span>
   </div>
   <!-- Grouped by what a control is about, separators between the groups:
@@ -435,7 +455,17 @@ function finishFile() {
 /// shown is a peak over the last second rather than an average over all time.
 let inPeak = 0;
 
-window.addEventListener('error', e => fail(`${e.message} (${e.filename}:${e.lineno})`));
+window.addEventListener('error', e => {
+    // "ResizeObserver loop completed with undelivered notifications" is not a
+    // fault. It is the browser saying a round of observations produced another
+    // round and it has deferred the rest to the next frame -- which is what
+    // this page's observers do by design, one of them measuring the toolbar
+    // and sizing the picture from it. `fail` is sticky and kills the status
+    // line and the catch-up button for the rest of the session, so letting
+    // this one through would trade a harmless notice for a broken page.
+    if (/^ResizeObserver loop/.test(e.message || '')) return;
+    fail(`${e.message} (${e.filename}:${e.lineno})`);
+});
 window.addEventListener('unhandledrejection',
     e => fail('unhandled: ' + (e.reason && e.reason.message || e.reason)));
 
@@ -1950,10 +1980,22 @@ function saveSelection() {
     const got = selectionFrames();
     if (!got) return;
     const frames = got.frames;
+    // Asked for here, because `<a download>` has nowhere to ask: it names the
+    // file and the browser saves it. What the browser does with that name
+    // varies -- a desktop set to ask where downloads go offers a sheet with it
+    // filled in, and Chrome on an iPad opens a strip at the foot of the page
+    // that has to be confirmed and then dismissed -- but none of those is a
+    // place to *choose* a name, and one of them is easy to miss entirely.
+    //
+    // The timestamp is the default: the one thing about a selection that is
+    // always true and always different.
+    const suggested = `Cochleagram ${fileStamp()}`;
+    const typed = prompt('Save the selection as', suggested);
+    if (typed === null) return;                    // cancelled
     const url = URL.createObjectURL(wavBlob(frames, ctx.sampleRate));
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Cochleagram ${fileStamp()}.wav`;
+    a.download = safeFileName(typed, suggested);
     // In the document, because Firefox will not follow a click on a link that
     // is not; harmless in the browsers that do not care.
     document.body.appendChild(a);
@@ -1964,12 +2006,36 @@ function saveSelection() {
     setTimeout(() => URL.revokeObjectURL(url), 60000);
     const ms = Math.round(frames.length / ctx.sampleRate * 1000);
     const db = peakDbfs(frames);
+    // The name is in the message because where a browser puts a download is
+    // the browser's business and not something this page is told -- so the one
+    // useful thing it can say is what to look for.
     // `sayFor`, not `say`: this reports what a press did, and `say` is dropped
     // while an earlier hold is outstanding -- a save inside one of those would
     // otherwise say nothing at all, which for a button whose only other
     // feedback is the browser's own download UI reads as a dead control.
-    sayFor(4000, `saved ${ms} mS · ${peakText(db)}`
+    sayFor(6000, `saved “${a.download}” · ${ms} mS · ${peakText(db)}`
                  + (db !== null && db > 0 ? ' — clipped in the file' : ''));
+}
+
+/// Make what was typed into something that can be a filename, and make sure it
+/// ends in `.wav`.
+///
+/// Slashes and colons are taken out rather than refused: someone who types a
+/// date with slashes in it means the date, not a path, and a download whose
+/// name contains a separator is renamed or rejected by the browser without
+/// saying so. An entry that is nothing but punctuation falls back to the name
+/// that was offered -- an empty download name is silently replaced by the
+/// browser with something like "download", which is the one outcome worse than
+/// the timestamp.
+/// Leading and trailing dots go as well. A name beginning with one is hidden on
+/// every system this runs on, and a file that cannot be found is the problem
+/// this whole exercise is about.
+function safeFileName(typed, fallback) {
+    const cleaned = typed.replace(/[\/\\:*?"<>|]+/g, ' ')
+                         .replace(/\s+/g, ' ').trim();
+    const stem = cleaned.replace(/\.wav$/i, '')
+                        .replace(/^\.+|\.+$/g, '').trim().slice(0, 200);
+    return (stem || fallback) + '.wav';
 }
 
 /// Local time, so the name says when the sound was heard rather than what UTC
@@ -2430,6 +2496,194 @@ try {
     window.addEventListener('resize', refit);
 }
 
+/// Give the picture whatever height the toolbar leaves, up to the height it
+/// actually wants.
+///
+/// The point is that nothing scrolls. The picture would rather be 600 rows and
+/// says so through `cssHeight`; on a window too short for that and a wrapped
+/// toolbar together it takes what is left instead. See `display.js` for why
+/// that costs nothing on a screen with device pixels to spare.
+///
+/// The toolbar is measured rather than assumed, because how many rows it wraps
+/// onto depends on the width, the font and which controls are showing -- the
+/// RePlay group appears and disappears -- and there is no list of those widths
+/// anywhere. `visualViewport` where it exists: on a tablet the browser's own
+/// chrome grows and shrinks as you scroll, and `innerHeight` does not always
+/// notice.
+const fitToWindow = () => {
+    const bars = $('bars');
+    if (!bars) return;
+    // The visual viewport only while it is the window. Its height is the
+    // layout height divided by the zoom, so a pinch to read the picture more
+    // closely would otherwise halve the room and squeeze the picture -- taking
+    // rows away at the exact moment somebody is trying to see them.
+    const vv = window.visualViewport;
+    const zoomed = vv && vv.scale > 1;
+    const windowHeight = Math.floor(
+        vv && !zoomed ? vv.height
+                      : (document.documentElement.clientHeight
+                         || window.innerHeight));
+    if (!(windowHeight > 0)) return;
+    // How much of the top of the page the browser is sitting on.
+    //
+    // Chrome on an iPad opens a popped-out window whose layout viewport is the
+    // whole screen -- 1024 -- while what can be seen of it is 892 starting 132
+    // px down. Nothing is scrolled and nothing can be: the document is shorter
+    // than the layout viewport, so the toolbar sits under the browser's own
+    // furniture and no amount of dragging brings it out. Measured rather than
+    // assumed, and normally zero: an ordinary tab reports the visible window
+    // as the whole of it, and this changes nothing there.
+    //
+    // The page is moved down by that much rather than made to scroll, because
+    // there is nothing to scroll and because moving it is what is wanted.
+    // Clamped to a quarter of the window, because this number is not settled
+    // when a popped-out window first opens: it is the offset of the visible
+    // part within the laid-out page, and while the window is still arriving it
+    // can be most of the height of the screen. Padding the page by that put
+    // everything below the visible band -- a blank window that a reload fixed,
+    // which is the signature of a measurement taken too early. A browser that
+    // genuinely covers more than a quarter of the window with its own
+    // furniture is not a browser this page can help.
+    //
+    // Only at the top level, and only unzoomed. In a frame nothing covers the
+    // top and the padding would be measured by the page around it as a white
+    // band under the instrument; while pinch-zoomed, `offsetTop` is where the
+    // pan has got to rather than anything a browser is sitting on, so padding
+    // by it would push the page about under the finger doing the panning.
+    const covered = (vv && !zoomed && window.top === window)
+        ? Math.min(Math.round(windowHeight / 4),
+                   Math.max(0, Math.round(vv.offsetTop)))
+        : 0;
+    document.body.style.paddingTop = covered ? covered + 'px' : '';
+    // The sticky toolbar's own resting place has to clear it too, or it sticks
+    // to the top of the scrollport, which is the part that cannot be seen.
+    document.documentElement.style.setProperty('--covered-top', covered + 'px');
+
+    // `floor` on the window above and `ceil` on the toolbar here, so both
+    // roundings give the page room rather than taking it: half a pixel over is
+    // a scrollbar, and a scrollbar narrows the window, which re-wraps the
+    // toolbar, which changes the answer.
+    const room = windowHeight - Math.ceil(bars.getBoundingClientRect().height);
+    display.maxCssHeight = room;
+    // `applyHeight` writes the element's height; the observer above turns that
+    // into a `resize()`. Called even when the number has not moved -- it is one
+    // assignment, and the alternative is remembering the last one here as well
+    // as in `display`.
+    display.applyHeight();
+};
+/// One measurement now and three while things are still moving. A window that
+/// has just opened, or a tablet that has just been turned, goes on changing
+/// shape for the best part of a second, and every number `fitToWindow` reads
+/// changes with it.
+const settle = () => {
+    fitToWindow();
+    requestAnimationFrame(fitToWindow);
+    setTimeout(fitToWindow, 250);
+    setTimeout(fitToWindow, 600);
+    setTimeout(fitToWindow, 1200);
+};
+window.addEventListener('resize', fitToWindow);
+window.addEventListener('orientationchange', settle);
+if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitToWindow);
+    // And on its `scroll`, which is how the offset above changes: the browser
+    // sliding its own furniture in and out is a move of the visible window
+    // within the page, not a resize of anything.
+    window.visualViewport.addEventListener('scroll', fitToWindow);
+}
+// And now, and once the layout has settled: the toolbar's wrap is not final
+// until the fonts are, and the RePlay group changes the count of rows it takes
+// long after that.
+fitToWindow();
+addEventListener('load', settle);
+// The toolbar changing height is the other half of this, and it changes for
+// reasons no resize event reports: a control appearing, a message getting
+// longer, a wrap that only happens once the file name is in place.
+// Deferred to the next frame rather than run inside the observation. Sizing
+// the picture can end up changing the toolbar -- a wider window re-lays the
+// close-up menu, which can re-wrap the bars -- and an observation that causes
+// another observation in the same frame is what makes a browser give up and
+// report a loop. A frame's delay is invisible and breaks the chain.
+let fitQueued = false;
+try {
+    new ResizeObserver(() => {
+        if (fitQueued) return;
+        fitQueued = true;
+        requestAnimationFrame(() => { fitQueued = false; fitToWindow(); });
+    }).observe($('bars'));
+} catch {}
+
+// Reload once, in a tab another page opened, on a touch device.
+//
+// Chrome on an iPad measures such a tab before its own toolbar has arrived and
+// then never corrects itself: the page is told it has the whole screen, lays
+// its controls out in the top 130 pixels, and the browser draws its tab strip
+// and address bar over exactly that. Nothing is scrolled and nothing can be --
+// the document is shorter than the viewport it was given -- and there is no
+// number anywhere that says the top is covered: `innerHeight`,
+// `documentElement.clientHeight`, `visualViewport.height` and `100dvh` all
+// agree on the wrong answer, and `visualViewport.offsetTop` reads zero. A
+// reload, and only a reload, makes the browser report the 892 it really has.
+//
+// So it is done here rather than left to the visitor, who sees the controls
+// for an instant and then a blank strip where they were.
+//
+// Narrowly gated, because a page that reloads itself is a page that can reload
+// itself forever:
+//
+//   * `window.opener`, not `document.referrer`. A referrer is set by any link
+//     tap, and inside the frame on the page around this instrument it is the
+//     parent's URL -- so the framed copy would reload on every visit, for a
+//     window whose top is covered by nothing at all.
+//   * not in a frame, for the same reason.
+//   * a touch device only. The browsers that get this wrong are the ones whose
+//     furniture slides about.
+//   * and never twice, which is the navigation type rather than a stored flag:
+//     `sessionStorage` is copied into a window opened by `window.open`, so a
+//     flag set by the framed copy would be inherited by the popped-out one and
+//     suppress the reload in exactly the case it is for.
+//
+// It follows that this depends on `page/index.html` not passing `noopener`
+// when it opens the window. It deliberately does not; the comment there says
+// why, and now also says that this rests on it.
+let reloadingForViewport = false;
+try {
+    const framed = window.top !== window;
+    const touch = matchMedia('(hover: none) and (pointer: coarse)').matches;
+    const nav = performance.getEntriesByType('navigation')[0];
+    const already = nav && nav.type === 'reload';
+    if (window.opener !== null && !framed && touch && !already) {
+        reloadingForViewport = true;
+        location.reload();
+    }
+} catch {}
+
+// Start at the top, and stay there until somebody scrolls.
+//
+// `fitToWindow` above means there is usually nothing to scroll. This is for
+// the case it cannot reach -- a window shorter than `MIN_CSS_HEIGHT` and the
+// toolbar -- where the page scrolls after all. Starting part-way down is not,
+// and the half that goes off the top is the controls -- a visitor who cannot
+// see them has no way to know they are there. Reported on an iPad, where the
+// page opened with the toolbar hidden behind the browser's own chrome and
+// turning the tablet twice was the only way anyone found to get it back.
+//
+// Two mechanisms, because both are real and neither is worth diagnosing from
+// a screenshot: browsers restore the previous scroll position on a reload,
+// which is nearly always the wrong answer for an instrument rather than a
+// document; and the layout settles after this file runs -- the canvas takes
+// its real height, the bars wrap -- which can leave a scroll offset that made
+// sense against the page as it briefly was. So: refuse the restore, and put
+// the page back at the top once things have stopped moving.
+try { history.scrollRestoration = 'manual'; } catch {}
+const toTop = () => window.scrollTo(0, 0);
+toTop();
+addEventListener('load', () => {
+    toTop();
+    requestAnimationFrame(toTop);
+    setTimeout(toTop, 250);
+});
+
 // Start listening without being asked to.
 //
 // Nothing about the page is interesting until sound is going through it, and
@@ -2442,6 +2696,13 @@ try {
 // the button and to `resumeAudio`'s one-shot listener. A refusal here is a
 // quiet no-op, not an error -- the visitor may be about to open a file.
 (async () => {
+    // Not in a document that is about to be replaced. `location.reload()` only
+    // queues the navigation; everything below would otherwise still run --
+    // opening an AudioContext, fetching the engine and its coefficients, and
+    // asking for the microphone -- on a page with seconds to live. The visitor
+    // would see the permission prompt flash and be asked again, and a prompt
+    // dismissed by navigation counts as a refusal.
+    if (reloadingForViewport) return;
     // If the browser can tell us the answer without prompting, use it: an
     // unheralded permission dialog on load is worse manners than a button.
     // Safari has no 'microphone' descriptor and throws, in which case asking

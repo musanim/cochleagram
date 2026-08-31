@@ -55,11 +55,12 @@ SOURCE-NOTE -->
     overflow: hidden;
     background: #f2f2f5;
   }
-  /* The frame is exactly as tall as the instrument inside it, which is a
-     fixed 600 pixels of picture plus its toolbar. The number below is only a
-     fallback: the script at the foot of the page measures the real thing,
-     because the toolbar wraps onto a second or third row on a narrow window
-     and its height is not knowable from here. */
+  /* The frame is exactly as tall as the instrument inside it: 600 pixels of
+     picture where there is room for them, less where there is not, plus its
+     toolbar. The number below is only a fallback: the script at the foot of
+     the page measures the real thing, because the toolbar wraps onto a second
+     or third row on a narrow window and its height is not knowable from
+     here. */
   .app iframe { display: block; width: 100%; border: 0; height: 700px; }
   .hint { text-align: center; font-size: 0.85rem; opacity: 0.6;
           margin: 0 0 2.6rem; }
@@ -103,7 +104,15 @@ SOURCE-NOTE -->
      real origin -- but a listing looks like a broken page, and this at least
      fails honestly.) -->
 <div class="app">
-  <iframe src="app/index.html" title="Cochleagram" allow="microphone"></iframe>
+  <!-- `?v=` so each release is its own URL. Without it a browser is free to
+       show a cached copy of this document indefinitely: the modules inside it
+       are stamped by `publish.sh` and refetch, but the page that imports them
+       is not, so an old page can run new modules -- or, as happened on an
+       iPad, ignore three releases in a row. The version rather than the
+       publish stamp, because `publish.sh` substitutes it here and refuses to
+       ship a page with an unsubstituted placeholder left in it. -->
+  <iframe src="app/index.html?v=@VERSION@" title="Cochleagram"
+          allow="microphone"></iframe>
 </div>
 <p class="hint">Running here, in your browser. Allow the microphone and talk,
 whistle, or play something — or drop an audio file on the picture.<br>
@@ -133,6 +142,16 @@ bottom and time finely at the top, so both are visible in one picture.</p>
       plays the sound the frozen picture was drawn from — the whole width of
       it, or just what lies between your two lines. Hearing a moment you have
       just measured is the quickest way to learn to read the display.</li>
+  <li><b>Save Selection</b> writes that same sound to a WAV file — at the level
+      it was recorded rather than the level you are listening to it at, so the
+      file is a measurement rather than a mix. It asks you for a name; what
+      happens next is your browser's business and not this page's, and on a
+      tablet that usually means a strip at the foot of the window with a Save
+      button of its own — which has to be pressed, and then dismissed, or
+      nothing is written. The places offered there and the places offered by
+      <b>Play file…</b> are two different lists: the route back to a saved file
+      is Choose File, then Browse, then wherever your browser puts its
+      downloads.</li>
   <li><b>Waveform</b> puts the sound itself in a strip above the picture,
       column for column, so you can see which part of the waveform made which
       mark.</li>
@@ -189,26 +208,74 @@ account of how the filterbank is designed and where the numbers come from.</p>
 // from anywhere else on the page should not require an extra click.
 (function () {
     const frame = document.querySelector('.app iframe');
-    const focus = () => { try { frame.contentWindow.focus(); } catch {} };
+    // Focusing a frame scrolls it into view, and this one is taller than a
+    // tablet's landscape window: the browser brings the bottom of it up, which
+    // puts the toolbar above the top of the screen and under the browser's own
+    // chrome, where it cannot be seen or guessed at. On a touch device the
+    // focus buys nothing anyway -- it is there so the space bar pauses without
+    // a click first, and there is no space bar. So: never on load there, and
+    // `preventScroll` on the element for everywhere else, which the frame's
+    // window has no way to ask for.
+    const touchOnly = matchMedia('(hover: none) and (pointer: coarse)').matches;
+    let frameObserver = null;
+    const focus = () => {
+        try {
+            frame.focus({ preventScroll: true });
+            // Focusing the element normally moves focus inside it. Only where
+            // it does not is the frame's own window asked -- it has no
+            // `preventScroll` to offer, so it is the second choice, not the
+            // first.
+            if (document.activeElement !== frame) frame.contentWindow.focus();
+        } catch { }
+    };
 
     // Make the frame exactly as tall as what is inside it.
     //
     // The picture is a fixed height by design, but the toolbar above it wraps
     // onto more rows as the window narrows, so the total is not something this
     // page can compute -- it has to be measured. Same-origin, so it can be.
-    // Watching the inner document rather than only the window catches the
-    // wrap, which happens at widths this page has no list of.
+    //
+    // Measured from the inner *body*, not from `documentElement.scrollHeight`,
+    // which cannot ever shrink this frame: the root element is stretched to the
+    // frame's own height, so its scroll height is at least that, and setting
+    // the frame from it is a ratchet -- one wrap in portrait, or one turn of
+    // the waveform strip, and the frame stays tall for good with a band of
+    // empty space under the instrument. The body's box is the content's, and
+    // the content is what the frame should be.
+    //
+    // A measurement below the instrument's own floor is refused rather than
+    // used. `resize` fires long before the frame has loaded -- a tablet's URL
+    // bar collapsing on the first scroll is enough -- and at that moment the
+    // frame holds either `about:blank` or a half-parsed document, whose body
+    // is a few tens of pixels or none at all. Fitting to that collapses the
+    // frame until the next `load`, which is a worse failure than the ratchet
+    // this replaced. Nothing real is ever shorter than the picture.
     const fit = () => {
         const d = frame.contentDocument;
-        if (d && d.documentElement) {
-            frame.style.height = d.documentElement.scrollHeight + 'px';
-        }
+        if (!d || !d.body) return;
+        const h = Math.ceil(d.body.getBoundingClientRect().height);
+        if (h > 100) frame.style.height = h + 'px';
     };
     frame.addEventListener('load', () => {
         fit();
-        focus();
+        // Again once the instrument has settled. `load` can arrive before its
+        // script has grown the canvas to the height it wants, and before the
+        // observer below exists to notice -- these two cover the gap between
+        // the two, and cost nothing once it is closed.
+        requestAnimationFrame(fit);
+        setTimeout(fit, 250);
+        if (!touchOnly) focus();
         try {
-            new ResizeObserver(fit).observe(frame.contentDocument.documentElement);
+            // The body, for the same reason `fit` measures it -- and the body
+            // is what changes when the toolbar wraps or the waveform strip is
+            // switched on.
+            //
+            // The old one is let go first. `load` fires again for every
+            // document the frame holds, and an observer left watching a
+            // discarded body is a live callback on a dead page.
+            if (frameObserver) frameObserver.disconnect();
+            frameObserver = new ResizeObserver(fit);
+            frameObserver.observe(frame.contentDocument.body);
         } catch {}
     });
     window.addEventListener('resize', fit);
@@ -217,17 +284,29 @@ account of how the filterbank is designed and where the numbers come from.</p>
     // A window of its own.
     //
     // Opened from a click, because a popup opened any other way is blocked.
-    // Sized to the instrument -- the picture is a fixed 600 px tall by design
+    // Sized to the instrument, which wants 600 px of picture and takes less
+    // only where the window cannot give it
     // -- and named, so pressing the button twice raises the window that is
     // already open instead of making a second one.
     //
     // `noopener` is deliberately *not* set: it would be the safer default for
-    // a link to somewhere else, but this is our own page, and without a
-    // handle there is no way to raise it.
+    // a link to somewhere else, but this is our own page, and without a handle
+    // there is no way to raise it. The instrument now depends on that too --
+    // it tells a window opened by this button apart from an ordinary tab by
+    // `window.opener`, and reloads itself once when it finds one, because a
+    // tablet reports such a window's height wrongly until it does. Setting
+    // `noopener` here would silently put that back.
+    //
+    // The name is why this URL carries the version, and it is not only about
+    // caching. Opening a named window that already exists raises it rather
+    // than loading anything -- so a tab left open from an earlier release went
+    // on showing that release, through a cache clear, through three attempts
+    // to fix what looked like a layout bug in it. A URL that differs between
+    // releases makes the same call navigate instead of merely raising.
     document.getElementById('popout').addEventListener('click', () => {
         const w = Math.min(1400, Math.max(900, screen.availWidth - 120));
         const win = window.open(
-            'app/index.html', 'cochleagram',
+            'app/index.html?v=@VERSION@', 'cochleagram',
             `popup=yes,width=${w},height=760,` +
             `left=${Math.max(0, (screen.availWidth - w) / 2 | 0)},top=60`);
         if (win) win.focus();

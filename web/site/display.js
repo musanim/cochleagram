@@ -20,24 +20,38 @@ const NO_COHERENCE = -1000;
 /// mark. The same number as `CochleagramView.playheadInk`.
 const PLAYHEAD_INK = 'rgb(140, 61, 242)';
 
-/// How tall the picture is, in CSS pixels, whatever else is on screen.
+/// How tall the picture is, in CSS pixels, where the window allows it.
 ///
 /// 599 taps into 600 rows is one tap per pixel and no vertical resampling,
-/// which is the whole point -- harmonics sit one or two taps apart and
-/// interpolation destroys exactly that. The Mac app has no such guarantee: its
-/// picture is scaled to whatever the window leaves, so there the waveform strip
-/// takes a sixth of the space and the picture makes do with the rest. Here it
-/// cannot, so the canvas grows instead. The stylesheet's height for `#view`
-/// is this plus the two insets, and is the value that shows before this file
-/// has run; after that this owns it.
+/// which is the point -- harmonics sit one or two taps apart and interpolation
+/// destroys exactly that. So the canvas grows to hold it, and the waveform
+/// strip is added above rather than taken out of it. The Mac app has no such
+/// guarantee: its picture is scaled to whatever the window leaves.
+///
+/// The exception is a window too short to hold this and a wrapped toolbar
+/// together, where `maxCssHeight` overrides it and the picture is scaled after
+/// all. See `cssHeight` for why that is the better of the two failures, and
+/// why on the screens it happens on it usually costs nothing.
+///
+/// The stylesheet's height for `#view` is this plus the two insets, and is the
+/// value that shows before this file has run; after that this owns it.
 const PICTURE_HEIGHT = 600;
 
-/// The waveform strip's height.
+/// The shortest the canvas element will be made, whatever the window says.
+///
+/// A picture squeezed below this is not worth having, and at that point a page
+/// that scrolls is the better of two bad answers. 240 leaves the picture 224
+/// rows with the strip off -- still more than a third of a row per tap, which
+/// reads as a picture rather than a smear.
+const MIN_CSS_HEIGHT = 240;
+
+/// The waveform strip's height, where there is room for the whole picture.
 ///
 /// The Mac gives the strip a sixth of the space it and the picture share, which
-/// is a fifth of the picture at any window size. The picture here is a fixed
-/// 600 rows, so that fifth is a fixed 120 -- the same proportion, arrived at
-/// from the other end.
+/// is a fifth of the picture at any window size. At the picture's full 600 rows
+/// that sixth is 120 -- the same proportion, arrived at from the other end.
+/// Where the picture has had to give way, `waveformHeight` takes a sixth of
+/// what there is instead, which is the same rule and not this number.
 const WAVEFORM_HEIGHT = 120;
 
 /// Narrowest the picture may be squeezed by the spectrum, in CSS pixels. Only
@@ -183,8 +197,9 @@ export class Display {
         this.bottomInset = 8;
 
         /// Whether the waveform strip is drawn above the picture. It adds to
-        /// the canvas rather than taking from the picture; see
-        /// `PICTURE_HEIGHT`.
+        /// the canvas rather than taking from the picture -- except where the
+        /// canvas has a ceiling and cannot grow, and then it does take from it.
+        /// See `PICTURE_HEIGHT` and `cssHeight`.
         this.showsWaveform = false;
         /// Whether the spectrum is drawn to the right of the picture.
         this.showsSpectrum = false;
@@ -292,6 +307,10 @@ export class Display {
         this.traceRaw = null;
         this.traceTick = 0;
 
+        /// A ceiling on the element's height in CSS pixels, or Infinity for
+        /// none. Set from outside, by whoever knows how much window there is.
+        /// See `cssHeight`.
+        this.maxCssHeight = Infinity;
         this.resizing = false;
         this.imageDirty = false;
         this.hover = null;
@@ -706,13 +725,46 @@ export class Display {
     // waveform strip when it is on, then the picture, then an inset.
 
     /// How tall the strip is, or zero when it is off.
-    get waveformHeight() { return this.showsWaveform ? WAVEFORM_HEIGHT : 0; }
+    ///
+    /// `WAVEFORM_HEIGHT` where the picture is its full height, and a sixth of
+    /// what there is where it is not -- which is the proportion that constant
+    /// was chosen to give, and the Mac's. Without this, a ceiling that took the
+    /// picture down to the floor would leave the strip more than half the
+    /// canvas, annotating a picture smaller than itself.
+    ///
+    /// Derived from `maxCssHeight` rather than from `cssHeight`, which reads
+    /// this getter: the arithmetic is repeated here to break that circle.
+    get waveformHeight() {
+        if (!this.showsWaveform) return 0;
+        const natural = this.topInset + WAVEFORM_HEIGHT
+                      + PICTURE_HEIGHT + this.bottomInset;
+        const room = Math.max(MIN_CSS_HEIGHT,
+                              Math.min(natural, this.maxCssHeight))
+                   - this.topInset - this.bottomInset;
+        return Math.min(WAVEFORM_HEIGHT, Math.round(room / 6));
+    }
 
     /// How tall the canvas element has to be for the picture to come out at
-    /// `PICTURE_HEIGHT` with whatever else is switched on above it.
+    /// `PICTURE_HEIGHT` with whatever else is switched on above it -- or as
+    /// close to that as `maxCssHeight` allows.
+    ///
+    /// The picture gives way when there is not room for it. A window shorter
+    /// than the picture and a wrapped toolbar together used to mean a page that
+    /// scrolled, and a page that scrolls can sit where the controls are off the
+    /// top -- which on a tablet, where the picture itself refuses to pan the
+    /// page, leaves nothing obvious to drag and no way back. A shorter picture
+    /// costs less than that, and usually costs nothing at all: the guarantee
+    /// worth keeping is one *device* pixel per tap, and a screen with two
+    /// device pixels to the CSS pixel still has 1000 rows for 599 taps at 500
+    /// CSS pixels. It is only a real loss on a one-to-one screen in a short
+    /// window, where the alternative was a control nobody could see.
+    ///
+    /// `MIN_CSS_HEIGHT` is the floor: below that the page may scroll again,
+    /// because a picture squeezed past it is not worth having either.
     get cssHeight() {
-        return this.topInset + this.waveformHeight
-             + PICTURE_HEIGHT + this.bottomInset;
+        const natural = this.topInset + this.waveformHeight
+                      + PICTURE_HEIGHT + this.bottomInset;
+        return Math.max(MIN_CSS_HEIGHT, Math.min(natural, this.maxCssHeight));
     }
 
     /// Everything right of the gutter: what the picture and the spectrum share.
